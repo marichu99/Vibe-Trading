@@ -442,6 +442,13 @@ def _ensure_dotenv() -> None:
             loaded = candidate
             break
     _dotenv_loaded = True
+    if loaded is not None:
+        # The EnvConfig singleton may have been cached from a bare
+        # os.environ before this load (e.g. theme.py builds it at import
+        # time). Reset here so every caller — not just the ones that
+        # remember to reset — sees the .env values on the next
+        # get_env_config() call.
+        reset_env_config()
     # P08 R1: one-time, behavior-preserving diagnostic so a stale or
     # shadowed .env is observable instead of costing hours. The path is
     # redacted to a symbolic slot label and the API key is never logged.
