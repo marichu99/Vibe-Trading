@@ -321,7 +321,11 @@ class TradingPlaceOrderTool(BaseTool):
         "Place an order through the selected trading connector profile. Paper "
         "profiles trade a sandbox account; live profiles are gated by the user's "
         "mandate and kill switch. side is 'buy' or 'sell'; give exactly one of "
-        "quantity (units) or notional (account-currency amount)."
+        "quantity (units) or notional (account-currency amount). stop_loss/"
+        "take_profit are supported by MT5 (attached to the same order) and "
+        "ignored/rejected by connectors that don't support them — when a "
+        "committee or analysis produced concrete stop/target levels, pass them "
+        "here rather than placing the order naked."
     )
     parameters = {
         "type": "object",
@@ -334,6 +338,8 @@ class TradingPlaceOrderTool(BaseTool):
             "order_type": {"type": "string", "enum": ["market", "limit"], "default": "market"},
             "limit_price": {"type": "number", "description": "Required for limit orders."},
             "time_in_force": {"type": "string", "enum": ["day", "gtc"], "default": "day"},
+            "stop_loss": {"type": "number", "description": "Absolute stop-loss price level (MT5 only). Must be on the losing side of entry."},
+            "take_profit": {"type": "number", "description": "Absolute take-profit price level (MT5 only). Must be on the winning side of entry."},
         },
         "required": ["symbol", "side"],
     }
@@ -358,6 +364,8 @@ class TradingPlaceOrderTool(BaseTool):
                     order_type=str(kwargs.get("order_type") or "market"),
                     limit_price=_num_or_none(kwargs.get("limit_price")),
                     time_in_force=str(kwargs.get("time_in_force") or "day"),
+                    stop_loss=_num_or_none(kwargs.get("stop_loss")),
+                    take_profit=_num_or_none(kwargs.get("take_profit")),
                     **_overrides(kwargs),
                 )
             )

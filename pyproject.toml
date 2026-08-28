@@ -100,6 +100,10 @@ ibkr = [
 longbridge = [
     "longbridge>=0.2.5",
 ]
+mt5 = [
+    # Windows-only; talks to a locally installed MetaTrader 5 terminal over IPC.
+    "MetaTrader5>=5.0.45",
+]
 deepseek = [
     "langchain-deepseek>=1.0.0,<2",
 ]

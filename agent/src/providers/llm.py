@@ -411,7 +411,11 @@ def _build_native_deepseek(
         max_retries=get_env_config().llm.max_retries,
         callbacks=callbacks,
         api_key=api_key or None,
-        base_url=base_url or None,
+        # ChatDeepSeek (langchain-deepseek>=1.1) requires a real string —
+        # unlike older versions it no longer defaults this internally when
+        # None is passed — so fall back to DeepSeek's own default endpoint
+        # rather than crashing when DEEPSEEK_BASE_URL is unset.
+        base_url=base_url or "https://api.deepseek.com/v1",
     )
 
 

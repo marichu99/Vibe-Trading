@@ -119,6 +119,33 @@ class TestSyncProviderEnv:
         assert result["OPENAI_API_KEY"] == "ds-key-123"
         assert result["OPENAI_API_BASE"] == "https://api.deepseek.com/v1"
 
+    def test_native_deepseek_defaults_base_url_when_unset(self, monkeypatch) -> None:
+        """``_build_native_deepseek`` must never pass ``base_url=None`` to
+        ``ChatDeepSeek`` — langchain-deepseek>=1.1 requires a real string and
+        raises a pydantic ValidationError otherwise (no internal default)."""
+        import sys
+        import types
+
+        import src.providers.llm as llm_mod
+
+        captured: dict = {}
+
+        def fake_chat_deepseek(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+        fake_module = types.ModuleType("langchain_deepseek")
+        fake_module.ChatDeepSeek = fake_chat_deepseek
+        monkeypatch.setitem(sys.modules, "langchain_deepseek", fake_module)
+
+        clean = {k: v for k, v in os.environ.items() if not k.startswith(("DEEPSEEK_", "OPENAI_"))}
+        with patch.dict(os.environ, clean, clear=True):
+            os.environ["DEEPSEEK_API_KEY"] = "ds-key-123"
+            result = llm_mod._build_native_deepseek(model="deepseek-v4-pro", temperature=0.0)
+
+        assert result is not None
+        assert isinstance(captured["base_url"], str) and captured["base_url"]
+
     def test_groq_provider(self) -> None:
         result = self._run_sync({
             "LANGCHAIN_PROVIDER": "groq",

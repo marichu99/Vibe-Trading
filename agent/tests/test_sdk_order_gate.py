@@ -47,7 +47,7 @@ class _FakeConnector:
         return {"status": "ok", "symbol": symbol, "quote": {"last": self._quote_last}}
 
 
-def _mandate(*, max_order=1_000_000.0, assets=(AssetClass.US_EQUITY,), instruments=(InstrumentType.EQUITY,)):
+def _mandate(*, max_order=1_000_000.0, assets=(AssetClass.US_EQUITY,), instruments=(InstrumentType.EQUITY,), max_loss=None):
     return Mandate(
         schema_version=1,
         hard_caps=HardCaps(
@@ -57,6 +57,7 @@ def _mandate(*, max_order=1_000_000.0, assets=(AssetClass.US_EQUITY,), instrumen
             max_leverage=2.0,
             allowed_instruments=tuple(instruments),
             max_trades_per_day=100,
+            max_loss_per_order_usd=max_loss,
         ),
         universe=UniverseConstraint(
             asset_classes=tuple(assets),
@@ -169,6 +170,136 @@ def test_gate_quantity_order_priced_and_enforced(monkeypatch) -> None:
     assert conn.placed == []
 
 
+def _mt5_gold_intent(qty: float, stop_loss: float | None = None) -> OrderIntent:
+    return OrderIntent(
+        symbol="XAUUSDm", side="buy", notional_usd=None, quantity=qty,
+        instrument_type=InstrumentType.CFD, asset_class=AssetClass.COMMODITY,
+        stop_loss=stop_loss,
+    )
+
+
+def _mt5_gold_mandate(max_order: float, max_loss: float | None = None) -> Mandate:
+    return _mandate(
+        max_order=max_order, assets=(AssetClass.COMMODITY,), instruments=(InstrumentType.CFD,), max_loss=max_loss,
+    )
+
+
+def test_gate_lot_based_notional_uses_contract_size(monkeypatch) -> None:
+    """A lot-based connector's quantity must be scaled by contract_size.
+
+    Regression for the bug where MT5's 0.01-lot XAUUSDm order was priced as
+    0.01 * price (~$46) instead of 0.01 lot * 100 oz/lot * price (~$4,651) —
+    understating real notional by exactly the contract-size factor, which
+    would let an oversized order (e.g. a hallucinated 1.0 lot) sail under a
+    cap sized for the real per-lot exposure.
+    """
+    conn = _FakeConnector(quote_last=4651.0)
+    conn.contract_size = lambda symbol, *, config=None: 100.0
+    _patch_gate(monkeypatch, mandate=_mt5_gold_mandate(max_order=6000.0))
+    out = gate.execute_live_order(
+        broker="mt5", connector_module=conn, config=object(),
+        intent=_mt5_gold_intent(qty=0.01),
+        place_kwargs={"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01},
+    )
+    # 0.01 lot * 100 oz/lot = 1 oz; 1 oz * $4651 = $4651 notional <= $6000 cap → allowed.
+    assert out["status"] == "ok"
+    assert conn.placed == [{"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01}]
+
+
+def test_gate_lot_based_notional_denies_oversized_quantity(monkeypatch) -> None:
+    """A 1.0-lot order (100x the intended 0.01) must breach, not slip under, the cap."""
+    conn = _FakeConnector(quote_last=4651.0)
+    conn.contract_size = lambda symbol, *, config=None: 100.0
+    _patch_gate(monkeypatch, mandate=_mt5_gold_mandate(max_order=6000.0))
+    out = gate.execute_live_order(
+        broker="mt5", connector_module=conn, config=object(),
+        intent=_mt5_gold_intent(qty=1.0),
+        place_kwargs={"symbol": "XAUUSDm", "side": "buy", "quantity": 1.0},
+    )
+    assert out["status"] == "blocked"
+    assert out["breach"]["attempted_value"] == pytest.approx(465100.0)
+    assert conn.placed == []
+
+
+def test_gate_lot_based_notional_fails_closed_when_contract_size_unreadable(monkeypatch) -> None:
+    """A lot-based connector whose contract_size lookup fails must deny, not assume 1:1."""
+    conn = _FakeConnector(quote_last=4651.0)
+    conn.contract_size = lambda symbol, *, config=None: None
+    _patch_gate(monkeypatch, mandate=_mt5_gold_mandate(max_order=6000.0))
+    out = gate.execute_live_order(
+        broker="mt5", connector_module=conn, config=object(),
+        intent=_mt5_gold_intent(qty=0.01),
+        place_kwargs={"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01},
+    )
+    assert out["status"] == "blocked"
+    assert conn.placed == []
+
+
+def test_gate_allows_order_within_max_loss_cap(monkeypatch) -> None:
+    """A tight stop under the cap must pass — the cap isn't a stricter notional check."""
+    conn = _FakeConnector(quote_last=4651.0)
+    conn.contract_size = lambda symbol, *, config=None: 100.0
+    _patch_gate(monkeypatch, mandate=_mt5_gold_mandate(max_order=6000.0, max_loss=10.0))
+    out = gate.execute_live_order(
+        broker="mt5", connector_module=conn, config=object(),
+        # stop 8 points away * 100 contract size * 0.01 lot = $8 planned loss, under the $10 cap.
+        intent=_mt5_gold_intent(qty=0.01, stop_loss=4643.0),
+        place_kwargs={"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01, "stop_loss": 4643.0},
+    )
+    assert out["status"] == "ok"
+
+
+def test_gate_denies_order_exceeding_max_loss_cap(monkeypatch) -> None:
+    """A well-sized order (small notional) with an oversized stop must still be denied.
+
+    Regression motivation: two real live losses ($14.53, $16.53) came from a
+    correctly-sized 0.01-lot order whose stop was simply placed too far away —
+    max_order_notional_usd alone never catches this, since notional depends on
+    lot size, not stop distance.
+    """
+    conn = _FakeConnector(quote_last=4651.0)
+    conn.contract_size = lambda symbol, *, config=None: 100.0
+    _patch_gate(monkeypatch, mandate=_mt5_gold_mandate(max_order=6000.0, max_loss=10.0))
+    out = gate.execute_live_order(
+        broker="mt5", connector_module=conn, config=object(),
+        # stop 20 points away * 100 * 0.01 lot = $20 planned loss, over the $10 cap.
+        intent=_mt5_gold_intent(qty=0.01, stop_loss=4631.0),
+        place_kwargs={"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01, "stop_loss": 4631.0},
+    )
+    assert out["status"] == "blocked"
+    assert out["breach"]["limit"] == "max_loss_per_order_usd"
+    assert out["breach"]["attempted_value"] == pytest.approx(20.0)
+    assert conn.placed == []
+
+
+def test_gate_denies_when_max_loss_cap_set_but_no_stop_loss_given(monkeypatch) -> None:
+    """An unstopped order under a max-loss cap must fail closed, not be waved through."""
+    conn = _FakeConnector(quote_last=4651.0)
+    conn.contract_size = lambda symbol, *, config=None: 100.0
+    _patch_gate(monkeypatch, mandate=_mt5_gold_mandate(max_order=6000.0, max_loss=10.0))
+    out = gate.execute_live_order(
+        broker="mt5", connector_module=conn, config=object(),
+        intent=_mt5_gold_intent(qty=0.01, stop_loss=None),
+        place_kwargs={"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01},
+    )
+    assert out["status"] == "blocked"
+    assert out["breach"]["limit"] == "max_loss_per_order_usd"
+    assert conn.placed == []
+
+
+def test_gate_no_max_loss_cap_is_backward_compatible(monkeypatch) -> None:
+    """A mandate that never sets max_loss_per_order_usd (None, the default) must be unaffected."""
+    conn = _FakeConnector(quote_last=4651.0)
+    conn.contract_size = lambda symbol, *, config=None: 100.0
+    _patch_gate(monkeypatch, mandate=_mt5_gold_mandate(max_order=6000.0))  # max_loss defaults to None
+    out = gate.execute_live_order(
+        broker="mt5", connector_module=conn, config=object(),
+        intent=_mt5_gold_intent(qty=0.01, stop_loss=4600.0),  # a huge stop distance, would breach any real cap
+        place_kwargs={"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01, "stop_loss": 4600.0},
+    )
+    assert out["status"] == "ok"
+
+
 # --------------------------------------------------------------------------- #
 # Service routing
 # --------------------------------------------------------------------------- #
@@ -198,6 +329,24 @@ def test_service_place_order_live_routes_through_gate(monkeypatch) -> None:
     assert out["status"] == "blocked"
     assert conn.placed == []
     assert out["environment"] == "live"
+
+
+def test_service_place_order_threads_stop_loss_into_intent(monkeypatch) -> None:
+    """Regression: OrderIntent.stop_loss must actually be populated from the
+    place_order() call — the max-loss cap is a no-op if this wiring silently
+    drops it (it originally did, before OrderIntent even had the field)."""
+    conn = _FakeConnector()
+    conn.build_config = lambda profile_config, overrides: object()
+    monkeypatch.setattr(service, "_sdk_module", lambda c: conn)
+    captured = {}
+
+    def fake_execute(**kwargs):
+        captured["stop_loss"] = kwargs["intent"].stop_loss
+        return {"status": "blocked"}
+
+    monkeypatch.setattr("src.live.sdk_order_gate.execute_live_order", fake_execute)
+    service.place_order("AAPL", "alpaca-live-trade", side="buy", notional=500.0, stop_loss=142.5)
+    assert captured["stop_loss"] == 142.5
 
 
 def test_no_longbridge_live_trade_profile() -> None:

@@ -21,6 +21,12 @@ class InstrumentType(str, Enum):
     ETF = "etf"
     OPTION = "option"
     CRYPTO = "crypto"
+    #: Leveraged CFD-style instruments (MT5 forex/commodity/index CFDs). Margin
+    #: accounts trading this instrument type route the mandate's ``funding``
+    #: field as an authorized-notional ceiling rather than literal cash — see
+    #: ``src.live.enforcement.check_mandate`` step 8 and the mt5 mandate commit
+    #: script (``scripts/commit_mt5_mandate.py``) for the rationale.
+    CFD = "cfd"
 
 
 class AssetClass(str, Enum):
@@ -32,6 +38,13 @@ class AssetClass(str, Enum):
     CN_EQUITY = "cn_equity"
     IN_EQUITY = "in_equity"
     CRYPTO = "crypto"
+    #: MT5 CFD buckets. Only ``COMMODITY`` is ever placed in a committed
+    #: mandate's ``universe.asset_classes`` today (gold-only); ``FOREX``/
+    #: ``US_INDEX`` are defined for when committee_reporter's other symbols
+    #: (EURUSD/USTEC/US500) are promoted to live.
+    FOREX = "forex"
+    COMMODITY = "commodity"
+    US_INDEX = "us_index"
 
 
 @dataclass(frozen=True)
@@ -54,6 +67,13 @@ class HardCaps:
             types. Empty == deny all (fail-closed).
         max_trades_per_day: Vibe-enforced count of order placements allowed
             per UTC calendar day. Counter persisted alongside the mandate.
+        max_loss_per_order_usd: Vibe-enforced cap on worst-case USD loss if an
+            order's own stop-loss fills exactly (``abs(entry - stop) *
+            contract_multiplier * quantity``) — independent of
+            ``max_order_notional_usd``, which bounds position SIZE, not
+            planned risk. ``None`` (default, and how an old mandate.json
+            lacking this field loads) means no cap — backward compatible for
+            brokers/mandates that don't set one.
     """
 
     account_funding_usd: float
@@ -62,6 +82,7 @@ class HardCaps:
     max_leverage: float
     allowed_instruments: tuple[InstrumentType, ...]
     max_trades_per_day: int
+    max_loss_per_order_usd: float | None = None
 
 
 @dataclass(frozen=True)

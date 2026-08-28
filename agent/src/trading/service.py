@@ -17,6 +17,7 @@ _SDK_CONNECTOR_MODULES = {
     "tiger": "src.trading.connectors.tiger.sdk",
     "longbridge": "src.trading.connectors.longbridge.sdk",
     "alpaca": "src.trading.connectors.alpaca.sdk",
+    "mt5": "src.trading.connectors.mt5.sdk",
     "okx": "src.trading.connectors.okx.sdk",
     "binance": "src.trading.connectors.binance.sdk",
     "futu": "src.trading.connectors.futu.sdk",
@@ -211,6 +212,34 @@ _CONNECTOR_INSTRUMENT = {
 }
 
 
+#: MT5 symbols are broker-suffixed CFD tickers (e.g. Exness's ``XAUUSDm``), not
+#: the dotted equity market tags the block below infers from — classified
+#: separately in ``_mt5_asset_class``.
+_MT5_FX_CODES = ("USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD", "CNH", "CNY", "SGD", "HKD")
+
+
+def _mt5_asset_class(symbol: str):
+    """Infer the CFD asset-class bucket for an MT5 symbol (fail-closed to ``None``).
+
+    Matches the same instrument families ``committee_reporter.py`` trades:
+    metals (``XAU``/``XAG``) and other commodities → commodity, six-letter
+    currency-code pairs → forex, everything else (index CFDs like
+    ``USTECm``/``US500m``) → us_index. An unrecognized symbol returns ``None``,
+    which the gate treats as "no asset class" — denied unless the mandate's
+    ``allowed_instruments``/exclude-list alone would pass it, i.e. fail-safe.
+    """
+    from src.live.mandate.model import AssetClass
+
+    token = (symbol or "").strip().upper().rstrip("M")  # strip Exness's demo/live 'm' suffix
+    if token.startswith(("XAU", "XAG", "XPT", "XPD")) or token in ("BRENT", "WTI", "UKOIL", "USOIL"):
+        return AssetClass.COMMODITY
+    if len(token) == 6 and token[:3] in _MT5_FX_CODES and token[3:] in _MT5_FX_CODES:
+        return AssetClass.FOREX
+    if token:
+        return AssetClass.US_INDEX
+    return None
+
+
 def _order_classification(connector: str, symbol: str):
     """Return ``(InstrumentType, AssetClass | None)`` for an order's mandate gate.
 
@@ -222,6 +251,9 @@ def _order_classification(connector: str, symbol: str):
     non-US class, so the unknown case is fail-safe.
     """
     from src.live.mandate.model import AssetClass, InstrumentType
+
+    if connector == "mt5":
+        return InstrumentType.CFD, _mt5_asset_class(symbol)
 
     instrument_name, asset_name = _CONNECTOR_INSTRUMENT.get(connector, ("equity", None))
     instrument = InstrumentType(instrument_name)
@@ -248,6 +280,8 @@ def place_order(
     order_type: str = "market",
     limit_price: float | None = None,
     time_in_force: str = "day",
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
     session_id: str = "",
     **overrides: Any,
 ) -> dict[str, Any]:
@@ -258,6 +292,11 @@ def place_order(
     fail-closed pre-trade checks + audit) before any order reaches the broker.
     Only ``broker_sdk`` connectors are supported here; Robinhood keeps its MCP
     gate and IBKR stays read-only.
+
+    ``stop_loss``/``take_profit`` are forwarded only when given (omitted
+    entirely otherwise) — most connectors' ``place_order`` don't accept these
+    keywords at all, so an unconditional pass-through would break every
+    connector but the ones (currently: MT5) that do.
     """
     profile = profile_by_id(profile_id)
     if profile.transport != "broker_sdk":
@@ -276,6 +315,10 @@ def place_order(
         "limit_price": limit_price,
         "time_in_force": time_in_force,
     }
+    if stop_loss is not None:
+        place_kwargs["stop_loss"] = stop_loss
+    if take_profit is not None:
+        place_kwargs["take_profit"] = take_profit
 
     if profile.environment == "paper":
         return _with_profile(profile, module.place_order(config, **place_kwargs))
@@ -286,12 +329,20 @@ def place_order(
 
     instrument_type, asset_class = _order_classification(profile.connector, symbol)
     intent = OrderIntent(
-        symbol=str(symbol or "").strip().upper(),
+        # NOT .upper() here: `check_mandate` already re-normalizes case itself
+        # for its own policy comparisons (exclude-list, breach reporting), but
+        # `intent.symbol` is also what the gate hands straight to the
+        # connector's own `get_quote` for notional pricing — force-uppercasing
+        # it here broke MT5's case-sensitive broker-suffixed symbols (Exness's
+        # `XAUUSDm`, uppercased to `XAUUSDM`, which the terminal doesn't
+        # recognize), the same bug class already fixed in the connector layer.
+        symbol=str(symbol or "").strip(),
         side=str(side or "").strip().lower(),
         notional_usd=float(notional) if notional is not None else None,
         quantity=float(quantity) if quantity is not None else None,
         instrument_type=instrument_type,
         asset_class=asset_class,
+        stop_loss=float(stop_loss) if stop_loss is not None else None,
     )
     result = execute_live_order(
         broker=profile.connector,

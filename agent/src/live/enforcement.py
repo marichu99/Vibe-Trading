@@ -118,6 +118,14 @@ class OrderIntent:
             back to the instrument-type default (US-centric), preserving the
             single-market behavior. Carrying it explicitly is what lets the
             mandate gate distinguish e.g. an HK equity from a US equity.
+        stop_loss: The order's stop-loss price level, when the connector
+            supports one (currently: MT5). ``None`` for connectors/orders
+            with no attached stop.
+        max_loss_usd: Worst-case USD loss if the stop-loss fills exactly —
+            ``abs(entry_price - stop_loss) * contract_multiplier * quantity``.
+            Stamped by the gate (mirrors how ``notional_usd`` is stamped from
+            ``quantity``), never set by the caller directly. ``None`` when
+            there's no stop_loss to price, or pricing failed.
     """
 
     symbol: str
@@ -126,6 +134,8 @@ class OrderIntent:
     quantity: float | None
     instrument_type: InstrumentType
     asset_class: AssetClass | None = None
+    stop_loss: float | None = None
+    max_loss_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -473,6 +483,29 @@ def check_mandate(
             kind=BREACH_KIND_QUANTITATIVE, limit="max_order_notional_usd",
             limit_value=caps.max_order_notional_usd, attempted_value=notional,
         )
+
+    # 4b. Worst-case planned loss (stop-loss distance), independent of order
+    #     SIZE — a small-notional order can still carry an oversized stop.
+    #     Only enforced when the mandate actually sets this cap (None ==
+    #     no cap, backward compatible with every mandate that predates this
+    #     field). Once set, an order with no resolvable max_loss_usd (no
+    #     stop-loss attached, or the gate couldn't price it) is DENIED rather
+    #     than waved through — an unstopped order has unbounded downside,
+    #     which is exactly what this cap exists to prevent.
+    if caps.max_loss_per_order_usd is not None:
+        if intent.max_loss_usd is None:
+            return _breach(
+                broker=broker, remote_tool=remote_tool, intent=intent,
+                kind=BREACH_KIND_QUANTITATIVE, limit="max_loss_per_order_usd",
+                limit_value=caps.max_loss_per_order_usd, attempted_value=float("inf"),
+                detail="no stop-loss attached (or it could not be priced) — fail-closed under a max-loss cap",
+            )
+        if intent.max_loss_usd > caps.max_loss_per_order_usd:
+            return _breach(
+                broker=broker, remote_tool=remote_tool, intent=intent,
+                kind=BREACH_KIND_QUANTITATIVE, limit="max_loss_per_order_usd",
+                limit_value=caps.max_loss_per_order_usd, attempted_value=intent.max_loss_usd,
+            )
 
     # 5–6. Exposure + leverage need observable positions; fail-closed on any
     #      unparseable position. A sell reduces gross exposure (signed by side).

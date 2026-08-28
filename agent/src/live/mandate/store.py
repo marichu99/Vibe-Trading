@@ -94,6 +94,7 @@ def _parse_mandate(raw: object) -> Mandate:
             InstrumentType(value) for value in caps["allowed_instruments"]
         ),
         max_trades_per_day=int(caps["max_trades_per_day"]),
+        max_loss_per_order_usd=_opt_float(caps.get("max_loss_per_order_usd")),
     )
     universe_constraint = UniverseConstraint(
         asset_classes=tuple(AssetClass(value) for value in universe["asset_classes"]),

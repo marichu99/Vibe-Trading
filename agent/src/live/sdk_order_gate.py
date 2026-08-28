@@ -211,7 +211,8 @@ def _refusal(broker, *, decision, reason, reauth, breach=None, record=None) -> d
 
 
 def _normalize_notional(intent: OrderIntent, connector_module: Any, config: Any) -> OrderIntent | None:
-    """Stamp a single authoritative ``notional_usd`` (quantity → priced).
+    """Stamp a single authoritative ``notional_usd`` (quantity → priced), and
+    ``max_loss_usd`` when the order carries a ``stop_loss``.
 
     Currency note: the connector quote is the broker's native currency (HKD for
     HK, CNH for A-share). The mandate caps are USD; treating a local-currency
@@ -224,15 +225,54 @@ def _normalize_notional(intent: OrderIntent, connector_module: Any, config: Any)
     price = _quote_price(intent, connector_module, config)
     if price is None:
         return None
-    implied = intent.quantity * price
+    multiplier = _contract_multiplier(connector_module, config, intent.symbol)
+    if multiplier is None:
+        return None
+    implied = intent.quantity * price * multiplier
     if implied != implied or implied <= 0:
         return None
     explicit = intent.notional_usd if intent.notional_usd is not None else 0.0
     enforced = max(float(explicit), implied)
+
+    max_loss_usd = None
+    if intent.stop_loss is not None:
+        max_loss_usd = abs(price - intent.stop_loss) * multiplier * intent.quantity
+        if max_loss_usd != max_loss_usd:  # NaN
+            max_loss_usd = None
+
     return OrderIntent(
         symbol=intent.symbol, side=intent.side, notional_usd=enforced,
         quantity=intent.quantity, instrument_type=intent.instrument_type, asset_class=intent.asset_class,
+        stop_loss=intent.stop_loss, max_loss_usd=max_loss_usd,
     )
+
+
+def _contract_multiplier(connector_module: Any, config: Any, symbol: str) -> float | None:
+    """Units-per-lot for a lot-based connector, or ``1.0`` when quantity is raw units.
+
+    Connectors that trade in lots (currently: MT5) expose a ``contract_size``
+    read function; connectors that trade in shares/coins (the notional-per-unit
+    assumption ``_normalize_notional`` originally made) don't, and default to a
+    1:1 multiplier. When a lot-based connector's contract-size lookup fails,
+    this returns ``None`` (fail-closed DENY) rather than silently falling back
+    to 1.0 — assuming 1:1 for a symbol that is NOT 1:1 would understate real
+    notional, the exact failure mode a hard cap exists to catch.
+    """
+    getter = getattr(connector_module, "contract_size", None)
+    if getter is None:
+        return 1.0
+    try:
+        value = getter(symbol, config=config)
+    except Exception as exc:  # noqa: BLE001 - loader failure → fail-closed
+        logger.warning("contract_size lookup failed for %s: %s", symbol, exc)
+        return None
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _quote_price(intent: OrderIntent, connector_module: Any, config: Any) -> float | None:

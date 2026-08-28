@@ -472,6 +472,7 @@ def _profile_to_hard_caps(profile: Mapping[str, Any]) -> dict[str, Any]:
     funding = float(profile.get("account_funding_usd", profile.get("max_total_exposure_usd", 0.0)) or 0.0)
     max_order = float(profile.get("max_order_usd", 0.0) or 0.0)
     max_exposure = float(profile.get("max_total_exposure_usd", funding or max_order) or max_order)
+    max_loss_raw = profile.get("max_loss_per_order_usd")
     return {
         "account_funding_usd": funding or max_exposure,
         "max_order_notional_usd": max_order,
@@ -479,6 +480,7 @@ def _profile_to_hard_caps(profile: Mapping[str, Any]) -> dict[str, Any]:
         "max_leverage": max_leverage,
         "allowed_instruments": instruments,
         "max_trades_per_day": int(profile.get("daily_trade_cap", 0) or 0),
+        "max_loss_per_order_usd": float(max_loss_raw) if max_loss_raw is not None else None,
     }
 
 

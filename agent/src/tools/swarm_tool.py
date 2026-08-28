@@ -346,7 +346,42 @@ _MARKET_PATTERNS: list[tuple[str, list[str]]] = [
     ("A-shares", [r"A股", r"a股", "沪深", "上证", "深证", "创业板", "科创板", "中证", r"\bCSI\b"]),
     ("crypto", ["加密", r"\bcrypto\b", r"\bBTC\b", r"\bETH\b", "币", "USDT", "数字货币"]),
     ("Hong Kong", ["港股", "恒生", r"H股", "港交所", r"\.HK\b"]),
-    ("US", ["美股", "纳斯达克", "标普", "道琼斯", r"S&P", r"\.US\b"]),
+    (
+        "US",
+        [
+            # Chinese terms plus a literal ".US" ticker suffix covered the
+            # original set, but every plain-English index name (as an
+            # orchestrating agent would actually phrase them) was missing -
+            # discovered while wiring US index committee targets, the same
+            # class of gap as the forex/commodity one above.
+            "美股", "纳斯达克", "标普", "道琼斯", r"S&P", r"\.US\b",
+            r"\bnasdaq\b", r"\bNDX\b", r"\bUSTEC\b", r"\bdow\s+jones\b",
+            r"\bUS30\b", r"\bUS500\b", r"\bSPX\b", r"\bwall\s+street\b",
+            r"\bUS\s+index\b",
+        ],
+    ),
+    # Forex/commodity CFDs and futures (e.g. MT5 instruments) had no pattern at
+    # all here, so every gold/FX prompt silently fell through to the
+    # "A-shares" default below and mislabeled every committee agent's
+    # {market} context. Anchored on real currency codes (not a bare
+    # \b[A-Z]{3}[A-Z]{3}\b, which under re.IGNORECASE would match arbitrary
+    # 3+3-letter word pairs in ordinary English text).
+    (
+        "forex",
+        [
+            r"\bforex\b", r"\bFX\b", r"\bcurrency pair\b", r"外汇",
+            r"\b(?:USD|EUR|GBP|JPY|CHF|AUD|NZD|CAD|CNH|CNY|SGD|HKD)/?"
+            r"(?:USD|EUR|GBP|JPY|CHF|AUD|NZD|CAD|CNH|CNY|SGD|HKD)\b",
+        ],
+    ),
+    (
+        "commodity",
+        [
+            r"\bcommodit(?:y|ies)\b", r"\bgold\b", r"\bsilver\b", r"\bcrude\b", r"\boil\b",
+            r"\bXAU\w*\b", r"\bXAG\w*\b", r"\bWTI\b", r"\bBrent\b", r"\bnatural gas\b",
+            r"\bfutures?\b", "黄金", "白银", "原油", "期货",
+        ],
+    ),
 ]
 
 # Risk tolerance for global_allocation_committee (English).
