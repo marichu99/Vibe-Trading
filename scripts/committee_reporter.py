@@ -205,12 +205,91 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _process_creation_time(pid: int) -> int | None:
+    """Return `pid`'s exact process creation time (raw Windows FILETIME), or None.
+
+    Paired with the PID in the lock file (see _acquire_singleton_lock) because
+    a PID alone is not a stable process identity on Windows: PIDs are recycled
+    quickly, so after a crash/reboot a dead reporter's old PID can be handed
+    to an unrelated process within minutes (observed in practice: a location-
+    service process inherited a dead reporter's PID moments after a reboot,
+    and a liveness-only check treated it as "still running" forever after).
+    Two different processes essentially never share both the same PID and the
+    same to-the-100ns creation timestamp, so comparing both together — not
+    PID alone — is what makes a stale lock detectable and self-healing.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        ok = ctypes.windll.kernel32.GetProcessTimes(
+            handle, ctypes.byref(creation), ctypes.byref(exit_time),
+            ctypes.byref(kernel_time), ctypes.byref(user_time),
+        )
+        if not ok:
+            return None
+        return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def _read_lock_identity() -> tuple[int, int | None] | None:
+    """Parse the lock file as (pid, creation_time). None if missing/unreadable.
+
+    ``creation_time`` is None for a pre-upgrade bare-PID lock (written before
+    this identity check existed) — callers fall back to a liveness-only check
+    for that one transitional read; every lock written from here on carries
+    its creation time.
+    """
+    if not LOCK_PATH.exists():
+        return None
+    try:
+        raw = LOCK_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    pid_part, sep, created_part = raw.partition(":")
+    try:
+        pid = int(pid_part)
+    except ValueError:
+        return None
+    if not sep:
+        return pid, None
+    try:
+        return pid, int(created_part)
+    except ValueError:
+        return pid, None
+
+
+def _lock_identity_is_alive(identity: tuple[int, int | None]) -> bool:
+    """True if the lock's recorded (pid, creation_time) still matches a live process.
+
+    Falls back to a liveness-only check when creation_time is unavailable (a
+    pre-upgrade lock, or GetProcessTimes failing) — less precise, but matches
+    the pre-fix behavior rather than refusing to ever reclaim the lock.
+    """
+    pid, created = identity
+    if created is None:
+        return _pid_is_alive(pid)
+    current = _process_creation_time(pid)
+    return current is not None and current == created
+
+
 def _acquire_singleton_lock() -> bool:
     """Claim the lock, refusing to start if another instance already holds it.
 
-    A stale lock (its recorded PID is no longer a live process) self-heals —
-    reclaimed automatically rather than requiring manual cleanup, since an
-    abrupt kill (Stop-Process, a crash) never runs an exit handler.
+    A stale lock (no live process matching its recorded pid+creation_time)
+    self-heals — reclaimed automatically rather than requiring manual
+    cleanup, since an abrupt kill (Stop-Process, a crash, a reboot) never
+    runs an exit handler. See _process_creation_time for why the lock
+    identity is pid+creation_time, not PID alone.
 
     Returns:
         True if the lock was acquired (safe to proceed). False if another
@@ -219,14 +298,13 @@ def _acquire_singleton_lock() -> bool:
         this guards against.
     """
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if LOCK_PATH.exists():
-        try:
-            existing_pid = int(LOCK_PATH.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            existing_pid = None
-        if existing_pid and _pid_is_alive(existing_pid):
-            return False
-    LOCK_PATH.write_text(str(os.getpid()), encoding="utf-8")
+    identity = _read_lock_identity()
+    if identity is not None and _lock_identity_is_alive(identity):
+        return False
+    my_pid = os.getpid()
+    my_created = _process_creation_time(my_pid)
+    created_token = "" if my_created is None else str(my_created)
+    LOCK_PATH.write_text(f"{my_pid}:{created_token}", encoding="utf-8")
     return True
 
 
@@ -1416,13 +1494,11 @@ _LOG_INTERVAL_RE = re.compile(r"starting loop mode, interval=(\d+)s")
 
 def _status_lock_state() -> tuple[bool, int | None]:
     """Return (is_running, pid) from the singleton lock — None pid if no lock file at all."""
-    if not LOCK_PATH.exists():
+    identity = _read_lock_identity()
+    if identity is None:
         return False, None
-    try:
-        pid = int(LOCK_PATH.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        return False, None
-    return _pid_is_alive(pid), pid
+    pid, _ = identity
+    return _lock_identity_is_alive(identity), pid
 
 
 def _status_log_summary() -> dict:
