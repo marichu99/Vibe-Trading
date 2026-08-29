@@ -26,6 +26,9 @@ agent/sessions/
 agent/runs/
 agent/.swarm/
 logs/
+agent/gold_5m.py
+agent/gold_analysis.py
+agent/gold_intraday.py
 agent/.ui_runtime/
 agent/.tasks/
 agent/uploads/
