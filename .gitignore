@@ -24,6 +24,8 @@ CLAUDE.md
 learn-claude-code-main/
 agent/sessions/
 agent/runs/
+agent/.swarm/
+logs/
 agent/.ui_runtime/
 agent/.tasks/
 agent/uploads/

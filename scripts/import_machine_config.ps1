@@ -22,7 +22,7 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $VibeHome = Join-Path $env:USERPROFILE ".vibe-trading"
-$ClaudeMemDir = Join-Path $env:USERPROFILE ".claude\projects\C--Users-Spectre-Documents-Vibe-Trading\memory"
+$ClaudeMemDir = Join-Path $env:USERPROFILE ".claude\projects\C--Users-Hp-Documents-Vibe-Trading-2026-08-29\memory"
 
 function Restore-IfExists($From, $To) {
     if (Test-Path $From) {
