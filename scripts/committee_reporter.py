@@ -171,6 +171,22 @@ REVERSAL_THRESHOLD_FRACTION = 0.5  # favorable move >= this fraction of the stop
 # instead of just getting denied more often for no smaller-risk benefit.
 MAX_LOSS_PER_ORDER_USD = 10.0
 
+# Volatility floor for the stop-loss: below ATR_STOP_MULTIPLE x ATR, a stop
+# sits inside the instrument's normal noise band and risks getting clipped by
+# ordinary fluctuation before the thesis has a chance to play out, regardless
+# of whether the thesis itself was right. Real case: the 2026-08-27 -$7.00
+# loss used an 8-unit stop against a 6.09-unit 15m ATR (1.31x ATR) and was
+# stopped out 10 minutes after entry, before any real move happened. Checked
+# deterministically (pure historical-bar math, zero LLM cost — see
+# _atr_stop_floor) against MAX_LOSS_PER_ORDER_USD's own distance budget: if
+# the ATR floor exceeds what the account can afford to risk, the honest
+# answer is that this instrument's current volatility doesn't fit the risk
+# budget at this position size, and the pass should WAIT rather than take a
+# trade with an inadequate stop.
+ATR_PERIOD = "15m"
+ATR_LOOKBACK_BARS = 14
+ATR_STOP_MULTIPLE = 1.5
+
 # Milestone reminder: the user asked to be told once the live account hits
 # this equity, to reconsider adding silver (XAGUSDm — the nearest cousin to
 # gold, least new plumbing) to the live portfolio. Auto-clears once a silver
@@ -191,6 +207,58 @@ LOCK_PATH = REPO_ROOT / "logs" / "committee_reporter.lock"
 # below); this constant exists purely so --status can read the same file
 # back, not to configure logging output itself.
 REPORTER_LOG_PATH = REPO_ROOT / "logs" / "reporter.log"
+
+# No-weekend-hold rule, enforced in code rather than left to an LLM to
+# remember: each committee pass is an independent subprocess with no memory
+# of a prior pass's reasoning (see run_committee's docstring), so a rule one
+# run derives ("stay flat into the weekend") isn't binding on the next run a
+# few hours later. That gap produced a real loss: ticket 1046283982 was
+# opened Fri 2026-08-28 18:50 UTC, held through the weekend, and gapped
+# through its stop, closing Sat 22:01 UTC at -$13.39 (planned worst case was
+# ~-$5.87 to -$9.74) — four hours after a *different* pass that same Friday
+# had explicitly reasoned itself flat to avoid exactly this. WEEKEND_CUTOFF_
+# UTC_HOUR matches the flat-by-20:00-UTC tripwire the committee itself has
+# independently derived more than once.
+WEEKEND_CUTOFF_UTC_HOUR = 20
+WEEKEND_STATE_PATH = REPO_ROOT / "logs" / "weekend_state.json"
+
+# Breakeven-stop management ("dual take-profit, Option A"): 0.01 lots is
+# XAUUSDm's broker-enforced minimum AND step size (confirmed live via
+# symbol_info — volume_min = volume_step = 0.01), so a position at that size
+# cannot be partially closed; there is nothing smaller to scale out of. This
+# is the substitute — once price has moved BREAKEVEN_TRIGGER_FRACTION of the
+# way from entry to the planned take-profit, the stop moves to entry, so the
+# trade can no longer lose (worst case becomes flat, best case is still the
+# full original target) without touching position size or risk-per-trade.
+# Checked on its own fast cadence, independent of the LLM-costly committee
+# cadence — waiting up to --interval seconds to react would leave a trade
+# sitting past its breakeven point unprotected for no reason, since this
+# check is pure API reads plus at most one SLTP modify (zero LLM cost).
+BREAKEVEN_POLL_SECONDS = 300
+BREAKEVEN_TRIGGER_FRACTION = 0.5
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and every descendant it spawned (Windows-only, via taskkill /T).
+
+    A plain Popen.kill() only signals the direct child. `cli run` is itself a
+    venv-shim launch that re-execs into a second interpreter process (the same
+    pattern as committee_reporter.py's own launch) — so the direct child has
+    already spawned a grandchild by the time a run is underway. Killing only
+    the direct child leaves that grandchild alive, still holding the stdout/
+    stderr pipe's write end open, which makes the follow-up communicate()
+    block forever waiting for EOF that will never come.
+
+    This is not hypothetical: on 2026-08-31 a run hung for 7+ hours past its
+    1-hour RUN_TIMEOUT_SECONDS budget with no timeout ever logged, because
+    run_committee() was stuck inside communicate(), not merely slow to check
+    the clock. /T kills the whole descendant tree, so the drain call right
+    after this always terminates.
+    """
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=15)
+    except Exception:
+        logger.exception("failed to kill process tree for pid %s", pid)
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -357,6 +425,40 @@ def _max_stop_distance(symbol: str, lots: float) -> float | None:
     if not size or size <= 0 or lots <= 0:
         return None
     return MAX_LOSS_PER_ORDER_USD / (size * lots)
+
+
+def _atr_stop_floor(symbol: str) -> float | None:
+    """Minimum stop-loss distance (price units) to sit outside normal noise, or None if unavailable.
+
+    ATR_STOP_MULTIPLE x ATR(ATR_LOOKBACK_BARS) on ATR_PERIOD bars, computed
+    from the most recent real bars — pure historical-bar math, zero LLM cost,
+    same data source and connector-default-config pattern as
+    ``_max_stop_distance``. Fails open (returns None) on any read error; a
+    pass this can't compute for just proceeds without the floor rather than
+    blocking trading over a transient data-feed hiccup.
+    """
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+
+    try:
+        bars = mt5_sdk.get_historical_bars(symbol, period=ATR_PERIOD, limit=ATR_LOOKBACK_BARS + 1)["bars"]
+    except Exception:
+        return None
+
+    bars = [b for b in bars if b.get("high") is not None and b.get("low") is not None and b.get("close") is not None]
+    if len(bars) < 2:
+        return None
+
+    true_ranges = [
+        max(
+            bars[i]["high"] - bars[i]["low"],
+            abs(bars[i]["high"] - bars[i - 1]["close"]),
+            abs(bars[i]["low"] - bars[i - 1]["close"]),
+        )
+        for i in range(1, len(bars))
+    ]
+    atr = sum(true_ranges) / len(true_ranges)
+    return atr * ATR_STOP_MULTIPLE if atr > 0 else None
 
 
 def _symbol_position_summary(symbol: str, connection: str) -> dict:
@@ -788,6 +890,185 @@ def _live_circuit_breaker_check(trade: dict) -> str | None:
     )
 
 
+def _in_weekend_window(now: datetime) -> bool:
+    """True from WEEKEND_CUTOFF_UTC_HOUR on Friday through end of Sunday (UTC)."""
+    if now.weekday() in (5, 6):  # Sat, Sun
+        return True
+    return now.weekday() == 4 and now.hour >= WEEKEND_CUTOFF_UTC_HOUR  # Fri evening
+
+
+def _read_weekend_state() -> dict:
+    try:
+        return json.loads(WEEKEND_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _write_weekend_state(data: dict) -> None:
+    WEEKEND_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WEEKEND_STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _weekend_flatten_and_notify() -> None:
+    """Deterministically flatten our own live positions heading into the
+    weekend, and send exactly one status email per calendar week for it.
+
+    Called every pass while _in_weekend_window() is true — cheap and
+    idempotent (a pass with nothing open is a no-op, pure API reads plus at
+    most one close_position call), so there's no harm re-checking it every
+    loop interval all weekend. The email is deliberately throttled to once
+    per ISO week (via WEEKEND_STATE_PATH) so an unattended weekend doesn't
+    spam a report every --interval seconds; a flatten actually happening
+    always gets emailed regardless of that throttle, since that's new
+    information even if the week's notice already went out.
+    """
+    week_key = datetime.now(timezone.utc).strftime("%G-W%V")
+    already_notified = _read_weekend_state().get("week") == week_key
+
+    closed_lines: list[str] = []
+    for spec in TARGETS:
+        trade = spec.get("trade")
+        if not trade or trade["connection"] not in LIVE_CONNECTIONS:
+            continue
+
+        sys.path.insert(0, str(AGENT_DIR))
+        from src.trading.connectors.mt5 import sdk as mt5_sdk
+        from src.trading.profiles import profile_by_id
+        from src.trading.service import get_positions
+
+        try:
+            positions = get_positions(trade["connection"]).get("positions", [])
+        except Exception:
+            logger.exception("weekend flatten: could not read positions for %s", trade["symbol"])
+            continue
+
+        ours = [
+            p for p in positions
+            if p.get("symbol") == trade["symbol"] and p.get("magic") == OUR_MAGIC
+        ]
+        if not ours:
+            continue
+
+        try:
+            profile = profile_by_id(trade["connection"])
+            config = mt5_sdk.build_config(profile.config, {})
+        except Exception:
+            logger.exception("weekend flatten: could not build config for %s", trade["connection"])
+            continue
+
+        for pos in ours:
+            ticket = pos.get("ticket")
+            try:
+                result = mt5_sdk.close_position(config, ticket=ticket)
+            except Exception as exc:
+                closed_lines.append(f"FAILED to close ticket {ticket} on {trade['symbol']}: {exc}")
+                logger.exception("weekend flatten: close_position raised for ticket %s", ticket)
+                continue
+            if result.get("status") == "ok":
+                closed_lines.append(
+                    f"Closed {pos.get('side', '?').upper()} {result.get('closed_volume', pos.get('volume'))} lots "
+                    f"{trade['symbol']} @ {result.get('fill_price', '?')} "
+                    f"(open P&L at trigger ≈ {pos.get('profit')})"
+                )
+                logger.info("weekend flatten: closed ticket %s on %s", ticket, trade["symbol"])
+            else:
+                closed_lines.append(f"FAILED to close ticket {ticket} on {trade['symbol']}: {result.get('error')}")
+                logger.error("weekend flatten: close_position failed for ticket %s: %s", ticket, result.get("error"))
+
+    if already_notified and not closed_lines:
+        return
+
+    body_lines = ["Market closed for the weekend — no committee runs until Monday (UTC)."]
+    if closed_lines:
+        body_lines.append("")
+        body_lines.append("Positions flattened ahead of the weekend (no-weekend-hold rule, code-enforced):")
+        body_lines.extend(f"  - {line}" for line in closed_lines)
+    else:
+        body_lines.append("No open positions of ours to flatten.")
+
+    try:
+        send_email("[Vibe-Trading] Weekend status — market closed", _status_header() + "\n".join(body_lines))
+    except Exception:
+        logger.exception("failed to send weekend status email")
+
+    _write_weekend_state({"week": week_key})
+
+
+def _breakeven_stop_check() -> None:
+    """Move a live position's stop to breakeven once price is halfway to its TP.
+
+    Pure code, no LLM: reads the position's own entry/SL/TP (as submitted by
+    the committee's original order) and the live mark price, and issues at
+    most one TRADE_ACTION_SLTP modify per check — idempotent, since a
+    position already at breakeven-or-better is skipped on every later check.
+    Positions with no SL or no TP attached are left alone (nothing to compute
+    a halfway point from). See BREAKEVEN_TRIGGER_FRACTION's comment for why
+    this exists instead of a literal partial-close dual take-profit.
+    """
+    for spec in TARGETS:
+        trade = spec.get("trade")
+        if not trade or trade["connection"] not in LIVE_CONNECTIONS:
+            continue
+
+        sys.path.insert(0, str(AGENT_DIR))
+        from src.trading.connectors.mt5 import sdk as mt5_sdk
+        from src.trading.profiles import profile_by_id
+        from src.trading.service import get_positions
+
+        try:
+            positions = get_positions(trade["connection"]).get("positions", [])
+        except Exception:
+            logger.exception("breakeven check: could not read positions for %s", trade["symbol"])
+            continue
+
+        ours = [
+            p for p in positions
+            if p.get("symbol") == trade["symbol"] and p.get("magic") == OUR_MAGIC
+        ]
+        if not ours:
+            continue
+
+        try:
+            profile = profile_by_id(trade["connection"])
+            config = mt5_sdk.build_config(profile.config, {})
+        except Exception:
+            logger.exception("breakeven check: could not build config for %s", trade["connection"])
+            continue
+
+        for pos in ours:
+            entry, sl, tp, price = pos.get("price_open"), pos.get("stop_loss"), pos.get("take_profit"), pos.get("price_current")
+            side = pos.get("side")
+            if entry is None or sl is None or tp is None or price is None or side not in ("buy", "sell"):
+                continue
+
+            entry, sl, tp, price = float(entry), float(sl), float(tp), float(price)
+            halfway = entry + (tp - entry) * BREAKEVEN_TRIGGER_FRACTION
+            already_at_breakeven = sl >= entry if side == "buy" else sl <= entry
+            reached_halfway = price >= halfway if side == "buy" else price <= halfway
+            if already_at_breakeven or not reached_halfway:
+                continue
+
+            try:
+                # Both sl and tp are passed explicitly -- modify_position's
+                # own docstring warns that an omitted side can get cleared
+                # rather than preserved on some brokers, so tp must be
+                # re-sent unchanged here even though only sl is moving.
+                result = mt5_sdk.modify_position(config, ticket=pos.get("ticket"), stop_loss=entry, take_profit=tp)
+            except Exception:
+                logger.exception("breakeven check: modify_position raised for ticket %s", pos.get("ticket"))
+                continue
+            if result.get("status") == "ok":
+                logger.info(
+                    "breakeven check: moved SL to entry (%.3f) for ticket %s on %s (price %.3f past halfway %.3f)",
+                    entry, pos.get("ticket"), trade["symbol"], price, halfway,
+                )
+            else:
+                logger.error(
+                    "breakeven check: modify_position failed for ticket %s: %s",
+                    pos.get("ticket"), result.get("error"),
+                )
+
+
 @dataclass
 class CommitteeResult:
     committee: str
@@ -904,6 +1185,39 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
             f"broker gate regardless of what you propose."
         )
 
+    atr_floor = _atr_stop_floor(symbol)
+    if atr_floor is None:
+        volatility_fact = None
+    elif max_distance is not None and atr_floor > max_distance:
+        volatility_fact = (
+            f"VOLATILITY FLOOR — READ BEFORE TRADING: the minimum stop distance to sit outside \"{symbol}\"'s "
+            f"current normal noise ({ATR_STOP_MULTIPLE}x the last {ATR_LOOKBACK_BARS}-bar {ATR_PERIOD} ATR) is "
+            f"{atr_floor:.3f} price units — WIDER than the {max_distance:.3f}-unit hard risk limit above. "
+            f"There is no stop that is both inside the risk cap AND outside normal noise right now: any "
+            f"cap-compliant stop will very likely get clipped by ordinary fluctuation regardless of whether "
+            f"the directional thesis is correct (this is exactly how a prior trade lost $7 in 10 minutes — "
+            f"an 8-unit stop against a 6-unit ATR). Given this, the decision must be WAIT — do not place a "
+            f"trade this pass no matter how strong the setup looks; note in your report that current "
+            f"volatility does not fit this account's risk budget at this position size."
+        )
+    elif max_distance is not None:
+        volatility_fact = (
+            f"Volatility floor: to sit outside \"{symbol}\"'s current normal noise, size the stop-loss at or "
+            f"beyond {atr_floor:.3f} price units from entry ({ATR_STOP_MULTIPLE}x the last {ATR_LOOKBACK_BARS}"
+            f"-bar {ATR_PERIOD} ATR) — a stop tighter than this risks getting clipped by ordinary fluctuation "
+            f"before the thesis has a chance to play out, independent of whether the thesis is right. Combined "
+            f"with the hard risk limit above, your stop should land between {atr_floor:.3f} and "
+            f"{max_distance:.3f} price units from entry."
+        )
+    else:
+        volatility_fact = (
+            f"Volatility floor: to sit outside \"{symbol}\"'s current normal noise, size the stop-loss at or "
+            f"beyond {atr_floor:.3f} price units from entry ({ATR_STOP_MULTIPLE}x the last {ATR_LOOKBACK_BARS}"
+            f"-bar {ATR_PERIOD} ATR) — a stop tighter than this risks getting clipped by ordinary fluctuation "
+            f"before the thesis has a chance to play out, independent of whether the thesis is right."
+        )
+    volatility_block = f"{volatility_fact}\n\n" if volatility_fact else ""
+
     signal_fact = _signal_service_activity(symbol, connection)
     signal_block = f"{signal_fact}\n\n" if signal_fact else ""
 
@@ -917,6 +1231,7 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
         f"committee decision must carry these, not just a direction.\n\n"
         f"{quote_fact}\n\n"
         f"{risk_fact}\n\n"
+        f"{volatility_block}"
         f"{signal_block}"
         f"{journal_block}"
         f"{_DAY_TRADE_FRAMING}"
@@ -942,11 +1257,25 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
         f"      side=<'buy' if the decision is long, 'sell' if short>,\n"
         f"      quantity={lots},\n"
         f'      order_type="market",\n'
-        f"      stop_loss=<PM's stop price, adjusted to the live quote above AND to the HARD RISK LIMIT "
-        f"distance if needed — tighten it inward, never widen it>,\n"
-        f"      take_profit=<PM's nearest target price, same adjustment>,\n"
+        f"      stop_loss=<see stop-loss recomputation rule below>,\n"
+        f"      take_profit=<PM's nearest target price, shifted by the same live-quote adjustment as the "
+        f"stop-loss below, so the planned reward:risk ratio is preserved rather than skewed by drift>,\n"
         f'      time_in_force="day",\n'
         f"  )\n\n"
+        f"STOP-LOSS RECOMPUTATION RULE (read this before filling in stop_loss above): the PM's stop was "
+        f"designed as a DISTANCE from their intended entry (e.g. \"10 units\"), not as a fixed absolute "
+        f"price — that distance, capped at the HARD RISK LIMIT distance above if the PM's is wider, is "
+        f"what must survive to execution, not the raw number the PM wrote down. Compute stop_loss as "
+        f"(PM's intended distance, capped at the HARD RISK LIMIT) applied from the LIVE quote above — the "
+        f"actual price you are about to fill at — not from the PM's original entry reference. If live "
+        f"price has moved since the debate (it usually has, by the time you actually place the order), "
+        f"reusing the PM's original absolute stop price silently shrinks your real risk distance below "
+        f"what the PM sized it for and the stop lands inside normal price noise, getting hit on ordinary "
+        f"fluctuation regardless of whether the thesis is right — recomputing by distance from the live "
+        f"price avoids this. This applies just as much on a RETRY after a rejected order: if the first "
+        f"trading_place_order call is rejected (e.g. because the stop is invalid at the now-current live "
+        f"price), do not simply resend the PM's original absolute stop now that it happens to be valid — "
+        f"recompute it fresh from the live price at retry time, the same way.\n\n"
         f"Do not call trading_place_order at all if any condition above fails — that includes a "
         f"wait/hold decision, a missing stop-loss, an opposite-direction position already open, or the "
         f"cap already reached. There is no partial/scaled/limit-order version of this call: either place "
@@ -971,28 +1300,40 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
 
     prompt = _build_prompt(committee, target, market, trade)
     logger.info("running %s on %s (%s)%s", committee, target, market, " [trade-enabled]" if trade else "")
+    cmd = [
+        sys.executable, "-m", "cli", "run",
+        "--prompt", prompt,
+        "--json",
+        "--max-iter", str(MAX_ITER),
+    ]
+    popen = subprocess.Popen(
+        cmd,
+        cwd=str(AGENT_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        # Committee reports routinely contain em-dashes/CJK text; without an
+        # explicit encoding, the pipe falls back to the Windows locale
+        # (cp1252 here), which can't decode that output and crashes the
+        # reader thread mid-read, leaving stdout as None.
+        encoding="utf-8",
+        errors="replace",
+    )
     try:
-        proc = subprocess.run(
-            [
-                sys.executable, "-m", "cli", "run",
-                "--prompt", prompt,
-                "--json",
-                "--max-iter", str(MAX_ITER),
-            ],
-            cwd=str(AGENT_DIR),
-            capture_output=True,
-            text=True,
-            # Committee reports routinely contain em-dashes/CJK text; without an
-            # explicit encoding, subprocess.run falls back to the Windows locale
-            # (cp1252 here), which can't decode that output and crashes the
-            # reader thread mid-read, leaving proc.stdout as None.
-            encoding="utf-8",
-            errors="replace",
-            timeout=RUN_TIMEOUT_SECONDS,
-        )
+        stdout, stderr = popen.communicate(timeout=RUN_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
+        _kill_process_tree(popen.pid)
+        # Now that every descendant is actually dead, drain whatever's left
+        # -- this can't hang, since nothing remains alive to hold the pipe's
+        # write end open (see _kill_process_tree's docstring for why a plain
+        # popen.kill() here would not be enough).
+        try:
+            popen.communicate(timeout=15)
+        except Exception:
+            pass
         logger.warning("%s on %s timed out after %ss", committee, target, RUN_TIMEOUT_SECONDS)
         return CommitteeResult(committee, target, market, "timeout", None, "", error="run exceeded timeout")
+    proc = subprocess.CompletedProcess(cmd, popen.returncode, stdout, stderr)
 
     payload = _last_json_line(proc.stdout)
     if payload is None:
@@ -1662,16 +2003,49 @@ def main() -> int:
         return 1
 
     if args.loop:
-        logger.info("starting loop mode, interval=%ss", args.interval)
+        logger.info(
+            "starting loop mode, interval=%ss (breakeven-stop checked every %ss)",
+            args.interval, BREAKEVEN_POLL_SECONDS,
+        )
+        # Two independent cadences share this one loop: the expensive,
+        # LLM-costly committee pass on args.interval, and the free,
+        # code-only breakeven-stop check on the much shorter
+        # BREAKEVEN_POLL_SECONDS -- see BREAKEVEN_POLL_SECONDS's comment for
+        # why waiting for the slow cadence to react would be wrong. A full
+        # pass fires immediately on the first tick (last_full_pass starts
+        # "due"), matching the loop's original always-run-on-start behavior.
+        last_full_pass = time.monotonic() - args.interval
         while True:
-            try:
-                run_once()
-            except Exception:
-                # Defense in depth on top of run_once()'s own per-target
-                # try/except: nothing here should ever be able to kill an
-                # unattended loop that nobody is watching in real time.
-                logger.exception("run_once() crashed; continuing after the normal interval")
-            time.sleep(args.interval)
+            now = time.monotonic()
+            if now - last_full_pass >= args.interval:
+                last_full_pass = now
+                # XAUUSDm (and forex generally) is closed roughly Fri evening
+                # through Sun evening -- a pass during that window pays the
+                # full 4-agent committee cost for a trade that cannot
+                # execute, with no offsetting chance of a missed
+                # opportunity. Checked every cycle (not slept-through-to-
+                # Monday) so it self-corrects cleanly across restarts/DST
+                # without extra scheduling logic.
+                if _in_weekend_window(datetime.now(timezone.utc)):
+                    logger.info("weekend (UTC) — market closed, skipping this pass")
+                    try:
+                        _weekend_flatten_and_notify()
+                    except Exception:
+                        logger.exception("weekend flatten/notify crashed; continuing after the normal interval")
+                else:
+                    try:
+                        run_once()
+                    except Exception:
+                        # Defense in depth on top of run_once()'s own per-target
+                        # try/except: nothing here should ever be able to kill an
+                        # unattended loop that nobody is watching in real time.
+                        logger.exception("run_once() crashed; continuing after the normal interval")
+            else:
+                try:
+                    _breakeven_stop_check()
+                except Exception:
+                    logger.exception("breakeven stop check crashed; continuing")
+            time.sleep(BREAKEVEN_POLL_SECONDS)
     else:
         run_once()
     return 0

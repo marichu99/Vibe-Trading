@@ -1099,6 +1099,8 @@ def _position_to_dict(item: Any) -> dict[str, Any]:
         "volume": _obj_get(item, "volume"),
         "price_open": _obj_get(item, "price_open"),
         "price_current": _obj_get(item, "price_current"),
+        "stop_loss": _obj_get(item, "sl") or None,
+        "take_profit": _obj_get(item, "tp") or None,
         "swap": _obj_get(item, "swap"),
         "profit": _obj_get(item, "profit"),
         "magic": _obj_get(item, "magic"),

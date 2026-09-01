@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Starts the Vibe-Trading committee_reporter.py loop at boot: it decides
     (and, for gold, conditionally trades) on a schedule and emails you the
@@ -32,6 +32,35 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 function Write-StartupLog($Message) {
     Add-Content -Path (Join-Path $LogDir "startup.log") -Value "$(Get-Date -Format o) $Message"
+}
+
+# Start-Process -RedirectStandardOutput/-Error TRUNCATES the target file on
+# every launch, so a plain relaunch on each reboot silently threw away the
+# previous session's reporter.log/reporter.err.log. Archive whatever's there
+# into an accumulating history file first, so nothing is lost across restarts
+# - reporter.log/err.log stay as "this session only" (committee_reporter.py's
+# own --status tail-parsing depends on that), while reporter.history.log
+# keeps the full record.
+$HistoryLog = Join-Path $LogDir "reporter.history.log"
+
+function Archive-PreviousLog($SourcePath, $Label) {
+    if (Test-Path $SourcePath) {
+        $content = Get-Content -Path $SourcePath -Raw -ErrorAction SilentlyContinue
+        if ($content) {
+            Add-Content -Path $HistoryLog -Value "===== $Label — boot $(Get-Date -Format o) ====="
+            Add-Content -Path $HistoryLog -Value $content
+        }
+    }
+}
+Archive-PreviousLog (Join-Path $LogDir "reporter.log") "stdout"
+Archive-PreviousLog (Join-Path $LogDir "reporter.err.log") "stderr"
+
+# Cap the history file so it doesn't grow forever - keep at most one rotated
+# backup (reporter.history.log.old) once the live file passes 10MB.
+$MaxHistoryBytes = 10MB
+if ((Test-Path $HistoryLog) -and (Get-Item $HistoryLog).Length -gt $MaxHistoryBytes) {
+    Move-Item -Path $HistoryLog -Destination (Join-Path $LogDir "reporter.history.log.old") -Force
+    Write-StartupLog "rotated reporter.history.log (exceeded ${MaxHistoryBytes} bytes)"
 }
 
 # A single committee run can take a long time (multi-agent debate + real data

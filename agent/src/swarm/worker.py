@@ -200,31 +200,20 @@ def build_worker_prompt(
     Returns:
         Complete system prompt string for the worker LLM.
     """
-    upstream_block = ""
-    if upstream_summaries:
-        sections = []
-        for key, summary in upstream_summaries.items():
-            sections.append(f"### {key}\n{summary}")
-        upstream_block = (
-            "## Upstream Context (from previous agents)\n\n"
-            + "\n\n".join(sections)
-        )
-
-    prompt_parts = [
-        f"## Role\n\n{agent_spec.role}",
-        agent_spec.system_prompt.replace("{upstream_context}", upstream_block),
-    ]
+    # Static, agent-invariant blocks first: for a given agent_spec these are
+    # byte-identical on every call (skill_descriptions/tools come from the
+    # agent's own YAML spec, not the current task), so they form one stable
+    # prompt-cache-eligible prefix across a swarm's repeated calls to the
+    # same agent. Anything that varies per call (upstream context, grounding
+    # data, the current date) is appended after, in the same relative order
+    # as before -- a cache hit only needs a stable *prefix*, so moving the
+    # variable tail doesn't need to preserve position, only what precedes it.
+    prompt_parts = [f"## Role\n\n{agent_spec.role}"]
 
     if skill_descriptions and skill_descriptions != "(no matching skills)":
         prompt_parts.append(
             f"## Available Skills (use load_skill to access full documentation)\n\n{skill_descriptions}"
         )
-
-    if grounding_block:
-        # Placed before Execution Rules so it's in scope when the worker
-        # plans its first tool call. The block already contains an explicit
-        # instruction to prefer these prices over training data.
-        prompt_parts.append(grounding_block)
 
     if "get_market_data" in (agent_spec.tools or []):
         prompt_parts.append(
@@ -267,11 +256,33 @@ def build_worker_prompt(
         "it and proceed without."
     )
 
+    # From here on, content varies per call (upstream context substitution,
+    # grounding data, the date), so none of it extends the cacheable prefix
+    # above -- relative order matches the original layout exactly.
+    upstream_block = ""
+    if upstream_summaries:
+        sections = []
+        for key, summary in upstream_summaries.items():
+            sections.append(f"### {key}\n{summary}")
+        upstream_block = (
+            "## Upstream Context (from previous agents)\n\n"
+            + "\n\n".join(sections)
+        )
+    prompt_parts.append(agent_spec.system_prompt.replace("{upstream_context}", upstream_block))
+
+    if grounding_block:
+        # Placed before Execution Rules so it's in scope when the worker
+        # plans its first tool call. The block already contains an explicit
+        # instruction to prefer these prices over training data.
+        prompt_parts.append(grounding_block)
+
+    _effective_max_iter = agent_spec.max_iterations or _default_max_iterations()
+    _phase2_limit = max(1, round(_effective_max_iter * 0.75))
     prompt_parts.append(
         "## Execution Rules\n\n"
-        "You have a HARD LIMIT of 20 tool calls. After that you will be cut off. Work efficiently.\n\n"
+        f"You have a HARD LIMIT of {_effective_max_iter} tool calls. After that you will be cut off. Work efficiently.\n\n"
         "**Phase 1 — Plan (0 tool calls):** Before calling any tool, state your plan in 3-5 bullet points.\n\n"
-        "**Phase 2 — Execute (≤15 tool calls):**\n"
+        f"**Phase 2 — Execute (≤{_phase2_limit} tool calls):**\n"
         "- `load_skill` first to get data access methods and analysis patterns.\n"
         "- Write ONE focused Python script via `write_file`, then run it with `bash python script.py`.\n"
         "- Do NOT write long Python code inside bash. Use write_file + bash.\n"
@@ -400,18 +411,31 @@ def run_worker(
     last_assistant_content = ""
 
     _KEEP_RECENT_TOOLS = 3
+    _COMPACT_INTERVAL = 5
     data_tool_calls = 0
     content_filter_count = 0
     consecutive_content_filter_count = 0
 
     for iteration in range(max_iterations):
-        # Microcompact: clear old tool results to prevent token bloat
-        tool_msgs = [m for m in messages if m.get("role") == "tool"]
-        if len(tool_msgs) > _KEEP_RECENT_TOOLS:
-            for msg in tool_msgs[:-_KEEP_RECENT_TOOLS]:
-                content = msg.get("content", "")
-                if isinstance(content, str) and len(content) > 100:
-                    msg["content"] = "[cleared]"
+        # Microcompact: clear old tool results to prevent token bloat.
+        # Batched to once every _COMPACT_INTERVAL iterations rather than
+        # every iteration: mutating a message that was already part of a
+        # prior request's prefix breaks provider-side prompt caching
+        # (DeepSeek et al. cache on an exact byte-matching prefix) from that
+        # point in `messages` onward, and with the old per-iteration sweep
+        # exactly one more tool message aged out of the keep-window on
+        # almost every call, so the cache reset almost every call too.
+        # Batching keeps the same bloat ceiling — anything older than
+        # _KEEP_RECENT_TOOLS still gets cleared, just in one shot per
+        # checkpoint instead of incrementally — while letting the prefix
+        # stay cache-stable for the iterations in between.
+        if iteration % _COMPACT_INTERVAL == 0:
+            tool_msgs = [m for m in messages if m.get("role") == "tool"]
+            if len(tool_msgs) > _KEEP_RECENT_TOOLS:
+                for msg in tool_msgs[:-_KEEP_RECENT_TOOLS]:
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and len(content) > 100:
+                        msg["content"] = "[cleared]"
 
         # Check timeout
         elapsed = time.monotonic() - t0
