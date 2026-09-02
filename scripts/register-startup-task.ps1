@@ -36,8 +36,23 @@ $ScriptPath = Join-Path $PSScriptRoot "startup.ps1"
 
 $Action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`""
+
+# 2026-09-02: an AtLogOn trigger firing a hidden PowerShell console the
+# instant the session starts is a known Windows race -- the session/
+# console teardown that happens during early logon can send the fresh
+# process a console-close signal, killing it with STATUS_CONTROL_C_EXIT
+# (0xC000013A) before it executes a single line. Confirmed this exact
+# symptom in the wild: LastTaskResult 0xC000013A with zero corresponding
+# entry in startup.log, i.e. it died before even the first Write-StartupLog
+# call. A short logon delay lets the session finish settling first.
 $Trigger = New-ScheduledTaskTrigger -AtLogOn
-$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+$Trigger.Delay = "PT45S"
+
+# Belt-and-suspenders: if it still dies (any reason), have Task Scheduler
+# itself retry a few times rather than silently leaving the live-trading
+# loop down for hours until someone notices.
+$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2)
 
 try {
     Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings `
