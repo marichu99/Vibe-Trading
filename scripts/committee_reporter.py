@@ -61,13 +61,34 @@ logger = logging.getLogger("committee_reporter")
 
 TARGETS: list[dict[str, object]] = [
     {
-        # LIVE — real money (mt5-live-trade), not demo. Gold only: this is the
-        # sole symbol/asset-class the committed mt5 mandate authorizes (see
-        # scripts/commit_mt5_mandate.py). max_stack=1 overrides the global
-        # MAX_SAME_DIRECTION_POSITIONS: no pyramiding on a ~$30 live account.
+        # LIVE — real money (mt5-live-trade), not demo. Gold-only by
+        # deliberate choice as of 2026-09-01 (see the paused XAGUSDm entry
+        # below for why) — not a mandate restriction: the committed mandate
+        # authorizes the whole "commodity" asset class, which already covers
+        # silver too. max_stack=1 overrides the global
+        # MAX_SAME_DIRECTION_POSITIONS: no pyramiding on this account.
         "committee": "investment_committee", "target": "XAUUSD", "market": "commodity/forex",
         "trade": {"symbol": "XAUUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
     },
+    # PAUSED 2026-09-01: equity crossed the $100 silver milestone and this was
+    # briefly enabled live, then deliberately reverted the same day — decided
+    # to run gold-only for a full observation period (~1 month, not just the
+    # 1-week pipeline check) before adding a second live instrument, so the
+    # 8 pipeline fixes committed 2026-09-01 get a clean, unconfounded read and
+    # DeepSeek cost isn't doubled during a period explicitly about controlling
+    # it. No mandate change is needed to re-enable this later — the committed
+    # mandate's "commodity" asset class already covers XAGUSDm (see
+    # src.trading.service._mt5_asset_class). At re-enable time, note that
+    # silver's 5000 oz/lot contract (vs gold's 100 oz) means the current flat
+    # $10 MAX_LOSS_PER_ORDER_USD buys only a ~0.2-unit stop against silver's
+    # own ~0.53-unit ATR noise floor (verified live 2026-09-01 at ~$64/oz) —
+    # the ATR volatility floor will very likely keep it WAITing under the
+    # shared cap until a per-symbol cap is set via commit_mt5_mandate.py,
+    # which only a human may run.
+    # {
+    #     "committee": "investment_committee", "target": "XAGUSD", "market": "commodity/forex",
+    #     "trade": {"symbol": "XAGUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
+    # },
     # PAUSED 2026-08-25: an MT5 terminal can only be signed into ONE account at
     # a time. The terminal is now signed into the LIVE account (needed for the
     # gold target above), so these mt5-demo-trade targets crash every pass with
@@ -193,6 +214,33 @@ ATR_STOP_MULTIPLE = 1.5
 # target actually exists in TARGETS — no separate "already notified" state
 # needed; if it keeps firing, silver genuinely hasn't been added yet.
 MILESTONE_SILVER_EQUITY_USD = 100.0
+
+# Trade-drought alert: the user asked to be told early if a symbol goes this
+# long with zero new trades, rather than only finding out at a scheduled
+# review. Added 2026-09-01 alongside the ATR volatility floor (fix 8) — that
+# floor correctly refuses a noise-tight stop, which is good risk behavior,
+# but if the $10 MAX_LOSS_PER_ORDER_USD cap is genuinely too tight for
+# current volatility, the honest failure mode is the system going quiet for
+# a long stretch instead of trading. This surfaces that early instead of
+# waiting out the full observation period to discover it.
+NO_TRADE_ALERT_DAYS = 7
+NO_TRADE_ALERT_STATE_PATH = REPO_ROOT / "logs" / "no_trade_alert_state.json"
+
+# Cap-fit alert: the user asked (2026-09-02) to be told the moment the $10
+# risk cap's stop-distance budget actually clears a symbol's own ATR noise
+# floor -- a finer-grained, immediate signal than the 7-day drought alert
+# above, since gold's ATR was observed closing the gap naturally (from a
+# $6.90 shortfall down to $0.40 within a day) and the user wanted to know
+# as soon as it crosses, not after a week of silence.
+CAP_FIT_ALERT_STATE_PATH = REPO_ROOT / "logs" / "cap_fit_alert_state.json"
+
+# Risk-cap-vs-volatility history: pure observability (no alerting, no
+# trading effect) so the eventual cap-revisit decision (see the ~1-month
+# gold-only review) is backed by a real logged history of how often/how
+# much the ATR floor actually bound, instead of the handful of ad hoc
+# snapshots taken manually during this session. Appended once per live
+# symbol per pass — never truncated, never read back by the loop itself.
+RISK_CAP_GAP_LOG_PATH = REPO_ROOT / "logs" / "risk_cap_gap_history.jsonl"
 
 # Singleton lock: refuse to start a second instance. 2026-08-25: a Task
 # Scheduler AtLogOn relaunch and a manual startup.ps1 run overlapped, giving
@@ -1726,6 +1774,184 @@ def _wrap_email_html(inner: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _read_no_trade_alert_state() -> dict:
+    try:
+        return json.loads(NO_TRADE_ALERT_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _write_no_trade_alert_state(data: dict) -> None:
+    NO_TRADE_ALERT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    NO_TRADE_ALERT_STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _check_trade_drought() -> None:
+    """Email a dedicated alert once a symbol has gone NO_TRADE_ALERT_DAYS with no new trade.
+
+    Pure code, zero LLM cost: reads real MT5 deal history (ground truth, not
+    the committee's own report of what happened) for the most recent OUR_MAGIC
+    opening deal per live target. Throttled per symbol via
+    NO_TRADE_ALERT_STATE_PATH — alerts once per distinct dry spell (keyed on
+    the last trade's own timestamp), not once per pass, and naturally
+    re-arms itself once a new trade actually happens. Fails open (skips
+    silently) on any read error or if a symbol has no trade history yet —
+    a missed alert is better than crashing the loop over this.
+    """
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.service import get_open_orders
+
+    for spec in TARGETS:
+        trade = spec.get("trade")
+        if not trade or trade["connection"] not in LIVE_CONNECTIONS:
+            continue
+
+        try:
+            executions = get_open_orders(trade["connection"], include_executions=True).get("executions", [])
+        except Exception:
+            continue
+
+        opens = [
+            d for d in executions
+            if d.get("symbol") == trade["symbol"] and d.get("magic") == OUR_MAGIC and d.get("entry") == 0
+        ]
+        if not opens:
+            continue  # never traded this symbol yet -- nothing to measure a drought against
+        opens.sort(key=lambda d: d.get("time") or "")
+        last_trade_time_str = opens[-1].get("time") or ""
+        try:
+            last_trade_time = datetime.fromisoformat(last_trade_time_str)
+        except ValueError:
+            continue
+
+        days_idle = (datetime.now(timezone.utc) - last_trade_time).days
+        if days_idle < NO_TRADE_ALERT_DAYS:
+            continue
+
+        state = _read_no_trade_alert_state()
+        key = f"{trade['connection']}:{trade['symbol']}"
+        if state.get(key) == last_trade_time_str:
+            continue  # already alerted for this specific dry spell
+
+        try:
+            text = (
+                f'No new "{trade["symbol"]}" trade in {days_idle} days (last opened {last_trade_time_str}). '
+                f"This can be the ATR volatility floor correctly refusing a noise-tight stop -- good risk "
+                f"behavior -- or it can mean the ${MAX_LOSS_PER_ORDER_USD:.2f} risk cap is now too tight for "
+                f"current volatility. Worth checking whether it's time to revisit the cap rather than waiting "
+                f"for the next scheduled review."
+            )
+            send_email(f"[Vibe-Trading] No trades in {days_idle} days — {trade['symbol']}", text)
+        except Exception:
+            logger.exception("failed to send trade-drought alert email")
+            continue
+
+        state[key] = last_trade_time_str
+        _write_no_trade_alert_state(state)
+
+
+def _read_cap_fit_alert_state() -> dict:
+    try:
+        return json.loads(CAP_FIT_ALERT_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _write_cap_fit_alert_state(data: dict) -> None:
+    CAP_FIT_ALERT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CAP_FIT_ALERT_STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _check_cap_fit_alert() -> None:
+    """Email the moment a live symbol's risk-cap stop budget clears its own ATR noise floor.
+
+    Finer-grained than _check_trade_drought (which only fires after
+    NO_TRADE_ALERT_DAYS of silence): this fires immediately on the pass
+    where _max_stop_distance >= _atr_stop_floor first becomes true for a
+    symbol, i.e. the moment the ATR volatility floor (fix 8) should stop
+    blocking trades on its own, without any cap change. Re-arms per symbol
+    via CAP_FIT_ALERT_STATE_PATH — if the gap reopens later (volatility
+    rises again) and then re-closes, it alerts again, not just once ever.
+    Pure code, zero LLM cost; fails open on any read error.
+    """
+    state = _read_cap_fit_alert_state()
+    changed = False
+
+    for spec in TARGETS:
+        trade = spec.get("trade")
+        if not trade or trade["connection"] not in LIVE_CONNECTIONS:
+            continue
+        symbol = trade["symbol"]
+        key = f"{trade['connection']}:{symbol}"
+
+        max_distance = _max_stop_distance(symbol, trade["lots"])
+        atr_floor = _atr_stop_floor(symbol)
+        if max_distance is None or atr_floor is None:
+            continue
+
+        fits = atr_floor <= max_distance
+        already_alerted = state.get(key) is True
+
+        if fits and not already_alerted:
+            try:
+                text = (
+                    f'"{symbol}"\'s stop-loss risk cap now covers its own current volatility: the '
+                    f"${MAX_LOSS_PER_ORDER_USD:.2f} cap allows a {max_distance:.3f}-unit stop, and the "
+                    f"current ATR-based noise floor is only {atr_floor:.3f} units -- the ATR volatility floor "
+                    f"should stop blocking trades on this symbol without any config change. Worth checking "
+                    f"whether the next committee pass actually trades."
+                )
+                send_email(f"[Vibe-Trading] Risk cap now covers volatility — {symbol}", text)
+                state[key] = True
+                changed = True
+            except Exception:
+                logger.exception("failed to send cap-fit alert email for %s", symbol)
+        elif not fits and already_alerted:
+            state[key] = False
+            changed = True
+
+    if changed:
+        _write_cap_fit_alert_state(state)
+
+
+def _log_cap_gap() -> None:
+    """Append one line per live symbol per pass: cap-derived stop budget vs ATR noise floor.
+
+    Pure observability, zero LLM cost, never blocks or alters trading
+    behavior. Persists the same numbers _check_cap_fit_alert already
+    computes at pass time, so the eventual cap-revisit decision is backed
+    by a real history instead of a handful of ad hoc snapshots. Appends,
+    never truncates or reads its own history back; fails open (skips
+    silently) on any read/write error.
+    """
+    for spec in TARGETS:
+        trade = spec.get("trade")
+        if not trade or trade["connection"] not in LIVE_CONNECTIONS:
+            continue
+        symbol = trade["symbol"]
+
+        max_distance = _max_stop_distance(symbol, trade["lots"])
+        atr_floor = _atr_stop_floor(symbol)
+        if max_distance is None or atr_floor is None:
+            continue
+
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "symbol": symbol,
+            "connection": trade["connection"],
+            "max_stop_distance": round(max_distance, 4),
+            "atr_stop_floor": round(atr_floor, 4),
+            "gap": round(atr_floor - max_distance, 4),
+            "fits": atr_floor <= max_distance,
+        }
+        try:
+            RISK_CAP_GAP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with RISK_CAP_GAP_LOG_PATH.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry) + "\n")
+        except Exception:
+            logger.exception("failed to append risk-cap-gap log entry for %s", symbol)
+
+
 def _check_silver_milestone() -> None:
     """Send a dedicated reminder once live equity crosses MILESTONE_SILVER_EQUITY_USD.
 
@@ -1783,7 +2009,18 @@ def _status_header_html() -> str:
 
 
 def run_once() -> None:
-    _check_silver_milestone()
+    # Disabled 2026-09-02 at the user's request: equity crossed the $100
+    # milestone on 2026-09-01, and the user already decided (with silver
+    # deliberately deferred ~1 month) to hold off adding it -- this alert
+    # has no re-notify throttle (see its docstring: "repeats every pass
+    # once crossed... better to nag than to fire once and have it get
+    # missed"), so with the decision already made it was just emailing
+    # every ~2h pass for no reason. Re-enable (delete this comment + the
+    # line below) once the silver/commodity decision is actually revisited.
+    # _check_silver_milestone()
+    _check_trade_drought()
+    _check_cap_fit_alert()
+    _log_cap_gap()
     for spec in TARGETS:
         target = spec.get("target", "?")
         try:
