@@ -324,14 +324,22 @@ BREAKEVEN_TRIGGER_FRACTION = 0.5
 # close at $6-10 would cap every winner there while losers still run to the
 # full risk cap, a bad risk/reward skew. This is the trailing alternative
 # instead: once unrealized profit reaches EARLY_PROFIT_TRIGGER_USD, the stop
-# starts trailing behind price, always locking in
-# EARLY_PROFIT_LOCK_FRACTION of whatever price distance has been gained past
-# entry so far (re-evaluated, and only ever ratcheted forward, on every
-# BREAKEVEN_POLL_SECONDS check below) — banking a growing profit floor
-# without hard-capping a trade that keeps running toward its full
-# take-profit. $8 is the midpoint of the user's $6-10 range.
+# starts trailing behind price (re-evaluated, and only ever ratcheted
+# forward, on every BREAKEVEN_POLL_SECONDS check below) — banking a growing
+# profit floor without hard-capping a trade that keeps running toward its
+# full take-profit. $8 is the midpoint of the user's $6-10 range.
+#
+# ATR-aware, not a fixed fraction of gained distance (the original version
+# of this): trails behind live price by _atr_stop_floor(symbol) -- the same
+# "sit outside normal noise" distance ATR_STOP_MULTIPLE x ATR already
+# computes for the INITIAL stop-loss floor (see ATR_STOP_MULTIPLE's
+# comment). A fixed-fraction trail was rejected after discussing the
+# tradeoff: it can sit too close to price on a genuinely volatile
+# instrument (gets whipsawed out by ordinary noise the moment it arms,
+# turning a real trend into a premature small win) or needlessly loose on a
+# calm one. Reusing the ATR floor adapts the trailing distance to each
+# instrument's actual current noise level instead of guessing one constant.
 EARLY_PROFIT_TRIGGER_USD = 8.0
-EARLY_PROFIT_LOCK_FRACTION = 0.5
 
 
 def _kill_process_tree(pid: int) -> None:
@@ -1105,11 +1113,11 @@ def _profit_protection_check() -> None:
       1. Breakeven-at-halfway (original rule): once price is
          BREAKEVEN_TRIGGER_FRACTION of the way from entry to the planned
          take-profit, candidate stop = entry. Worst case becomes flat.
-      2. Early-profit trail (see EARLY_PROFIT_TRIGGER_USD's comment): once
-         unrealized profit reaches EARLY_PROFIT_TRIGGER_USD, candidate stop
-         = entry + EARLY_PROFIT_LOCK_FRACTION * (price - entry) — trails
-         price, locking in a growing floor instead of the flat breakeven
-         floor above.
+      2. ATR-aware early-profit trail (see EARLY_PROFIT_TRIGGER_USD's
+         comment): once unrealized profit reaches EARLY_PROFIT_TRIGGER_USD,
+         candidate stop = price minus _atr_stop_floor(symbol) for a buy (plus,
+         for a sell) — trails price at a distance sized to the instrument's
+         own current noise level, instead of the flat breakeven floor above.
 
     Positions with no SL or no TP attached are left alone (nothing to
     compute a halfway point from, and the $ trigger needs a stop-derived
@@ -1160,9 +1168,11 @@ def _profit_protection_check() -> None:
             reached_halfway = price >= halfway if is_buy else price <= halfway
             breakeven_candidate = entry if reached_halfway else None
 
-            # Rule 2: early-profit trail. Needs contract size to convert the
-            # $ trigger into a price distance -- fails open (skips this rule
-            # only, breakeven above still applies) if the lookup fails.
+            # Rule 2: ATR-aware early-profit trail. Needs contract size to
+            # convert the $ trigger into a price distance, and the ATR
+            # floor for the trailing distance -- fails open (skips this
+            # rule only, breakeven above still applies) if either lookup
+            # fails.
             trail_candidate = None
             try:
                 size = mt5_sdk.contract_size(trade["symbol"])
@@ -1172,8 +1182,9 @@ def _profit_protection_check() -> None:
                 trigger_distance = EARLY_PROFIT_TRIGGER_USD / (size * trade["lots"])
                 gained = (price - entry) if is_buy else (entry - price)
                 if gained >= trigger_distance:
-                    locked = gained * EARLY_PROFIT_LOCK_FRACTION
-                    trail_candidate = entry + locked if is_buy else entry - locked
+                    atr_distance = _atr_stop_floor(trade["symbol"])
+                    if atr_distance:
+                        trail_candidate = price - atr_distance if is_buy else price + atr_distance
 
             candidates = [c for c in (breakeven_candidate, trail_candidate) if c is not None]
             if not candidates:
