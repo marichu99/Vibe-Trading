@@ -60,15 +60,36 @@ logger = logging.getLogger("committee_reporter")
 # --------------------------------------------------------------------------- #
 
 TARGETS: list[dict[str, object]] = [
+    # PAUSED 2026-09-03 at the user's request: gold's 15m-ATR stop floor has
+    # been running hot (logs/risk_cap_gap_history.jsonl: ~$6.6-$20.0 across
+    # 16 passes on 2026-09-01/02) — even after raising MAX_LOSS_PER_ORDER_USD
+    # to $30 same day, the user chose to pause gold entirely until it calms
+    # down rather than keep trading through the volatility, and shift focus
+    # to EURUSD (below) in the meantime. No mandate change needed to
+    # re-enable — the committed mandate's "commodity" asset class still
+    # covers XAUUSDm. Resume when gold's ATR floor settles back down
+    # (logs/risk_cap_gap_history.jsonl is still being appended to every pass
+    # for EURUSD/whatever's live, so there's no live gold reading to check it
+    # against until this is re-enabled — check via a manual _atr_stop_floor
+    # call, same pattern as scripts/diversification_roadmap.md, before
+    # flipping this back on).
+    # {
+    #     "committee": "investment_committee", "target": "XAUUSD", "market": "commodity/forex",
+    #     "trade": {"symbol": "XAUUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
+    # },
     {
-        # LIVE — real money (mt5-live-trade), not demo. Gold-only by
-        # deliberate choice as of 2026-09-01 (see the paused XAGUSDm entry
-        # below for why) — not a mandate restriction: the committed mandate
-        # authorizes the whole "commodity" asset class, which already covers
-        # silver too. max_stack=1 overrides the global
-        # MAX_SAME_DIRECTION_POSITIONS: no pyramiding on this account.
-        "committee": "investment_committee", "target": "XAUUSD", "market": "commodity/forex",
-        "trade": {"symbol": "XAUUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
+        # LIVE — real money (mt5-live-trade), not demo. Added 2026-09-03 at
+        # the user's request, replacing gold (paused above) as the sole live
+        # target while gold's volatility is elevated. Verified read-only
+        # before enabling: EURUSDm contract_size=100000, 15m ATR-based stop
+        # floor ~0.00076 price units vs. a ~0.03-unit budget under the $30
+        # cap at 0.01 lots — comfortably inside it, unlike gold's current
+        # situation. Requires the mandate's asset_classes to include "forex"
+        # (scripts/commit_mt5_mandate.py) — a mandate-only "commodity"
+        # authorization will fail-closed deny every order here. max_stack=1:
+        # same no-pyramiding policy as gold.
+        "committee": "investment_committee", "target": "EURUSD", "market": "forex",
+        "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
     },
     # PAUSED 2026-09-01: equity crossed the $100 silver milestone and this was
     # briefly enabled live, then deliberately reverted the same day — decided

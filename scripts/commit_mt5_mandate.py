@@ -1,4 +1,4 @@
-"""Commits the live-trading mandate for the ``mt5`` broker (gold-only).
+"""Commits the live-trading mandate for the ``mt5`` broker (gold + forex).
 
 This is the ONE-TIME (well — once per ~30-day mandate lifetime) consent
 ceremony for MT5 live trading. It is deliberately a standalone script, never
@@ -36,6 +36,14 @@ cap, not a removal of one — the two 2026-08-27 incidents motivated *having*
 a stop-distance cap at all, not the specific $10 figure. Revisit this
 number, not the cap's existence, if it needs adjusting again.
 
+2026-09-03: added "forex" to asset_classes and EURUSDm to committee_reporter's
+TARGETS, at the user's request, pausing gold in the same change until its
+elevated volatility calms down. Verified read-only before this change:
+EURUSDm's 15m-ATR stop floor sits comfortably inside the $30 cap at 0.01
+lots (~0.00076 price units needed vs. a ~0.03-unit budget) — see the paused
+XAUUSD entry's comment in committee_reporter.py for the full context and
+the gold resume criteria.
+
 Re-run this (bump --lifetime-days or just re-run before the 30 days are up) to
 renew; it always issues a fresh mandate_id/consent record, so the old one is
 superseded, never mutated.
@@ -71,7 +79,7 @@ MAX_TRADES_PER_DAY = 5
 LIFETIME_DAYS = 30
 FLATTEN_ON_HALT = True
 ALLOWED_INSTRUMENTS = ["cfd"]
-ASSET_CLASSES = ["commodity"]  # gold only; add "forex"/"us_index" if EURUSD/USTEC/US500 go live later
+ASSET_CLASSES = ["commodity", "forex"]  # commodity: gold (paused). forex: EURUSD, added 2026-09-03.
 
 # Added 2026-08-27, raised 2026-09-03 — see module docstring.
 MAX_LOSS_PER_ORDER_USD = 30.0
