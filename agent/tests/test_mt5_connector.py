@@ -424,6 +424,37 @@ def test_mt5_place_order_rejects_wrong_side_sl_tp(fake_terminal, side, kwargs, e
     assert expected_error in result["error"]
 
 
+@pytest.mark.parametrize(
+    "side, stop_loss, take_profit",
+    [
+        # Buy fills at ask=1.1000: 50-pip stop, only 20-pip target -> 0.4:1.
+        ("buy", 1.0950, 1.1020),
+        # Sell fills at bid=1.0995: 50-pip stop, only 20-pip target -> 0.4:1.
+        ("sell", 1.1045, 1.0975),
+    ],
+)
+def test_mt5_place_order_rejects_reward_below_risk(fake_terminal, side, stop_loss, take_profit) -> None:
+    """A target closer than the stop is a losing floor even at 100% would-be
+    win rate on the stop side — reject before order_send, not after the fact."""
+    cfg = mt5.MT5Config(profile="paper")
+    result = mt5.place_order(
+        cfg, symbol="EURUSD", side=side, quantity=0.01, order_type="market",
+        stop_loss=stop_loss, take_profit=take_profit,
+    )
+    assert result["status"] == "error"
+    assert "reward:risk" in result["error"]
+
+
+def test_mt5_place_order_allows_exact_1to1_reward_risk(fake_terminal) -> None:
+    """The floor is >= 1:1, not > 1:1 — an exact match must still be allowed."""
+    cfg = mt5.MT5Config(profile="paper")
+    result = mt5.place_order(
+        cfg, symbol="EURUSD", side="buy", quantity=0.01, order_type="market",
+        stop_loss=1.0950, take_profit=1.1050,
+    )
+    assert result["status"] == "ok", result
+
+
 def test_mt5_place_order_rejects_non_numeric_sl_tp(fake_terminal) -> None:
     cfg = mt5.MT5Config(profile="paper")
     result = mt5.place_order(cfg, symbol="EURUSD", side="buy", quantity=0.01, stop_loss="not-a-number")

@@ -442,6 +442,10 @@ def place_order(
     native ``sl``/``tp`` fields) — a buy's stop must be below and its
     take-profit above the entry price (sell is the reverse); a mismatched
     level is rejected here rather than left for MT5 to reject less legibly.
+    When both are given, the take-profit distance must also be at least the
+    stop-loss distance (reward:risk >= 1:1) — MT5 will happily fill an order
+    whose target is closer than its stop, so that floor is enforced here
+    rather than left to the calling agent's judgment.
     Fails closed (returns an error envelope) on any invalid input or a
     non-``DONE``/``PLACED`` MT5 retcode — never raises for caller-controlled
     mistakes.
@@ -523,6 +527,20 @@ def place_order(
                 "status": "error",
                 "error": f"take_profit {tp_value} must be {'above' if is_buy else 'below'} the entry price ~{price}",
             }
+        if sl_value is not None and tp_value is not None:
+            risk = abs(price - sl_value)
+            reward = abs(tp_value - price)
+            # 1e-9 relative tolerance: float rounding must not reject an
+            # intended-exact 1:1 (e.g. 0.005000000000000116 vs 0.004999999999999893).
+            if risk > 0 and reward < risk * (1 - 1e-9):
+                return {
+                    "status": "error",
+                    "error": (
+                        f"reward:risk {reward / risk:.2f} is below the 1:1 floor — take_profit is "
+                        f"{reward:g} away from entry ~{price} but stop_loss is {risk:g} away; widen "
+                        f"the target or tighten the stop before resubmitting"
+                    ),
+                }
 
     try:
         volume = _resolve_volume(info, quantity, notional, _obj_get(tick, "ask") or _obj_get(tick, "bid") or price)
