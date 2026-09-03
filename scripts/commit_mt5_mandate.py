@@ -25,15 +25,16 @@ gate (src.live.enforcement.check_mandate), not left to prompt compliance —
 an order with no stop-loss at all is now denied outright once this cap is
 set (fail-closed: unbounded downside is exactly what this exists to prevent).
 
-2026-09-03: raised max_loss_per_order_usd from $10 to $20, at the user's
-explicit request after reviewing why $10 was there. Gold's 15m-ATR stop
-floor spent most of 2026-09-01/02 above $10 (logs/risk_cap_gap_history.jsonl
-range: ~$6.6-$20.0 across 16 passes, several >$17), so the cap was blocking
-most passes outright via the ATR volatility floor rather than the committee
-choosing not to trade. $20 covers that observed range while still being a
-real cap, not a removal of one — the two 2026-08-27 incidents motivated
-*having* a stop-distance cap at all, not the specific $10 figure. Revisit
-this number, not the cap's existence, if it needs adjusting again.
+2026-09-03: raised max_loss_per_order_usd from $10 to $20, then to $30 the
+same day, both at the user's explicit request after reviewing why $10 was
+there. Gold's 15m-ATR stop floor spent most of 2026-09-01/02 above $10
+(logs/risk_cap_gap_history.jsonl range: ~$6.6-$20.0 across 16 passes,
+several >$17), so the cap was blocking most passes outright via the ATR
+volatility floor rather than the committee choosing not to trade. $30
+leaves more headroom above that observed range while still being a real
+cap, not a removal of one — the two 2026-08-27 incidents motivated *having*
+a stop-distance cap at all, not the specific $10 figure. Revisit this
+number, not the cap's existence, if it needs adjusting again.
 
 Re-run this (bump --lifetime-days or just re-run before the 30 days are up) to
 renew; it always issues a fresh mandate_id/consent record, so the old one is
@@ -73,7 +74,7 @@ ALLOWED_INSTRUMENTS = ["cfd"]
 ASSET_CLASSES = ["commodity"]  # gold only; add "forex"/"us_index" if EURUSD/USTEC/US500 go live later
 
 # Added 2026-08-27, raised 2026-09-03 — see module docstring.
-MAX_LOSS_PER_ORDER_USD = 20.0
+MAX_LOSS_PER_ORDER_USD = 30.0
 
 
 def _build_proposal() -> dict:
