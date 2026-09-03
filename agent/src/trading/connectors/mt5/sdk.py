@@ -825,12 +825,27 @@ def modify_position(
     is_buy_position = _obj_get(position, "type") == 0
     entry_price = _obj_get(position, "price_open")
 
-    if entry_price:
-        if sl_value is not None and ((is_buy_position and sl_value >= entry_price) or (not is_buy_position and sl_value <= entry_price)):
+    # Stop-loss is validated against the CURRENT price, not entry -- unlike
+    # place_order (where entry and "current" are the same instant), a stop
+    # on an already-open position is legitimately meant to move past entry
+    # as a trade earns profit (a breakeven or trailing stop IS a stop past
+    # entry by design). Pinning this to entry_price the same way place_order
+    # does rejected every such modify with "must be below/above entry" even
+    # when the stop was perfectly valid relative to where price actually is
+    # now -- confirmed live 2026-09-03, see committee_reporter.py's
+    # BREAKEVEN_BUFFER_POINTS comment. MT5 closes a buy at bid and a sell at
+    # ask, so that's the side compared here, matching how the broker itself
+    # evaluates stops-level distance on a modify.
+    tick = _safe_call(module, "symbol_info_tick", symbol)
+    current_price = _obj_get(tick, "bid") if is_buy_position else _obj_get(tick, "ask")
+
+    if current_price:
+        if sl_value is not None and ((is_buy_position and sl_value >= current_price) or (not is_buy_position and sl_value <= current_price)):
             return {
                 "status": "error",
-                "error": f"stop_loss {sl_value} must be {'below' if is_buy_position else 'above'} entry {entry_price}",
+                "error": f"stop_loss {sl_value} must be {'below' if is_buy_position else 'above'} the current price ~{current_price}",
             }
+    if entry_price:
         if tp_value is not None and ((is_buy_position and tp_value <= entry_price) or (not is_buy_position and tp_value >= entry_price)):
             return {
                 "status": "error",
