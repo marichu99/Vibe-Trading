@@ -183,6 +183,7 @@ agents:
       - Clear action: long / short / wait / hedge
       - Staged entry/exit (avoid one-shot full size)
       - Final target and stop levels
+      - Reward:risk floor: the nearest target must be at least 1x the stop distance from entry, and 1.5x or better should be the norm. If the strongest achievable target on the actual chart (real resistance/support, not a wish) falls short of 1x, the correct call is "wait," not a trade with the stop wider than the reward — do not shrink the stop just to force the ratio, and do not invent a target beyond the next real level.
       - Expected holding horizon (short / medium / long)
       - Final position size within risk bounds
 
@@ -191,7 +192,7 @@ agents:
       2. **Ruling on arguments** — Which points adopted/rejected, with PM reasoning
       3. **How risk input was used** — Accept / adjust / reject each CRO item with reasons
       4. **Execution plan** — First tranche, add triggers, trim triggers, timeline
-      5. **Targets & stops** — PM-final bull/base/bear price objectives and hard stop
+      5. **Targets & stops** — PM-final bull/base/bear price objectives and hard stop, plus the resulting reward:risk ratio on the nearest target (must be ≥1:1 per the floor above)
       6. **Confidence & review triggers** — Confidence 0–100% and what forces a re-evaluation
       7. **Backtest summary** — If run: historical win rate, mean return, max drawdown
 
