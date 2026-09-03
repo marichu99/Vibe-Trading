@@ -316,6 +316,32 @@ def contract_size(symbol: str, *, config: MT5Config | None = None, **_: Any) -> 
     return value if value > 0 else None
 
 
+def point_size(symbol: str, *, config: MT5Config | None = None, **_: Any) -> float | None:
+    """Return ``symbol``'s minimum price increment (MT5 ``point``), or ``None`` if unreadable.
+
+    Used to size a small strictly-on-the-protective-side buffer for stop
+    modifications — ``modify_position`` rejects an SL sitting exactly at
+    entry (see its own validation), so callers that want a "breakeven" stop
+    need a nonzero nudge past entry, and that nudge should be a handful of
+    points, not a value guessed from the price scale (which differs wildly
+    between e.g. XAUUSD and EURUSD).
+    """
+    cfg = config or load_config()
+    try:
+        module = _connect(cfg)
+    except (MT5DependencyError, MT5ConnectionError):
+        return None
+    clean = symbol.strip()
+    _ensure_symbol(module, clean)
+    info = _safe_call(module, "symbol_info", clean)
+    value = _obj_get(info, "point")
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def get_quote(symbol: str, *, config: MT5Config | None = None, **_: Any) -> dict[str, Any]:
     """Fetch a top-of-book tick snapshot for ``symbol``."""
     cfg = config or load_config()

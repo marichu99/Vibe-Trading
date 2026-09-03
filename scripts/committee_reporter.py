@@ -316,6 +316,16 @@ WEEKEND_STATE_PATH = REPO_ROOT / "logs" / "weekend_state.json"
 BREAKEVEN_POLL_SECONDS = 300
 BREAKEVEN_TRIGGER_FRACTION = 0.5
 
+# modify_position's own validation rejects an SL sitting exactly at entry
+# ("stop_loss X must be below/above entry X") -- confirmed live 2026-09-03:
+# ticket 1048921466 sat retrying and failing every BREAKEVEN_POLL_SECONDS for
+# 2+ hours because the candidate below was literally `entry`, never
+# protecting the position at all. BREAKEVEN_BUFFER_POINTS nudges the
+# candidate a handful of points past entry, on the protective side, so the
+# modify actually succeeds -- worst case becomes a few points of spread-level
+# loss instead of the intended flat, not a silently-failing no-op.
+BREAKEVEN_BUFFER_POINTS = 20
+
 # Early-profit trail: the same 0.01-lot/no-partial-close constraint above
 # also blocks literally banking a small early profit (e.g. $6-10) and
 # letting the rest ride — there's nothing smaller to scale out of. Added
@@ -1112,7 +1122,9 @@ def _profit_protection_check() -> None:
 
       1. Breakeven-at-halfway (original rule): once price is
          BREAKEVEN_TRIGGER_FRACTION of the way from entry to the planned
-         take-profit, candidate stop = entry. Worst case becomes flat.
+         take-profit, candidate stop = entry +/- BREAKEVEN_BUFFER_POINTS
+         (see its comment for why not exactly entry). Worst case becomes
+         near-flat.
       2. ATR-aware early-profit trail (see EARLY_PROFIT_TRIGGER_USD's
          comment): once unrealized profit reaches EARLY_PROFIT_TRIGGER_USD,
          candidate stop = price minus _atr_stop_floor(symbol) for a buy (plus,
@@ -1163,10 +1175,23 @@ def _profit_protection_check() -> None:
             entry, sl, tp, price = float(entry), float(sl), float(tp), float(price)
             is_buy = side == "buy"
 
-            # Rule 1: breakeven-at-halfway.
+            # Rule 1: breakeven-at-halfway. Candidate sits BREAKEVEN_BUFFER_
+            # POINTS past entry on the protective side, not exactly at entry
+            # -- modify_position rejects an SL exactly at entry, see
+            # BREAKEVEN_BUFFER_POINTS's comment. Fails open (skips this rule
+            # only, trail below still applies) if the point-size lookup
+            # fails.
+            breakeven_candidate = None
             halfway = entry + (tp - entry) * BREAKEVEN_TRIGGER_FRACTION
             reached_halfway = price >= halfway if is_buy else price <= halfway
-            breakeven_candidate = entry if reached_halfway else None
+            if reached_halfway:
+                try:
+                    point = mt5_sdk.point_size(trade["symbol"])
+                except Exception:
+                    point = None
+                if point and point > 0:
+                    buffer = point * BREAKEVEN_BUFFER_POINTS
+                    breakeven_candidate = entry - buffer if is_buy else entry + buffer
 
             # Rule 2: ATR-aware early-profit trail. Needs contract size to
             # convert the $ trigger into a price distance, and the ATR
