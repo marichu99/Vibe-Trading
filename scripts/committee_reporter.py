@@ -316,6 +316,23 @@ WEEKEND_STATE_PATH = REPO_ROOT / "logs" / "weekend_state.json"
 BREAKEVEN_POLL_SECONDS = 300
 BREAKEVEN_TRIGGER_FRACTION = 0.5
 
+# Early-profit trail: the same 0.01-lot/no-partial-close constraint above
+# also blocks literally banking a small early profit (e.g. $6-10) and
+# letting the rest ride — there's nothing smaller to scale out of. Added
+# 2026-09-03 at the user's request ("take the earliest profit... rather
+# than waiting for the full take") after discussing the tradeoff: a HARD
+# close at $6-10 would cap every winner there while losers still run to the
+# full risk cap, a bad risk/reward skew. This is the trailing alternative
+# instead: once unrealized profit reaches EARLY_PROFIT_TRIGGER_USD, the stop
+# starts trailing behind price, always locking in
+# EARLY_PROFIT_LOCK_FRACTION of whatever price distance has been gained past
+# entry so far (re-evaluated, and only ever ratcheted forward, on every
+# BREAKEVEN_POLL_SECONDS check below) — banking a growing profit floor
+# without hard-capping a trade that keeps running toward its full
+# take-profit. $8 is the midpoint of the user's $6-10 range.
+EARLY_PROFIT_TRIGGER_USD = 8.0
+EARLY_PROFIT_LOCK_FRACTION = 0.5
+
 
 def _kill_process_tree(pid: int) -> None:
     """Kill a process and every descendant it spawned (Windows-only, via taskkill /T).
@@ -1073,16 +1090,32 @@ def _weekend_flatten_and_notify() -> None:
     _write_weekend_state({"week": week_key})
 
 
-def _breakeven_stop_check() -> None:
-    """Move a live position's stop to breakeven once price is halfway to its TP.
+def _profit_protection_check() -> None:
+    """Ratchet a live position's stop toward locked-in profit as price moves favorably.
 
     Pure code, no LLM: reads the position's own entry/SL/TP (as submitted by
     the committee's original order) and the live mark price, and issues at
-    most one TRADE_ACTION_SLTP modify per check — idempotent, since a
-    position already at breakeven-or-better is skipped on every later check.
-    Positions with no SL or no TP attached are left alone (nothing to compute
-    a halfway point from). See BREAKEVEN_TRIGGER_FRACTION's comment for why
-    this exists instead of a literal partial-close dual take-profit.
+    most one TRADE_ACTION_SLTP modify per check. Two independent rules each
+    propose a candidate stop; only the more protective of the two (closer to
+    the live price, on the favorable side) is ever applied, and only when
+    that's actually an improvement over the current stop — so this never
+    loosens a stop, and a position already past both triggers is a no-op on
+    every later check:
+
+      1. Breakeven-at-halfway (original rule): once price is
+         BREAKEVEN_TRIGGER_FRACTION of the way from entry to the planned
+         take-profit, candidate stop = entry. Worst case becomes flat.
+      2. Early-profit trail (see EARLY_PROFIT_TRIGGER_USD's comment): once
+         unrealized profit reaches EARLY_PROFIT_TRIGGER_USD, candidate stop
+         = entry + EARLY_PROFIT_LOCK_FRACTION * (price - entry) — trails
+         price, locking in a growing floor instead of the flat breakeven
+         floor above.
+
+    Positions with no SL or no TP attached are left alone (nothing to
+    compute a halfway point from, and the $ trigger needs a stop-derived
+    contract size to convert to a price distance). See
+    BREAKEVEN_TRIGGER_FRACTION's comment for why this exists instead of a
+    literal partial-close dual take-profit.
     """
     for spec in TARGETS:
         trade = spec.get("trade")
@@ -1097,7 +1130,7 @@ def _breakeven_stop_check() -> None:
         try:
             positions = get_positions(trade["connection"]).get("positions", [])
         except Exception:
-            logger.exception("breakeven check: could not read positions for %s", trade["symbol"])
+            logger.exception("profit protection check: could not read positions for %s", trade["symbol"])
             continue
 
         ours = [
@@ -1111,7 +1144,7 @@ def _breakeven_stop_check() -> None:
             profile = profile_by_id(trade["connection"])
             config = mt5_sdk.build_config(profile.config, {})
         except Exception:
-            logger.exception("breakeven check: could not build config for %s", trade["connection"])
+            logger.exception("profit protection check: could not build config for %s", trade["connection"])
             continue
 
         for pos in ours:
@@ -1119,12 +1152,35 @@ def _breakeven_stop_check() -> None:
             side = pos.get("side")
             if entry is None or sl is None or tp is None or price is None or side not in ("buy", "sell"):
                 continue
-
             entry, sl, tp, price = float(entry), float(sl), float(tp), float(price)
+            is_buy = side == "buy"
+
+            # Rule 1: breakeven-at-halfway.
             halfway = entry + (tp - entry) * BREAKEVEN_TRIGGER_FRACTION
-            already_at_breakeven = sl >= entry if side == "buy" else sl <= entry
-            reached_halfway = price >= halfway if side == "buy" else price <= halfway
-            if already_at_breakeven or not reached_halfway:
+            reached_halfway = price >= halfway if is_buy else price <= halfway
+            breakeven_candidate = entry if reached_halfway else None
+
+            # Rule 2: early-profit trail. Needs contract size to convert the
+            # $ trigger into a price distance -- fails open (skips this rule
+            # only, breakeven above still applies) if the lookup fails.
+            trail_candidate = None
+            try:
+                size = mt5_sdk.contract_size(trade["symbol"])
+            except Exception:
+                size = None
+            if size and size > 0 and trade["lots"] > 0:
+                trigger_distance = EARLY_PROFIT_TRIGGER_USD / (size * trade["lots"])
+                gained = (price - entry) if is_buy else (entry - price)
+                if gained >= trigger_distance:
+                    locked = gained * EARLY_PROFIT_LOCK_FRACTION
+                    trail_candidate = entry + locked if is_buy else entry - locked
+
+            candidates = [c for c in (breakeven_candidate, trail_candidate) if c is not None]
+            if not candidates:
+                continue
+            new_sl = max(candidates) if is_buy else min(candidates)
+            improves = new_sl > sl if is_buy else new_sl < sl
+            if not improves:
                 continue
 
             try:
@@ -1132,18 +1188,18 @@ def _breakeven_stop_check() -> None:
                 # own docstring warns that an omitted side can get cleared
                 # rather than preserved on some brokers, so tp must be
                 # re-sent unchanged here even though only sl is moving.
-                result = mt5_sdk.modify_position(config, ticket=pos.get("ticket"), stop_loss=entry, take_profit=tp)
+                result = mt5_sdk.modify_position(config, ticket=pos.get("ticket"), stop_loss=new_sl, take_profit=tp)
             except Exception:
-                logger.exception("breakeven check: modify_position raised for ticket %s", pos.get("ticket"))
+                logger.exception("profit protection check: modify_position raised for ticket %s", pos.get("ticket"))
                 continue
             if result.get("status") == "ok":
                 logger.info(
-                    "breakeven check: moved SL to entry (%.3f) for ticket %s on %s (price %.3f past halfway %.3f)",
-                    entry, pos.get("ticket"), trade["symbol"], price, halfway,
+                    "profit protection check: moved SL to %.5f for ticket %s on %s (price %.5f, entry %.5f)",
+                    new_sl, pos.get("ticket"), trade["symbol"], price, entry,
                 )
             else:
                 logger.error(
-                    "breakeven check: modify_position failed for ticket %s: %s",
+                    "profit protection check: modify_position failed for ticket %s: %s",
                     pos.get("ticket"), result.get("error"),
                 )
 
@@ -2272,14 +2328,15 @@ def main() -> int:
 
     if args.loop:
         logger.info(
-            "starting loop mode, interval=%ss (breakeven-stop checked every %ss)",
+            "starting loop mode, interval=%ss (profit protection checked every %ss)",
             args.interval, BREAKEVEN_POLL_SECONDS,
         )
         # Two independent cadences share this one loop: the expensive,
         # LLM-costly committee pass on args.interval, and the free,
-        # code-only breakeven-stop check on the much shorter
-        # BREAKEVEN_POLL_SECONDS -- see BREAKEVEN_POLL_SECONDS's comment for
-        # why waiting for the slow cadence to react would be wrong. A full
+        # code-only profit protection check (breakeven + early-profit trail)
+        # on the much shorter BREAKEVEN_POLL_SECONDS -- see
+        # BREAKEVEN_POLL_SECONDS's comment for why waiting for the slow
+        # cadence to react would be wrong. A full
         # pass fires immediately on the first tick (last_full_pass starts
         # "due"), matching the loop's original always-run-on-start behavior.
         last_full_pass = time.monotonic() - args.interval
@@ -2310,9 +2367,9 @@ def main() -> int:
                         logger.exception("run_once() crashed; continuing after the normal interval")
             else:
                 try:
-                    _breakeven_stop_check()
+                    _profit_protection_check()
                 except Exception:
-                    logger.exception("breakeven stop check crashed; continuing")
+                    logger.exception("profit protection check crashed; continuing")
             time.sleep(BREAKEVEN_POLL_SECONDS)
     else:
         run_once()
