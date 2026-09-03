@@ -190,7 +190,16 @@ REVERSAL_THRESHOLD_FRACTION = 0.5  # favorable move >= this fraction of the stop
 # outright if breached; this constant lets the prompt tell the committee the
 # actual price-distance budget up front, so its stops land WITHIN the cap
 # instead of just getting denied more often for no smaller-risk benefit.
-MAX_LOSS_PER_ORDER_USD = 10.0
+#
+# Raised 2026-08-27's original $10 to $20 on 2026-09-03 at the user's request
+# after reviewing why the cap exists (see commit_mt5_mandate.py's docstring):
+# gold's 15m-ATR stop floor spent most of the prior two days above $10
+# (logs/risk_cap_gap_history.jsonl), so the cap was blocking most passes
+# outright rather than the committee choosing not to trade. Requires the
+# mandate to actually be re-committed (scripts/commit_mt5_mandate.py) for the
+# enforced side to match — this constant alone only changes the prompt/
+# pre-filter, not the gate's own limit.
+MAX_LOSS_PER_ORDER_USD = 20.0
 
 # Volatility floor for the stop-loss: below ATR_STOP_MULTIPLE x ATR, a stop
 # sits inside the instrument's normal noise band and risks getting clipped by
