@@ -215,6 +215,19 @@ SIGNAL_ACTIVITY_MAX_LINES = 5
 TRADE_JOURNAL_PATH = REPO_ROOT / "logs" / "trade_journal.json"
 JOURNAL_SUMMARY_WINDOW = 8
 
+# Grace period before a journal entry not found in get_positions() is
+# assumed genuinely closed, rather than not-yet-visible due to a brief
+# broker-side propagation delay right after order_send returns. Real
+# incident 2026-09-03/04: _journal_reconcile_closed runs a second time (to
+# build the emailed status report's "Track record" section) seconds after
+# run_committee's own reconcile+place+record_open sequence in the SAME
+# pass -- twice, a just-placed market order wasn't yet reflected in
+# get_positions() that soon, so a real, hours-long position got wrongly
+# marked closed/unknown 37-62ms after opening. Any entry younger than this
+# is left alone; the NEXT pass's reconciliation (by which time the broker
+# has caught up) resolves it correctly either way.
+JOURNAL_RECONCILE_GRACE = timedelta(seconds=120)
+
 # Excursion analysis: for every closed trade, pull the real price bars between
 # open and close and check whether it moved favorably before the outcome it
 # ended with — distinguishing a "clean" loss (moved against the position
@@ -956,11 +969,18 @@ def _journal_reconcile_closed(symbol: str, connection: str) -> None:
         if existing is None or (d.get("time") or "") >= (existing.get("time") or ""):
             latest_close_by_position[key] = d
 
+    now = datetime.now(timezone.utc)
     changed = False
     for entry in open_entries:
         ticket = str(entry.get("ticket"))
         if ticket in live_tickets:
             continue  # still open
+        try:
+            opened_at = datetime.fromisoformat(entry["opened_at"])
+        except (KeyError, TypeError, ValueError):
+            opened_at = None
+        if opened_at is not None and (now - opened_at) < JOURNAL_RECONCILE_GRACE:
+            continue  # too soon to trust a "not open" read — see JOURNAL_RECONCILE_GRACE
         deal = latest_close_by_position.get(ticket)
         entry["status"] = "closed"
         if deal:
