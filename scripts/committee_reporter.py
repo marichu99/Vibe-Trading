@@ -290,6 +290,16 @@ ATR_STOP_MULTIPLE = 1.5
 # needed; if it keeps firing, silver genuinely hasn't been added yet.
 MILESTONE_SILVER_EQUITY_USD = 100.0
 
+# LLM balance alert: added 2026-09-04 after a real incident — a pass failed
+# outright with DeepSeek returning 402 "Insufficient Balance" mid-run, and
+# the only visible signal was the buried "(ERROR)" tag in the emailed
+# subject line, easy to miss. Threshold is a judgment call, not derived from
+# spend rate: DeepSeek's own per-pass cost is a few cents, so $2 leaves
+# meaningful runway (several more passes) while still firing well before
+# the account actually hits zero and starts silently failing every pass.
+LLM_BALANCE_ALERT_THRESHOLD_USD = 2.0
+LLM_BALANCE_ALERT_STATE_PATH = REPO_ROOT / "logs" / "llm_balance_alert_state.json"
+
 # Trade-drought alert: the user asked to be told early if a symbol goes this
 # long with zero new trades, rather than only finding out at a scheduled
 # review. Added 2026-09-01 alongside the ATR volatility floor (fix 8) — that
@@ -2060,6 +2070,95 @@ def _check_trade_drought() -> None:
         _write_no_trade_alert_state(state)
 
 
+def _read_llm_balance_alert_state() -> dict:
+    try:
+        return json.loads(LLM_BALANCE_ALERT_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _write_llm_balance_alert_state(data: dict) -> None:
+    LLM_BALANCE_ALERT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LLM_BALANCE_ALERT_STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _deepseek_balance_usd() -> float | None:
+    """Read the DeepSeek platform account's USD balance, or None if unavailable.
+
+    Direct call to DeepSeek's own billing endpoint (not the OpenAI-compatible
+    chat completions API) — stdlib ``urllib`` only, no new dependency. A
+    no-op for any other provider (LANGCHAIN_PROVIDER != "deepseek"). Fails
+    open (returns None) on any network/parse error — this is purely an
+    advisory alert and must never block or slow down a pass.
+    """
+    if os.environ.get("LANGCHAIN_PROVIDER", "").strip().lower() != "deepseek":
+        return None
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        "https://api.deepseek.com/user/balance",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError):
+        return None
+
+    try:
+        usd_info = next(
+            (b for b in (payload.get("balance_infos") or []) if b.get("currency") == "USD"),
+            None,
+        )
+        return float(usd_info["total_balance"]) if usd_info else None
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _check_llm_balance_alert() -> None:
+    """Email once the LLM provider's account balance drops below the alert threshold.
+
+    Real incident 2026-09-04: a pass failed outright with DeepSeek returning
+    402 "Insufficient Balance", visible only as the emailed report's buried
+    "(ERROR)" subject tag — no dedicated alert existed for it. Re-arms like
+    _check_cap_fit_alert: fires once on the pass balance first drops below
+    LLM_BALANCE_ALERT_THRESHOLD_USD, clears once it recovers above it, so a
+    top-up followed by another dip alerts again rather than firing only
+    once ever. Pure read-only balance check; fails open (skips silently) if
+    the balance can't be read.
+    """
+    balance = _deepseek_balance_usd()
+    if balance is None:
+        return
+
+    state = _read_llm_balance_alert_state()
+    already_alerted = state.get("alerted") is True
+    below = balance < LLM_BALANCE_ALERT_THRESHOLD_USD
+
+    if below and not already_alerted:
+        try:
+            text = (
+                f"DeepSeek account balance is ${balance:.2f}, below the "
+                f"${LLM_BALANCE_ALERT_THRESHOLD_USD:.2f} alert threshold. Once it hits $0, every "
+                f"committee pass fails outright (402 Insufficient Balance) with no trade decision "
+                f"made and no position monitoring for that pass — top up soon to avoid a silent "
+                f"gap in live coverage."
+            )
+            send_email(f"[Vibe-Trading] LOW BALANCE — DeepSeek ${balance:.2f}", text)
+            state["alerted"] = True
+            _write_llm_balance_alert_state(state)
+        except Exception:
+            logger.exception("failed to send LLM balance alert email")
+    elif not below and already_alerted:
+        state["alerted"] = False
+        _write_llm_balance_alert_state(state)
+
+
 def _read_cap_fit_alert_state() -> dict:
     try:
         return json.loads(CAP_FIT_ALERT_STATE_PATH.read_text(encoding="utf-8"))
@@ -2233,6 +2332,7 @@ def run_once() -> None:
     # _check_silver_milestone()
     _check_trade_drought()
     _check_cap_fit_alert()
+    _check_llm_balance_alert()
     _log_cap_gap()
     for spec in TARGETS:
         target = spec.get("target", "?")
