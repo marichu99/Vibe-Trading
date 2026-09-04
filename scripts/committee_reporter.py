@@ -91,6 +91,27 @@ TARGETS: list[dict[str, object]] = [
         "committee": "investment_committee", "target": "EURUSD", "market": "forex",
         "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
     },
+    {
+        # LIVE — added 2026-09-04 at the user's request, as a genuine
+        # diversifier alongside EURUSD rather than a third same-bet pair.
+        # Checked real 60-day daily-return correlation against EURUSDm before
+        # adding: AUDUSD 0.61 (best of the USD-quoted candidates) vs. GBPUSD
+        # 0.83 and NZDUSD 0.76 (too correlated — mostly doubling the same
+        # EUR-bloc-vs-USD bet, not real diversification). USDCAD/USDJPY were
+        # more negatively correlated (-0.69 / -0.52) but were NOT added: MT5
+        # contract_size() returns raw units, so _max_stop_distance's
+        # MAX_LOSS_PER_ORDER_USD / (contract_size * lots) formula is only
+        # correct in USD terms when the QUOTE currency is USD (true for
+        # AUDUSD/EURUSD/GBPUSD, false for USDCAD/USDJPY where the quote
+        # currency is CAD/JPY) — using those today would silently mis-price
+        # the dollar risk cap without an added currency-conversion step.
+        # Verified read-only before enabling: AUDUSDm contract_size=100000,
+        # 15m-ATR stop floor ~$0.54 at 0.01 lots — comfortably inside the $4
+        # cap (see MAX_LOSS_PER_ORDER_USD above). max_stack=1: same
+        # no-pyramiding policy as the other live targets.
+        "committee": "investment_committee", "target": "AUDUSD", "market": "forex",
+        "trade": {"symbol": "AUDUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
+    },
     # PAUSED 2026-09-01: equity crossed the $100 silver milestone and this was
     # briefly enabled live, then deliberately reverted the same day — decided
     # to run gold-only for a full observation period (~1 month, not just the
@@ -217,11 +238,34 @@ REVERSAL_THRESHOLD_FRACTION = 0.5  # favorable move >= this fraction of the stop
 # commit_mt5_mandate.py's docstring): gold's 15m-ATR stop floor spent most
 # of the prior two days above $10 (logs/risk_cap_gap_history.jsonl), so the
 # cap was blocking most passes outright rather than the committee choosing
-# not to trade. Requires the mandate to actually be re-committed
-# (scripts/commit_mt5_mandate.py) for the enforced side to match — this
-# constant alone only changes the prompt/pre-filter, not the gate's own
-# limit.
-MAX_LOSS_PER_ORDER_USD = 30.0
+# not to trade.
+#
+# Dropped 2026-09-04 from $30 to $4, at the user's explicit request, to match
+# a stated portfolio policy: risk 10% of account equity total, split across
+# up to 3 concurrent trades ($123.74 equity at the time -> ~$4.12/trade). $30
+# was ~24% of equity on a single order — far looser than intended, even
+# though realized EURUSD stops had been landing at $0.7-2 in practice (the
+# ATR floor, not the cap, was the binding constraint day to day). No target's
+# 15m-ATR stop floor was pushed above this at the time (EURUSD ~$0.73,
+# AUDUSD ~$0.54, both at 0.01 lots) — verify again with a fresh
+# _atr_stop_floor call before relying on that if volatility has moved since.
+# Requires the mandate to actually be re-committed (scripts/
+# commit_mt5_mandate.py) for the enforced side to match — this constant
+# alone only changes the prompt/pre-filter, not the gate's own limit.
+MAX_LOSS_PER_ORDER_USD = 4.0
+
+# Portfolio risk policy (2026-09-04, user's request): risk PORTFOLIO_RISK_
+# FRACTION of account equity in total, spread across up to PORTFOLIO_MAX_
+# CONCURRENT_TRADES concurrent positions. The mandate gate has no portfolio-
+# level aggregate check (it only enforces the flat per-order ceiling above),
+# so this is approximated by sizing each order's OWN budget down to
+# equity * PORTFOLIO_RISK_FRACTION / PORTFOLIO_MAX_CONCURRENT_TRADES,
+# recomputed live each pass (see _effective_max_loss_usd) instead of a fixed
+# number that goes stale as equity moves. This can only TIGHTEN the
+# per-pass budget below MAX_LOSS_PER_ORDER_USD, never loosen it past the
+# mandate's own committed ceiling.
+PORTFOLIO_RISK_FRACTION = 0.10
+PORTFOLIO_MAX_CONCURRENT_TRADES = 3
 
 # Volatility floor for the stop-loss: below ATR_STOP_MULTIPLE x ATR, a stop
 # sits inside the instrument's normal noise band and risks getting clipped by
@@ -521,13 +565,48 @@ def _symbol_live_quote(symbol: str, connection: str) -> dict | None:
     return {"bid": float(bid), "ask": float(ask)}
 
 
-def _max_stop_distance(symbol: str, lots: float) -> float | None:
-    """Max stop-loss distance (price units) that stays within MAX_LOSS_PER_ORDER_USD.
+def _effective_max_loss_usd(connection: str) -> float:
+    """This pass's per-order risk budget: the tighter of the mandate ceiling
+    and the live portfolio-policy figure (equity * PORTFOLIO_RISK_FRACTION /
+    PORTFOLIO_MAX_CONCURRENT_TRADES).
 
-    ``MAX_LOSS_PER_ORDER_USD / (contract_size * lots)`` — the same formula the
-    mandate gate itself uses (in reverse) to compute planned loss. Returns
-    None if the contract size can't be read (fails open on the prompt side —
-    the gate still enforces the real cap regardless of what the prompt says).
+    Approximates a portfolio-level aggregate cap the mandate gate doesn't
+    implement (see MAX_LOSS_PER_ORDER_USD's own comment) by tightening the
+    per-order budget itself when equity is small enough that the policy asks
+    for less than the flat ceiling. Reads live equity via the same
+    connection/get_account call _live_circuit_breaker_check already uses.
+    Fails open to the static MAX_LOSS_PER_ORDER_USD ceiling on any read
+    error or a non-live connection — a stale/wider prompt-side budget is
+    still safe, since it can only ask for a stop up to what the gate would
+    allow anyway, never past it.
+    """
+    if connection not in LIVE_CONNECTIONS:
+        return MAX_LOSS_PER_ORDER_USD
+
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.service import get_account
+
+    try:
+        equity = float(get_account(connection)["account"]["equity"])
+    except Exception:
+        return MAX_LOSS_PER_ORDER_USD
+    if equity <= 0:
+        return MAX_LOSS_PER_ORDER_USD
+
+    portfolio_budget = equity * PORTFOLIO_RISK_FRACTION / PORTFOLIO_MAX_CONCURRENT_TRADES
+    return min(MAX_LOSS_PER_ORDER_USD, portfolio_budget)
+
+
+def _max_stop_distance(symbol: str, lots: float, budget_usd: float = MAX_LOSS_PER_ORDER_USD) -> float | None:
+    """Max stop-loss distance (price units) that stays within ``budget_usd``.
+
+    ``budget_usd / (contract_size * lots)`` — the same formula the mandate
+    gate itself uses (in reverse) to compute planned loss, applied against
+    whatever risk budget the caller passes (the flat MAX_LOSS_PER_ORDER_USD
+    ceiling by default, or the tighter live-equity-based figure from
+    _effective_max_loss_usd). Returns None if the contract size can't be
+    read (fails open on the prompt side — the gate still enforces the real
+    cap regardless of what the prompt says).
     """
     sys.path.insert(0, str(AGENT_DIR))
     from src.trading.connectors.mt5 import sdk as mt5_sdk
@@ -538,7 +617,7 @@ def _max_stop_distance(symbol: str, lots: float) -> float | None:
         return None
     if not size or size <= 0 or lots <= 0:
         return None
-    return MAX_LOSS_PER_ORDER_USD / (size * lots)
+    return budget_usd / (size * lots)
 
 
 def _atr_stop_floor(symbol: str) -> float | None:
@@ -1338,20 +1417,28 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
             f"level, and anchor to that, not to a research-data price."
         )
 
-    max_distance = _max_stop_distance(symbol, lots)
+    effective_budget = _effective_max_loss_usd(connection)
+    max_distance = _max_stop_distance(symbol, lots, effective_budget)
     if max_distance is not None:
+        budget_note = (
+            f"${effective_budget:.2f} (this account's {PORTFOLIO_RISK_FRACTION:.0%}-of-equity / "
+            f"{PORTFOLIO_MAX_CONCURRENT_TRADES}-concurrent-trade portfolio policy — tighter than the "
+            f"${MAX_LOSS_PER_ORDER_USD:.2f} mandate ceiling right now)"
+            if effective_budget < MAX_LOSS_PER_ORDER_USD
+            else f"${effective_budget:.2f}"
+        )
         risk_fact = (
-            f"HARD RISK LIMIT: at {lots} lots, this account's mandate caps worst-case planned loss at "
-            f"${MAX_LOSS_PER_ORDER_USD:.2f} — your stop-loss must be within {max_distance:.3f} price units "
-            f'of entry (whichever side is the losing side for "{symbol}"). This is enforced by the broker '
-            f"gate regardless of what you propose: a wider stop is denied outright, not trimmed for you. "
-            f"Size the stop AT or INSIDE this distance — do not propose a wider one and rely on it being "
-            f"rejected; a tighter, valid stop that actually executes is strictly better than a wider one "
-            f"that gets denied."
+            f"RISK BUDGET for this pass: at {lots} lots, size the stop-loss to stay within {budget_note} "
+            f"of worst-case planned loss — your stop-loss must be within {max_distance:.3f} price units "
+            f'of entry (whichever side is the losing side for "{symbol}"). The broker gate independently '
+            f"denies outright anything past this account's ${MAX_LOSS_PER_ORDER_USD:.2f} mandate ceiling "
+            f"regardless of what you propose, but size to the tighter budget above, not just the gate's "
+            f"outer limit — a tighter, valid stop that actually executes is strictly better than a wider "
+            f"one that risks denial or over-concentrates risk across concurrent trades."
         )
     else:
         risk_fact = (
-            f"Could not compute the exact price-distance budget for this account's ${MAX_LOSS_PER_ORDER_USD:.2f} "
+            f"Could not compute the exact price-distance budget for this account's ${effective_budget:.2f} "
             f"max-loss-per-order cap — size the stop conservatively; a wide stop risks outright denial by the "
             f"broker gate regardless of what you propose."
         )
@@ -2007,7 +2094,8 @@ def _check_cap_fit_alert() -> None:
         symbol = trade["symbol"]
         key = f"{trade['connection']}:{symbol}"
 
-        max_distance = _max_stop_distance(symbol, trade["lots"])
+        effective_budget = _effective_max_loss_usd(trade["connection"])
+        max_distance = _max_stop_distance(symbol, trade["lots"], effective_budget)
         atr_floor = _atr_stop_floor(symbol)
         if max_distance is None or atr_floor is None:
             continue
@@ -2019,7 +2107,7 @@ def _check_cap_fit_alert() -> None:
             try:
                 text = (
                     f'"{symbol}"\'s stop-loss risk cap now covers its own current volatility: the '
-                    f"${MAX_LOSS_PER_ORDER_USD:.2f} cap allows a {max_distance:.3f}-unit stop, and the "
+                    f"${effective_budget:.2f} budget allows a {max_distance:.3f}-unit stop, and the "
                     f"current ATR-based noise floor is only {atr_floor:.3f} units -- the ATR volatility floor "
                     f"should stop blocking trades on this symbol without any config change. Worth checking "
                     f"whether the next committee pass actually trades."
@@ -2053,7 +2141,8 @@ def _log_cap_gap() -> None:
             continue
         symbol = trade["symbol"]
 
-        max_distance = _max_stop_distance(symbol, trade["lots"])
+        effective_budget = _effective_max_loss_usd(trade["connection"])
+        max_distance = _max_stop_distance(symbol, trade["lots"], effective_budget)
         atr_floor = _atr_stop_floor(symbol)
         if max_distance is None or atr_floor is None:
             continue
@@ -2062,6 +2151,7 @@ def _log_cap_gap() -> None:
             "ts": datetime.now(timezone.utc).isoformat(),
             "symbol": symbol,
             "connection": trade["connection"],
+            "max_loss_budget_usd": round(effective_budget, 4),
             "max_stop_distance": round(max_distance, 4),
             "atr_stop_floor": round(atr_floor, 4),
             "gap": round(atr_floor - max_distance, 4),

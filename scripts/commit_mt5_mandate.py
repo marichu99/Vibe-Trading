@@ -44,6 +44,15 @@ lots (~0.00076 price units needed vs. a ~0.03-unit budget) — see the paused
 XAUUSD entry's comment in committee_reporter.py for the full context and
 the gold resume criteria.
 
+2026-09-04: dropped max_loss_per_order_usd from $30 to $4, and added
+AUDUSDm alongside EURUSDm in committee_reporter's TARGETS, both at the
+user's explicit request to match a stated portfolio policy (risk 10% of
+account equity total, split across up to 3 concurrent trades — $123.74
+equity at the time implies ~$4.12/trade). See committee_reporter.py's
+MAX_LOSS_PER_ORDER_USD comment and the new AUDUSD TARGETS entry for the
+full reasoning (correlation check against EURUSD, and why USDCAD/USDJPY
+were considered but not added).
+
 Re-run this (bump --lifetime-days or just re-run before the 30 days are up) to
 renew; it always issues a fresh mandate_id/consent record, so the old one is
 superseded, never mutated.
@@ -81,8 +90,8 @@ FLATTEN_ON_HALT = True
 ALLOWED_INSTRUMENTS = ["cfd"]
 ASSET_CLASSES = ["commodity", "forex"]  # commodity: gold (paused). forex: EURUSD, added 2026-09-03.
 
-# Added 2026-08-27, raised 2026-09-03 — see module docstring.
-MAX_LOSS_PER_ORDER_USD = 30.0
+# Added 2026-08-27, raised 2026-09-03, dropped 2026-09-04 — see module docstring.
+MAX_LOSS_PER_ORDER_USD = 4.0
 
 
 def _build_proposal() -> dict:
