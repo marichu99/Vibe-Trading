@@ -26,6 +26,7 @@ current price, then rounded to the symbol's volume step and clamped to its
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1042,6 +1043,24 @@ def _connect(config: MT5Config) -> ModuleType:
         kwargs["timeout"] = int(config.timeout * 1000)
 
     ok = module.initialize(**kwargs) if kwargs else module.initialize()
+    if not ok:
+        # A long-lived process's IPC handle to the terminal can go stale over
+        # time. Confirmed live 2026-09-05 and again 2026-09-07: the
+        # committee_reporter loop's connection failed with "-6: Terminal:
+        # Authorization failed" for hours across two separate incidents
+        # (~21-25h into that process's uptime each time), while a brand-new
+        # process against the exact same terminal/account connected
+        # instantly both times — nothing was actually wrong with the login.
+        # shutdown() + a fresh initialize() clears that stale handle without
+        # needing a whole process restart. Retried once; a second failure is
+        # a real problem (terminal not running, not signed in, wrong
+        # account, etc.), not staleness, and should raise as before.
+        try:
+            module.shutdown()
+        except Exception:
+            pass
+        time.sleep(0.5)
+        ok = module.initialize(**kwargs) if kwargs else module.initialize()
     if not ok:
         raise MT5ConnectionError(
             f"Could not attach to a running MetaTrader 5 terminal ({_last_error(module)}). "

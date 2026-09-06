@@ -51,9 +51,13 @@ class _FakeMT5:
     def __init__(self, *, trade_mode=0):
         self.trade_mode = trade_mode
         self.sent_requests: list[dict] = []
+        self.shutdown_calls = 0
 
     def initialize(self, **kwargs):
         return True
+
+    def shutdown(self):
+        self.shutdown_calls += 1
 
     def last_error(self):
         return (0, "no error")
@@ -113,6 +117,47 @@ def fake_terminal(monkeypatch):
     fake = _FakeMT5()
     monkeypatch.setattr(mt5, "_require_mt5", lambda: fake)
     return fake
+
+
+# --------------------------------------------------------------------------- #
+# Connection retry (stale IPC handle recovery)
+# --------------------------------------------------------------------------- #
+
+
+def test_mt5_connect_recovers_from_one_stale_initialize_failure(fake_terminal, monkeypatch) -> None:
+    """A long-lived process's connection can go stale (real incidents
+    2026-09-05/07: 'Authorization failed' for hours while a brand-new
+    process against the same terminal/account connected instantly) --
+    shutdown() + a fresh initialize() should recover within the same call,
+    with no propagated error."""
+    monkeypatch.setattr(mt5.time, "sleep", lambda seconds: None)
+    calls = {"n": 0}
+    real_initialize = fake_terminal.initialize
+
+    def flaky_initialize(**kwargs):
+        calls["n"] += 1
+        return False if calls["n"] == 1 else real_initialize(**kwargs)
+
+    monkeypatch.setattr(fake_terminal, "initialize", flaky_initialize)
+
+    module = mt5._connect(mt5.MT5Config(profile="paper"))
+
+    assert module is fake_terminal
+    assert calls["n"] == 2
+    assert fake_terminal.shutdown_calls == 1
+
+
+def test_mt5_connect_raises_when_second_initialize_also_fails(fake_terminal, monkeypatch) -> None:
+    """A second consecutive failure is a real connection problem (terminal
+    not running, not signed in, wrong account, ...), not staleness -- must
+    still raise, not retry forever."""
+    monkeypatch.setattr(mt5.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(fake_terminal, "initialize", lambda **kwargs: False)
+
+    with pytest.raises(mt5.MT5ConnectionError):
+        mt5._connect(mt5.MT5Config(profile="paper"))
+
+    assert fake_terminal.shutdown_calls == 1
 
 
 # --------------------------------------------------------------------------- #
