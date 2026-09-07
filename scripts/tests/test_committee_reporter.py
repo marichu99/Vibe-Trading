@@ -489,6 +489,64 @@ class TestPostTradeCapCheck:
 
 
 # ---------------------------------------------------------------------------
+# _spread_stop_floor / _post_trade_spread_check
+# ---------------------------------------------------------------------------
+
+
+class TestSpreadStopFloor:
+    def test_none_quote_returns_none(self) -> None:
+        assert cr._spread_stop_floor(None) is None
+
+    def test_computes_ratio_times_spread(self) -> None:
+        # spread = 0.00008 (0.8 pip EURUSD-style); floor = spread * MIN_STOP_TO_SPREAD_RATIO
+        floor = cr._spread_stop_floor({"bid": 1.16248, "ask": 1.16256})
+        assert floor == pytest.approx(0.00008 * cr.MIN_STOP_TO_SPREAD_RATIO, abs=1e-9)
+
+    def test_zero_or_negative_spread_returns_none(self) -> None:
+        assert cr._spread_stop_floor({"bid": 1.1626, "ask": 1.1626}) is None
+        assert cr._spread_stop_floor({"bid": 1.1627, "ask": 1.1626}) is None
+
+
+class TestPostTradeSpreadCheck:
+    def _trade(self, **overrides) -> dict:
+        base = {"symbol": "EURUSDm", "connection": "mt5-live-trade"}
+        base.update(overrides)
+        return base
+
+    def test_silent_when_ratio_meets_floor(self, monkeypatch) -> None:
+        # stop distance 0.00080, spread 0.00008 -> ratio 10x, floor is 8x.
+        monkeypatch.setattr(cr, "_symbol_live_quote", lambda symbol, conn: {"bid": 1.16248, "ask": 1.16256})
+        placed_order = {"fill_price": 1.16256, "stop_loss": 1.16176}
+        note = cr._post_trade_spread_check(self._trade(), placed_order)
+        assert note == ""
+
+    def test_warns_when_spread_dominates_the_stop(self, monkeypatch) -> None:
+        # stop distance 0.00020, spread 0.00008 -> ratio 2.5x, below the 8x floor.
+        monkeypatch.setattr(cr, "_symbol_live_quote", lambda symbol, conn: {"bid": 1.16248, "ask": 1.16256})
+        placed_order = {"fill_price": 1.16256, "stop_loss": 1.16236}
+        note = cr._post_trade_spread_check(self._trade(), placed_order)
+        assert "[AUTOMATED CHECK]" in note
+        assert "2.5x the live spread" in note
+
+    def test_silent_when_fill_price_missing(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_symbol_live_quote", lambda symbol, conn: {"bid": 1.0, "ask": 1.0001})
+        note = cr._post_trade_spread_check(self._trade(), {"stop_loss": 1.1620})
+        assert note == ""
+
+    def test_silent_when_quote_unavailable(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_symbol_live_quote", lambda symbol, conn: None)
+        placed_order = {"fill_price": 1.16256, "stop_loss": 1.16236}
+        note = cr._post_trade_spread_check(self._trade(), placed_order)
+        assert note == ""
+
+    def test_silent_when_stop_distance_is_zero(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_symbol_live_quote", lambda symbol, conn: {"bid": 1.16248, "ask": 1.16256})
+        placed_order = {"fill_price": 1.16256, "stop_loss": 1.16256}
+        note = cr._post_trade_spread_check(self._trade(), placed_order)
+        assert note == ""
+
+
+# ---------------------------------------------------------------------------
 # _last_json_line
 # ---------------------------------------------------------------------------
 

@@ -296,6 +296,18 @@ ATR_PERIOD = "15m"
 ATR_LOOKBACK_BARS = 14
 ATR_STOP_MULTIPLE = 1.5
 
+# Spread floor for the stop-loss: on a tight enough stop, the live bid/ask
+# spread alone (before any fill slippage) eats a large share of the planned
+# risk before the trade has even had a chance to work — a committee's own
+# CRO review has independently flagged this ("~10-25% drag from spread+slip
+# alone" on 20-22 pip EURUSD stops) but only as prose in one pass's report,
+# with nothing enforcing it on the next. MIN_STOP_TO_SPREAD_RATIO=8 caps the
+# spread's own share of the stop at 1/8 = 12.5% (before slippage on top),
+# the low end of that observed range, and folds into the same WAIT-if-
+# infeasible mechanism as ATR_STOP_MULTIPLE above (see _build_prompt) rather
+# than being left as a suggestion the committee can talk itself past.
+MIN_STOP_TO_SPREAD_RATIO = 8.0
+
 # Milestone reminder: the user asked to be told once the live account hits
 # this equity, to reconsider adding silver (XAGUSDm — the nearest cousin to
 # gold, least new plumbing) to the live portfolio. Auto-clears once a silver
@@ -675,6 +687,21 @@ def _atr_stop_floor(symbol: str) -> float | None:
     ]
     atr = sum(true_ranges) / len(true_ranges)
     return atr * ATR_STOP_MULTIPLE if atr > 0 else None
+
+
+def _spread_stop_floor(quote: dict | None) -> float | None:
+    """Minimum stop-loss distance (price units) to keep the live spread's own
+    share of that stop under 1/MIN_STOP_TO_SPREAD_RATIO, or None if unavailable.
+
+    Takes the same ``{"bid": float, "ask": float}`` dict ``_build_prompt``
+    already fetched via ``_symbol_live_quote`` for the prompt's quote_fact —
+    no extra broker round trip. Returns None on a missing/non-positive
+    spread (fails open, same convention as ``_atr_stop_floor``).
+    """
+    if not quote:
+        return None
+    spread = quote.get("ask", 0) - quote.get("bid", 0)
+    return spread * MIN_STOP_TO_SPREAD_RATIO if spread > 0 else None
 
 
 def _symbol_position_summary(symbol: str, connection: str) -> dict:
@@ -1489,35 +1516,53 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
         )
 
     atr_floor = _atr_stop_floor(symbol)
-    if atr_floor is None:
+    spread_floor = _spread_stop_floor(quote)
+    # Whichever constraint is currently wider governs — a stop that clears
+    # the ATR noise floor but leaves the spread eating a huge share of the
+    # risk budget (or vice versa) is still a bad stop. See
+    # MIN_STOP_TO_SPREAD_RATIO's own comment for why the spread side exists.
+    floor_candidates = [
+        (v, reason) for v, reason in (
+            (atr_floor, f"{ATR_STOP_MULTIPLE}x the last {ATR_LOOKBACK_BARS}-bar {ATR_PERIOD} ATR"),
+            (spread_floor, f"{MIN_STOP_TO_SPREAD_RATIO:.0f}x the live bid/ask spread"),
+        ) if v is not None
+    ]
+    stop_floor, floor_reason = max(floor_candidates, key=lambda pair: pair[0]) if floor_candidates else (None, None)
+
+    if stop_floor is None:
         volatility_fact = None
-    elif max_distance is not None and atr_floor > max_distance:
+    elif max_distance is not None and stop_floor > max_distance:
         volatility_fact = (
-            f"VOLATILITY FLOOR — READ BEFORE TRADING: the minimum stop distance to sit outside \"{symbol}\"'s "
-            f"current normal noise ({ATR_STOP_MULTIPLE}x the last {ATR_LOOKBACK_BARS}-bar {ATR_PERIOD} ATR) is "
-            f"{atr_floor:.3f} price units — WIDER than the {max_distance:.3f}-unit hard risk limit above. "
-            f"There is no stop that is both inside the risk cap AND outside normal noise right now: any "
-            f"cap-compliant stop will very likely get clipped by ordinary fluctuation regardless of whether "
-            f"the directional thesis is correct (this is exactly how a prior trade lost $7 in 10 minutes — "
-            f"an 8-unit stop against a 6-unit ATR). Given this, the decision must be WAIT — do not place a "
-            f"trade this pass no matter how strong the setup looks; note in your report that current "
-            f"volatility does not fit this account's risk budget at this position size."
+            f"VOLATILITY/SPREAD FLOOR — READ BEFORE TRADING: the minimum stop distance to sit outside "
+            f"\"{symbol}\"'s current normal noise and keep the live spread's own share of the stop under "
+            f"1/{MIN_STOP_TO_SPREAD_RATIO:.0f} is {stop_floor:.3f} price units (binding constraint right now: "
+            f"{floor_reason}) — WIDER than the {max_distance:.3f}-unit hard risk limit above. There is no "
+            f"stop that is both inside the risk cap AND outside normal noise/cost right now: any cap-compliant "
+            f"stop will very likely get clipped by ordinary fluctuation, or hand a large share of its planned "
+            f"risk straight to the spread, regardless of whether the directional thesis is correct (this is "
+            f"exactly how a prior trade lost $7 in 10 minutes — an 8-unit stop against a 6-unit ATR). Given "
+            f"this, the decision must be WAIT — do not place a trade this pass no matter how strong the setup "
+            f"looks; note in your report that current volatility/spread conditions do not fit this account's "
+            f"risk budget at this position size."
         )
     elif max_distance is not None:
         volatility_fact = (
-            f"Volatility floor: to sit outside \"{symbol}\"'s current normal noise, size the stop-loss at or "
-            f"beyond {atr_floor:.3f} price units from entry ({ATR_STOP_MULTIPLE}x the last {ATR_LOOKBACK_BARS}"
-            f"-bar {ATR_PERIOD} ATR) — a stop tighter than this risks getting clipped by ordinary fluctuation "
-            f"before the thesis has a chance to play out, independent of whether the thesis is right. Combined "
-            f"with the hard risk limit above, your stop should land between {atr_floor:.3f} and "
-            f"{max_distance:.3f} price units from entry."
+            f"Volatility/spread floor: to sit outside \"{symbol}\"'s current normal noise and keep the live "
+            f"spread's own share of the stop under 1/{MIN_STOP_TO_SPREAD_RATIO:.0f}, size the stop-loss at or "
+            f"beyond {stop_floor:.3f} price units from entry (binding constraint right now: {floor_reason}) — "
+            f"a stop tighter than this risks getting clipped by ordinary fluctuation, or paying away a large "
+            f"share of its planned risk in spread alone, before the thesis has a chance to play out, "
+            f"independent of whether the thesis is right. Combined with the hard risk limit above, your stop "
+            f"should land between {stop_floor:.3f} and {max_distance:.3f} price units from entry."
         )
     else:
         volatility_fact = (
-            f"Volatility floor: to sit outside \"{symbol}\"'s current normal noise, size the stop-loss at or "
-            f"beyond {atr_floor:.3f} price units from entry ({ATR_STOP_MULTIPLE}x the last {ATR_LOOKBACK_BARS}"
-            f"-bar {ATR_PERIOD} ATR) — a stop tighter than this risks getting clipped by ordinary fluctuation "
-            f"before the thesis has a chance to play out, independent of whether the thesis is right."
+            f"Volatility/spread floor: to sit outside \"{symbol}\"'s current normal noise and keep the live "
+            f"spread's own share of the stop under 1/{MIN_STOP_TO_SPREAD_RATIO:.0f}, size the stop-loss at or "
+            f"beyond {stop_floor:.3f} price units from entry (binding constraint right now: {floor_reason}) — "
+            f"a stop tighter than this risks getting clipped by ordinary fluctuation, or paying away a large "
+            f"share of its planned risk in spread alone, before the thesis has a chance to play out, "
+            f"independent of whether the thesis is right."
         )
     volatility_block = f"{volatility_fact}\n\n" if volatility_fact else ""
 
@@ -1670,6 +1715,7 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     traded = bool(placed_order)
     if traded:
         report_text = report_text + _post_trade_cap_check(trade)
+        report_text = report_text + _post_trade_spread_check(trade, placed_order)
         _journal_record_open(trade["symbol"], trade["connection"], placed_order)
     elif trade:
         blocked_note = _blocked_order_note(run_id)
@@ -1704,6 +1750,49 @@ def _post_trade_cap_check(trade: dict) -> str:
             f"The agent's own count was wrong somewhere; check manually."
         )
     return ""
+
+
+def _post_trade_spread_check(trade: dict, placed_order: dict) -> str:
+    """Defense-in-depth: re-verify the spread-to-stop ratio AFTER a trade, in code.
+
+    Mirrors _post_trade_cap_check — _build_prompt's VOLATILITY/SPREAD FLOOR
+    text gives the agent the rule (and forces WAIT when no compliant stop
+    exists), but nothing forces it to actually follow that guidance for the
+    stop it ends up submitting. This re-derives the ratio from the
+    connector's own verified fill/stop-loss (never the agent's own report)
+    and a fresh live quote, and surfaces a clear warning in the email if the
+    spread ended up eating more than 1/MIN_STOP_TO_SPREAD_RATIO of the
+    actual stop distance — informational only (does not close the
+    position): unlike a same-direction stacking cap breach, a wide spread
+    share is a cost/quality issue on an otherwise valid trade, not something
+    that warrants an automated unwind of a position that's already live.
+    """
+    entry = placed_order.get("fill_price")
+    stop_loss = placed_order.get("stop_loss")
+    if entry is None or stop_loss is None:
+        return ""
+    stop_distance = abs(float(entry) - float(stop_loss))
+    if stop_distance <= 0:
+        return ""
+
+    quote = _symbol_live_quote(trade["symbol"], trade["connection"])
+    if not quote:
+        return ""
+    spread = quote["ask"] - quote["bid"]
+    if spread <= 0:
+        return ""
+
+    ratio = stop_distance / spread
+    if ratio >= MIN_STOP_TO_SPREAD_RATIO:
+        return ""
+    spread_share = spread / stop_distance
+    return (
+        f"\n\n[AUTOMATED CHECK] {trade['symbol']}'s actual stop distance ({stop_distance:.5f}) is only "
+        f"{ratio:.1f}x the live spread ({spread:.5f}) — below the {MIN_STOP_TO_SPREAD_RATIO:.0f}x floor, "
+        f"meaning the spread alone accounts for ~{spread_share:.0%} of this stop's planned risk (before any "
+        f"fill slippage on top). The prompt's volatility/spread floor should have prevented this; check why "
+        f"it didn't."
+    )
 
 
 def _last_json_line(stdout: str | None) -> dict | None:
