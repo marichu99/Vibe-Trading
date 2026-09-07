@@ -476,10 +476,19 @@ Rules:
 
 
 def _is_tool_success(result: str) -> bool:
-    """Return True if the tool result does not look like an error response."""
+    """Return True if the tool result does not look like an error/refusal response.
+
+    The live-trading mandate gate (src/live/sdk_order_gate.py) returns
+    status "blocked" or "not_authorized" — not "error" — when it refuses an
+    order before it ever reaches the broker (fail-closed checks, halted,
+    expired mandate, etc). Treating those as success previously marked a
+    never-executed, non-repeatable trading_place_order call as
+    "already completed successfully", permanently blocking any retry for the
+    rest of the run even though nothing was sent to the broker.
+    """
     try:
         data = json.loads(result)
-        if isinstance(data, dict) and data.get("status") == "error":
+        if isinstance(data, dict) and data.get("status") in ("error", "blocked", "not_authorized"):
             return False
     except (json.JSONDecodeError, TypeError):
         pass

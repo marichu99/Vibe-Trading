@@ -285,6 +285,15 @@ class TestIsToolSuccess:
     def test_failure_json_error(self) -> None:
         assert _is_tool_success('{"status": "error", "error": "boom"}') is False
 
+    def test_failure_json_blocked(self) -> None:
+        # The live-trading mandate gate refuses an order (never reached the
+        # broker) with status "blocked", not "error" — must not be dedup'd
+        # as an already-completed trading_place_order call.
+        assert _is_tool_success('{"status": "blocked", "decision": "pause_for_reauth"}') is False
+
+    def test_failure_json_not_authorized(self) -> None:
+        assert _is_tool_success('{"status": "not_authorized"}') is False
+
     def test_success_non_dict_json(self) -> None:
         assert _is_tool_success("[1, 2, 3]") is True
 
