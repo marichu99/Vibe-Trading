@@ -925,17 +925,30 @@ def _journal_reconcile_closed(symbol: str, connection: str) -> None:
     """Mark journal entries closed once their position is no longer open.
 
     Pure API reads — no LLM tokens spent. Matches by ticket against current
-    open positions (still open -> left alone) and, failing that, against the
-    real CLOSING deal (magic == OUR_MAGIC, position_id == our ticket, entry
-    != 0) to record the real exit price/P&L — never trusts the committee's
-    own report of what happened. Fails open on any read error (never
-    corrupts the journal over a transient connector failure).
+    open positions AND still-resting pending orders (either -> left alone)
+    and, failing that, against the real CLOSING deal (magic == OUR_MAGIC,
+    position_id == our ticket, entry != 0) to record the real exit
+    price/P&L — never trusts the committee's own report of what happened.
+    Fails open on any read error (never corrupts the journal over a
+    transient connector failure).
 
     Regression: MT5's closing deal carries `order == 0` (no usable back-
     reference to the opening order); the only reliable link is `position_id`.
     Matching on order_id/deal-ticket instead (as this originally did) grabbed
     the OPENING deal — which always reports profit=0.0 — and recorded a real
     +$29 take-profit win as a false "breakeven".
+
+    Regression: a journal entry recorded for a pending limit/stop order (see
+    _journal_record_open) never appears in get_positions() until it fills —
+    that's true for its entire resting lifetime, not just a brief race, so
+    the JOURNAL_RECONCILE_GRACE window doesn't help. Checking only
+    get_positions() marked resting orders "closed"/"unknown" as soon as the
+    grace period elapsed, even while they stayed live on the broker for
+    hours (tickets 1048913897 on 2026-09-05, 1050385917 on 2026-09-07 — both
+    manually corrected after the fact). get_open_orders()'s own response
+    already carries the resting-order list alongside `executions` (same
+    call, no extra round trip) — folding it into the "still open" set fixes
+    this at the source instead of hand-patching the journal again next time.
     """
     entries = _read_journal()
     open_entries = [e for e in entries if e.get("status") == "open" and e.get("symbol") == symbol]
@@ -951,9 +964,11 @@ def _journal_reconcile_closed(symbol: str, connection: str) -> None:
         return
 
     try:
-        executions = get_open_orders(connection, include_executions=True).get("executions", [])
+        orders_resp = get_open_orders(connection, include_executions=True)
     except Exception:
-        executions = []
+        orders_resp = {}
+    live_tickets |= {str(o.get("order_id")) for o in orders_resp.get("open_orders", [])}
+    executions = orders_resp.get("executions", [])
     our_closing_deals = [
         d for d in executions
         if d.get("magic") == OUR_MAGIC and d.get("entry") not in (0, None)
