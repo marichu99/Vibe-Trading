@@ -430,6 +430,41 @@ BREAKEVEN_BUFFER_POINTS = 20
 # instrument's actual current noise level instead of guessing one constant.
 EARLY_PROFIT_TRIGGER_USD = 8.0
 
+# Time-decay stop: closes a real gap found 2026-09-08. A PM decision routinely
+# commits to a same-day "hard flat by HH:MM UTC" deadline, but nothing in
+# this script ever enforced that -- only the NEXT scheduled ~2h committee
+# pass could notice and close it, which can land well past the stated
+# deadline (or, for a target that came back a genuine WAIT, not run again on
+# that symbol for hours). Meanwhile the two rules above already ratchet a
+# WINNING position's locked-in floor up as it moves favorably -- a losing
+# position got no equivalent treatment and kept its full original stop
+# distance live indefinitely. This is asymmetric: winners get cut early by
+# nothing more than next-cycle timing luck, losers keep full risk live
+# until someone gets around to closing them.
+#
+# MAX_HOLD_HOURS is a code-owned ceiling (not parsed from the PM's own
+# prose deadline -- far more robust than trying to extract a machine-
+# readable time from free text). Past TIME_DECAY_START_FRACTION of that
+# window, each BREAKEVEN_POLL_SECONDS check proposes tightening the stop to
+# the same ATR-floor distance Rule 2 already trails winners at (see
+# _atr_stop_floor) -- gated on elapsed time instead of unrealized profit,
+# so it only ever tightens (the shared "improves" check below still applies)
+# and is a no-op once there's nothing left to protect. At MAX_HOLD_HOURS the
+# position is flattened unconditionally regardless of P&L -- this is this
+# script's first actual automated intraday time-stop; previously only the
+# weekend-flatten and the equity-drawdown breaker closed anything outside a
+# position's own SL/TP. 40h and 0.75 are starting points, not derived from
+# data, but 40h specifically was checked against the currently-open AUDUSDm
+# position's own PM-stated deadline ("hard time-stop ... Tue ~21:00 UTC",
+# ~36.7h from its 2026-09-07 08:17 UTC open) before this rule went live
+# 2026-09-08, so rollout doesn't retroactively cut that trade short of its
+# own plan -- a tighter default (30h) would have started tightening its
+# stop within minutes of deploy and flattened it ~6h before that stated
+# deadline. Override per-target via a "max_hold_hours" key on that target's
+# `trade` dict if a symbol needs a different window.
+MAX_HOLD_HOURS = 40.0
+TIME_DECAY_START_FRACTION = 0.75
+
 
 def _kill_process_tree(pid: int) -> None:
     """Kill a process and every descendant it spawned (Windows-only, via taskkill /T).
@@ -1260,16 +1295,17 @@ def _weekend_flatten_and_notify() -> None:
 
 
 def _profit_protection_check() -> None:
-    """Ratchet a live position's stop toward locked-in profit as price moves favorably.
+    """Ratchet a live position's stop toward locked-in profit, and enforce a time-stop.
 
     Pure code, no LLM: reads the position's own entry/SL/TP (as submitted by
     the committee's original order) and the live mark price, and issues at
-    most one TRADE_ACTION_SLTP modify per check. Two independent rules each
-    propose a candidate stop; only the more protective of the two (closer to
-    the live price, on the favorable side) is ever applied, and only when
-    that's actually an improvement over the current stop — so this never
-    loosens a stop, and a position already past both triggers is a no-op on
-    every later check:
+    most one TRADE_ACTION_SLTP modify (or one close) per check. Three
+    independent rules each propose a candidate stop; only the more
+    protective of the proposed candidates (closer to the live price, on the
+    favorable side) is ever applied, and only when that's actually an
+    improvement over the current stop — so the modify path never loosens a
+    stop, and a position already past every trigger is a no-op on every
+    later check:
 
       1. Breakeven-at-halfway (original rule): once price is
          BREAKEVEN_TRIGGER_FRACTION of the way from entry to the planned
@@ -1281,11 +1317,24 @@ def _profit_protection_check() -> None:
          candidate stop = price minus _atr_stop_floor(symbol) for a buy (plus,
          for a sell) — trails price at a distance sized to the instrument's
          own current noise level, instead of the flat breakeven floor above.
+      3. Time-decay (see MAX_HOLD_HOURS' comment): past TIME_DECAY_START_
+         FRACTION of MAX_HOLD_HOURS since the position opened (per the
+         broker's own reported open time, not the journal's), candidate
+         stop = the same ATR-floor distance as rule 2, gated on elapsed
+         time instead of profit — a losing position's maximum remaining
+         risk shrinks as its deadline nears too, not just a winner's locked-
+         in floor. At MAX_HOLD_HOURS the position is flattened
+         unconditionally, regardless of P&L or the other two rules.
 
-    Positions with no SL or no TP attached are left alone (nothing to
-    compute a halfway point from, and the $ trigger needs a stop-derived
-    contract size to convert to a price distance). See
-    BREAKEVEN_TRIGGER_FRACTION's comment for why this exists instead of a
+    Positions with no SL or no TP attached are left alone for rules 1-2 and
+    rule 3's tightening half (nothing to compute a halfway point from, the
+    $ trigger needs a stop-derived contract size, and modifying the stop
+    safely requires re-sending the existing tp unchanged — see
+    modify_position's own warning) — but rule 3's unconditional flatten at
+    MAX_HOLD_HOURS still applies regardless, since it only needs the
+    position's own open time, and a stray naked (no-SL/TP) position is
+    exactly the case that most needs a backstop. See
+    BREAKEVEN_TRIGGER_FRACTION's comment for why rule 1 exists instead of a
     literal partial-close dual take-profit.
     """
     for spec in TARGETS:
@@ -1319,6 +1368,43 @@ def _profit_protection_check() -> None:
             continue
 
         for pos in ours:
+            # Rule 3a: unconditional flatten at MAX_HOLD_HOURS (see its own
+            # comment). Checked first and independent of the entry/sl/tp/
+            # price gate below -- needs only the broker's own reported open
+            # time, so it still backstops a stray naked position that the
+            # rest of this function can't otherwise touch.
+            max_hold_hours = trade.get("max_hold_hours", MAX_HOLD_HOURS)
+            elapsed_hours = None
+            opened_raw = pos.get("time")
+            if opened_raw:
+                try:
+                    elapsed_hours = (
+                        datetime.now(timezone.utc) - datetime.fromisoformat(str(opened_raw))
+                    ).total_seconds() / 3600.0
+                except (TypeError, ValueError):
+                    elapsed_hours = None
+
+            if elapsed_hours is not None and elapsed_hours >= max_hold_hours:
+                try:
+                    result = mt5_sdk.close_position(config, ticket=pos.get("ticket"))
+                except Exception:
+                    logger.exception(
+                        "profit protection check: time-stop close_position raised for ticket %s", pos.get("ticket"),
+                    )
+                    continue
+                if result.get("status") == "ok":
+                    logger.info(
+                        "profit protection check: time-stop flattened ticket %s on %s after %.1fh "
+                        "(open P&L at trigger %s)",
+                        pos.get("ticket"), trade["symbol"], elapsed_hours, pos.get("profit"),
+                    )
+                else:
+                    logger.error(
+                        "profit protection check: time-stop close_position failed for ticket %s: %s",
+                        pos.get("ticket"), result.get("error"),
+                    )
+                continue  # this ticket is handled either way -- nothing else applies to it this pass
+
             entry, sl, tp, price = pos.get("price_open"), pos.get("stop_loss"), pos.get("take_profit"), pos.get("price_current")
             side = pos.get("side")
             if entry is None or sl is None or tp is None or price is None or side not in ("buy", "sell"):
@@ -1362,7 +1448,19 @@ def _profit_protection_check() -> None:
                     if atr_distance:
                         trail_candidate = price - atr_distance if is_buy else price + atr_distance
 
-            candidates = [c for c in (breakeven_candidate, trail_candidate) if c is not None]
+            # Rule 3b: time-decay tightening, past TIME_DECAY_START_FRACTION
+            # of max_hold_hours (see MAX_HOLD_HOURS' comment) but short of
+            # the unconditional flatten above. Same ATR-floor distance as
+            # rule 2's trail, gated on elapsed time instead of profit --
+            # the shared "improves" check below still means this can only
+            # tighten, never widen, a losing position's stop.
+            decay_candidate = None
+            if elapsed_hours is not None and elapsed_hours >= max_hold_hours * TIME_DECAY_START_FRACTION:
+                atr_distance = _atr_stop_floor(trade["symbol"])
+                if atr_distance:
+                    decay_candidate = price - atr_distance if is_buy else price + atr_distance
+
+            candidates = [c for c in (breakeven_candidate, trail_candidate, decay_candidate) if c is not None]
             if not candidates:
                 continue
             new_sl = max(candidates) if is_buy else min(candidates)

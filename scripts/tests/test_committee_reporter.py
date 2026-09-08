@@ -678,3 +678,217 @@ class TestStatusLogSummary:
 
         assert "next_due" not in result
         assert result["last_result_tag"] == "TRADED"
+
+
+# ---------------------------------------------------------------------------
+# _profit_protection_check -- rule 3 (time-decay stop / hard time-stop)
+# ---------------------------------------------------------------------------
+
+
+class TestProfitProtectionCheckTimeDecay:
+    """Regression coverage for the 2026-09-08 time-decay/time-stop rule.
+
+    A PM's "hard flat by HH:MM UTC" was prose only -- nothing enforced it,
+    and a losing position kept its full original stop distance live
+    indefinitely while a winner already got its risk ratcheted down by
+    rules 1-2. These tests cover the new rule 3 in isolation via a single
+    fake TARGETS entry, mocking every MT5/service read so no real broker
+    call is ever made.
+    """
+
+    SYMBOL = "EURUSDm"
+    CONNECTION = "mt5-live-trade"
+
+    def _trade(self, **overrides) -> dict:
+        base = {"symbol": self.SYMBOL, "connection": self.CONNECTION, "lots": 0.01, "max_stack": 1}
+        base.update(overrides)
+        return base
+
+    def _position(self, *, hours_open: float | None, side="buy", entry=1.1600, sl=1.1580, tp=1.1650,
+                   price=1.1605, ticket="1", profit=0.0, **overrides) -> dict:
+        opened = (
+            (datetime.now(timezone.utc) - timedelta(hours=hours_open)).isoformat()
+            if hours_open is not None else None
+        )
+        pos = {
+            "ticket": ticket, "symbol": self.SYMBOL, "magic": cr.OUR_MAGIC, "side": side,
+            "price_open": entry, "stop_loss": sl, "take_profit": tp, "price_current": price,
+            "time": opened, "profit": profit,
+        }
+        pos.update(overrides)
+        return pos
+
+    def _patch_broker(self, monkeypatch, *, positions, atr_floor=0.0010,
+                       modify_result=None, close_result=None) -> dict:
+        """Wires every MT5/service call _profit_protection_check makes to a
+        fake, and returns dicts recording each modify_position/close_position
+        call for assertions."""
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+        import src.trading.profiles as profiles_module
+        import src.trading.service as service
+
+        monkeypatch.setattr(cr, "TARGETS", [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade()}])
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+
+        class _FakeProfile:
+            config: dict = {}
+
+        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: _FakeProfile())
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: "FAKE_CONFIG")
+        monkeypatch.setattr(mt5_sdk, "point_size", lambda symbol: 0.00001)
+        monkeypatch.setattr(mt5_sdk, "contract_size", lambda symbol: 100_000)
+        monkeypatch.setattr(cr, "_atr_stop_floor", lambda symbol: atr_floor)
+
+        calls = {"modify": [], "close": []}
+
+        def _modify(config, *, ticket, stop_loss, take_profit):
+            calls["modify"].append({"ticket": ticket, "stop_loss": stop_loss, "take_profit": take_profit})
+            return modify_result or {"status": "ok"}
+
+        def _close(config, *, ticket):
+            calls["close"].append({"ticket": ticket})
+            return close_result or {"status": "ok", "fill_price": 1.0, "closed_volume": 0.01}
+
+        monkeypatch.setattr(mt5_sdk, "modify_position", _modify)
+        monkeypatch.setattr(mt5_sdk, "close_position", _close)
+        return calls
+
+    def test_flattens_at_max_hold_hours(self, monkeypatch) -> None:
+        pos = self._position(hours_open=cr.MAX_HOLD_HOURS + 1, ticket="T1")
+        calls = self._patch_broker(monkeypatch, positions=[pos])
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == [{"ticket": "T1"}]
+        assert calls["modify"] == []
+
+    def test_flattens_a_naked_position_with_no_sl_tp(self, monkeypatch) -> None:
+        """The unconditional flatten must not depend on sl/tp/entry being
+        present -- a stray naked position is exactly the case that most
+        needs the backstop."""
+        pos = self._position(hours_open=cr.MAX_HOLD_HOURS + 1, ticket="T2", sl=None, tp=None, entry=None)
+        calls = self._patch_broker(monkeypatch, positions=[pos])
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == [{"ticket": "T2"}]
+
+    def test_tightens_stop_once_decay_window_starts(self, monkeypatch) -> None:
+        start_hours = cr.MAX_HOLD_HOURS * cr.TIME_DECAY_START_FRACTION + 0.5
+        # buy: price 1.1605, atr_floor 0.0010 -> candidate 1.1595, tighter
+        # than the existing sl (1.1580).
+        pos = self._position(hours_open=start_hours, ticket="T3", side="buy", price=1.1605, sl=1.1580)
+        calls = self._patch_broker(monkeypatch, positions=[pos], atr_floor=0.0010)
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == []
+        assert calls["modify"] == [{"ticket": "T3", "stop_loss": pytest.approx(1.1595), "take_profit": pos["take_profit"]}]
+
+    def test_no_op_before_decay_window_starts(self, monkeypatch) -> None:
+        just_under = cr.MAX_HOLD_HOURS * cr.TIME_DECAY_START_FRACTION - 0.5
+        # Same geometry as the tightening test above, but too early -- and
+        # rules 1/2 don't trigger either (price hasn't reached halfway,
+        # profit hasn't reached EARLY_PROFIT_TRIGGER_USD).
+        pos = self._position(hours_open=just_under, ticket="T4", side="buy", price=1.1605, sl=1.1580, tp=1.1700)
+        calls = self._patch_broker(monkeypatch, positions=[pos], atr_floor=0.0010)
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == []
+        assert calls["modify"] == []
+
+    def test_never_widens_a_stop_already_tighter_than_the_decay_candidate(self, monkeypatch) -> None:
+        start_hours = cr.MAX_HOLD_HOURS * cr.TIME_DECAY_START_FRACTION + 0.5
+        # candidate would be 1.1595 (price 1.1605 - atr 0.0010), but the
+        # existing stop (1.1600) is already tighter -- must not loosen it.
+        pos = self._position(hours_open=start_hours, ticket="T5", side="buy", price=1.1605, sl=1.1600)
+        calls = self._patch_broker(monkeypatch, positions=[pos], atr_floor=0.0010)
+
+        cr._profit_protection_check()
+
+        assert calls["modify"] == []
+
+    def test_missing_open_time_degrades_gracefully(self, monkeypatch) -> None:
+        """No pos['time'] -> elapsed_hours is None -> rule 3 contributes
+        nothing, but rules 1/2 must still run normally (no crash)."""
+        pos = self._position(hours_open=None, ticket="T6", side="buy", price=1.1605, sl=1.1580, tp=1.1700)
+        calls = self._patch_broker(monkeypatch, positions=[pos], atr_floor=0.0010)
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == []
+        assert calls["modify"] == []
+
+    def test_malformed_open_time_degrades_gracefully(self, monkeypatch) -> None:
+        pos = self._position(hours_open=cr.MAX_HOLD_HOURS + 1, ticket="T7")
+        pos["time"] = "not-a-timestamp"
+        calls = self._patch_broker(monkeypatch, positions=[pos])
+
+        cr._profit_protection_check()  # must not raise
+
+        assert calls["close"] == []
+
+    def test_per_target_max_hold_hours_override(self, monkeypatch) -> None:
+        custom_max = 4.0
+        import src.trading.service as service
+        import src.trading.profiles as profiles_module
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+
+        pos = self._position(hours_open=custom_max + 1, ticket="T8")
+        monkeypatch.setattr(
+            cr, "TARGETS",
+            [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade(max_hold_hours=custom_max)}],
+        )
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": [pos]})
+
+        class _FakeProfile:
+            config: dict = {}
+
+        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: _FakeProfile())
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: "FAKE_CONFIG")
+        calls = {"close": []}
+        monkeypatch.setattr(mt5_sdk, "close_position", lambda config, *, ticket: calls["close"].append(ticket) or {"status": "ok"})
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == ["T8"]  # would NOT have fired yet under the global MAX_HOLD_HOURS
+
+    def test_close_position_error_status_does_not_raise(self, monkeypatch) -> None:
+        pos = self._position(hours_open=cr.MAX_HOLD_HOURS + 1, ticket="T9")
+        self._patch_broker(monkeypatch, positions=[pos], close_result={"status": "error", "error": "broker rejected"})
+
+        cr._profit_protection_check()  # must not raise
+
+    def test_close_position_raises_is_caught(self, monkeypatch) -> None:
+        pos = self._position(hours_open=cr.MAX_HOLD_HOURS + 1, ticket="T10")
+        calls = self._patch_broker(monkeypatch, positions=[pos])
+
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+
+        def _boom(config, *, ticket):
+            raise RuntimeError("MT5 connection dropped")
+
+        monkeypatch.setattr(mt5_sdk, "close_position", _boom)
+
+        cr._profit_protection_check()  # must not raise
+
+    def test_rules_1_and_2_still_work_unaffected_by_rule_3(self, monkeypatch) -> None:
+        """Regression: adding decay_candidate to the candidates list must not
+        break the pre-existing breakeven/early-profit-trail behavior."""
+        # Well before the decay window; price at halfway to TP -> rule 1
+        # (breakeven) should fire.
+        pos = self._position(
+            hours_open=1.0, ticket="T11", side="buy", entry=1.1600, tp=1.1650, sl=1.1580, price=1.1625,
+        )
+        calls = self._patch_broker(monkeypatch, positions=[pos], atr_floor=0.0010)
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == []
+        assert len(calls["modify"]) == 1
+        assert calls["modify"][0]["ticket"] == "T11"
+        # breakeven candidate = entry - buffer (protective side, just under
+        # entry for a buy) -- tighter than the original sl, still below entry.
+        new_sl = calls["modify"][0]["stop_loss"]
+        assert pos["stop_loss"] < new_sl < pos["price_open"]
