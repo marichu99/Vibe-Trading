@@ -112,25 +112,26 @@ TARGETS: list[dict[str, object]] = [
         "committee": "investment_committee", "target": "AUDUSD", "market": "forex",
         "trade": {"symbol": "AUDUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
     },
-    # PAUSED 2026-09-01: equity crossed the $100 silver milestone and this was
-    # briefly enabled live, then deliberately reverted the same day — decided
-    # to run gold-only for a full observation period (~1 month, not just the
-    # 1-week pipeline check) before adding a second live instrument, so the
-    # 8 pipeline fixes committed 2026-09-01 get a clean, unconfounded read and
-    # DeepSeek cost isn't doubled during a period explicitly about controlling
-    # it. No mandate change is needed to re-enable this later — the committed
-    # mandate's "commodity" asset class already covers XAGUSDm (see
-    # src.trading.service._mt5_asset_class). At re-enable time, note that
-    # silver's 5000 oz/lot contract (vs gold's 100 oz) means the current flat
-    # $10 MAX_LOSS_PER_ORDER_USD buys only a ~0.2-unit stop against silver's
-    # own ~0.53-unit ATR noise floor (verified live 2026-09-01 at ~$64/oz) —
-    # the ATR volatility floor will very likely keep it WAITing under the
-    # shared cap until a per-symbol cap is set via commit_mt5_mandate.py,
-    # which only a human may run.
-    # {
-    #     "committee": "investment_committee", "target": "XAGUSD", "market": "commodity/forex",
-    #     "trade": {"symbol": "XAGUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
-    # },
+    # Re-enabled 2026-09-08, at the user's request — the milestone reminder
+    # (_check_silver_milestone) had been firing every pass since equity first
+    # crossed $100, and the original 2026-09-01 pause rationale (a clean,
+    # unconfounded gold-only observation period) is moot now that gold itself
+    # was paused 2026-09-03 in favor of EURUSD/AUDUSD. No mandate change was
+    # needed to re-enable this — the committed mandate's "commodity" asset
+    # class already covers XAGUSDm (see src.trading.service._mt5_asset_class).
+    #
+    # Expect this to sit in WAIT every pass, not actually trade, until a
+    # human sets it a per-symbol risk cap: verified live 2026-09-08,
+    # XAGUSDm's 15m-ATR stop floor is ~0.346 price units, but the current
+    # ~$4 shared per-order budget (_effective_max_loss_usd) only buys a
+    # ~0.08-unit stop at 0.01 lots on silver's 5000 oz/lot contract (vs
+    # gold's 100 oz) — the VOLATILITY/SPREAD FLOOR check in _build_prompt
+    # will force WAIT every time until commit_mt5_mandate.py (human-only) is
+    # re-run with a wider per-symbol cap for this instrument.
+    {
+        "committee": "investment_committee", "target": "XAGUSD", "market": "commodity/forex",
+        "trade": {"symbol": "XAGUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
+    },
     # PAUSED 2026-08-25: an MT5 terminal can only be signed into ONE account at
     # a time. The terminal is now signed into the LIVE account (needed for the
     # gold target above), so these mt5-demo-trade targets crash every pass with
