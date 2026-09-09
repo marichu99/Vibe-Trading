@@ -48,6 +48,22 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT_DIR = REPO_ROOT / "agent"
 
+# On Windows, stdout/stderr default to the system ANSI codepage (cp1252 on
+# this machine) when redirected to a file (startup.ps1's -RedirectStandardOutput
+# into logs/reporter.log), not UTF-8 -- but _status_log_summary() reads that
+# file back with encoding="utf-8". Any non-ASCII character logged (e.g. the
+# em-dash in "{committee} — {target} ({tag})" email subjects) then gets
+# written as a single cp1252 byte that isn't valid UTF-8, decoding back as
+# U+FFFD and corrupting --status/the emailed report. Force real UTF-8 here so
+# what's written matches what's read. Guarded: reconfigure() can be absent/
+# fail in an unusual stream (e.g. tests capturing stdout) -- never let purely
+# cosmetic log encoding crash the loop.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
