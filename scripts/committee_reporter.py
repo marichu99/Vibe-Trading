@@ -1172,15 +1172,31 @@ def _live_circuit_breaker_check(trade: dict) -> str | None:
     reason = f"daily equity drawdown {drawdown:.0%} (baseline ${baseline_equity:.2f} -> ${equity:.2f})"
     trip_halt(by="cli", reason=reason, broker=broker)
 
+    # Flatten every one of OUR live positions on this connection, not just
+    # trade["symbol"] (the one target whose pass happened to detect the
+    # drawdown) -- an account-wide equity trip is a portfolio-level backstop
+    # and must not leave other live symbols' exposure open. Same
+    # all-TARGETS-on-this-connection + OUR_MAGIC pattern as
+    # _weekend_flatten_and_notify.
     closed = []
     try:
-        profile = profile_by_id(connection)
-        config = mt5_sdk.build_config(profile.config, {})
+        live_symbols = {
+            spec["trade"]["symbol"]
+            for spec in TARGETS
+            if spec.get("trade") and spec["trade"]["connection"] == connection
+        }
         positions = get_positions(connection).get("positions", [])
-        for pos in positions:
-            if pos.get("symbol") == trade["symbol"]:
-                result = mt5_sdk.close_position(config, ticket=pos.get("ticket"))
-                closed.append(f"ticket {pos.get('ticket')}: {result.get('status')}")
+        ours = [
+            p for p in positions
+            if p.get("symbol") in live_symbols and p.get("magic") == OUR_MAGIC
+        ]
+        if ours:
+            profile = profile_by_id(connection)
+            config = mt5_sdk.build_config(profile.config, {})
+            for pos in ours:
+                ticket = pos.get("ticket")
+                result = mt5_sdk.close_position(config, ticket=ticket)
+                closed.append(f"{pos.get('symbol')} ticket {ticket}: {result.get('status')}")
     except Exception as exc:
         closed.append(f"flatten attempt raised: {exc}")
 
@@ -2105,7 +2121,7 @@ def _status_report_html() -> str:
 
     sys.path.insert(0, str(AGENT_DIR))
     from src.live.halt import halt_flag_set
-    from src.trading.service import get_account, get_positions
+    from src.trading.service import get_account, get_open_orders, get_positions
 
     seen_connections: set[str] = set()
     for spec in TARGETS:
@@ -2124,6 +2140,7 @@ def _status_report_html() -> str:
             '<table style="border-collapse:collapse;font-size:13px;">'
             f'<tr><td style="padding:2px 12px 2px 0;color:#555;">Balance</td><td><strong>{_esc(account.get("balance"))}</strong></td></tr>'
             f'<tr><td style="padding:2px 12px 2px 0;color:#555;">Equity</td><td><strong>{_esc(account.get("equity"))}</strong></td></tr>'
+            f'<tr><td style="padding:2px 12px 2px 0;color:#555;">Margin level</td><td><strong>{_esc(account.get("margin_level"))}</strong></td></tr>'
             "</table>"
         )
         try:
@@ -2157,6 +2174,30 @@ def _status_report_html() -> str:
                 '<th style="text-align:left;padding:2px 8px;">TP</th><th style="text-align:left;padding:2px 8px;">P&amp;L</th></tr>'
                 + "".join(rows) + "</table>"
             )
+        try:
+            pending = get_open_orders(connection).get("open_orders", [])
+        except Exception as exc:
+            parts.append(f'<p style="color:#c62828;margin:2px 0;">could not read pending orders: {_esc(exc)}</p>')
+            pending = []
+        if pending:
+            prows = "".join(
+                "<tr>"
+                f'<td style="padding:2px 8px;">{_esc(o.get("side", "?")).upper()}</td>'
+                f'<td style="padding:2px 8px;">{_esc(o.get("quantity"))}</td>'
+                f'<td style="padding:2px 8px;">{_esc(o.get("symbol"))}</td>'
+                f'<td style="padding:2px 8px;">{_esc(o.get("order_type"))}</td>'
+                f'<td style="padding:2px 8px;">{_esc(o.get("limit_price"))}</td>'
+                "</tr>"
+                for o in pending
+            )
+            parts.append(
+                '<p style="margin:6px 0 2px;color:#555;">Pending orders:</p>'
+                '<table style="border-collapse:collapse;width:100%;font-size:13px;">'
+                '<tr style="color:#555;"><th style="text-align:left;padding:2px 8px;">Side</th>'
+                '<th style="text-align:left;padding:2px 8px;">Qty</th><th style="text-align:left;padding:2px 8px;">Symbol</th>'
+                '<th style="text-align:left;padding:2px 8px;">Type</th><th style="text-align:left;padding:2px 8px;">Price</th></tr>'
+                + prows + "</table>"
+            )
         if connection in LIVE_CONNECTIONS:
             try:
                 halted = halt_flag_set("mt5")
@@ -2165,6 +2206,23 @@ def _status_report_html() -> str:
                               f'{"TRIPPED" if halted else "clear"}</span></p>')
             except Exception as exc:
                 parts.append(f'<p style="color:#c62828;margin:2px 0;">could not read kill switch state: {_esc(exc)}</p>')
+            try:
+                baseline = _read_live_baseline()
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                if baseline.get("date") == today and baseline.get("equity"):
+                    baseline_equity = float(baseline["equity"])
+                    equity = float(account.get("equity") or 0)
+                    drawdown = (baseline_equity - equity) / baseline_equity if baseline_equity > 0 else 0
+                    dd_color = "#c62828" if drawdown >= LIVE_DRAWDOWN_HALT_PCT * 0.5 else "#555"
+                    parts.append(
+                        f'<p style="margin:2px 0;color:{dd_color};">Today\'s drawdown: '
+                        f'<strong>{drawdown:.1%}</strong> of baseline ${baseline_equity:.2f} '
+                        f'(halts at {LIVE_DRAWDOWN_HALT_PCT:.0%})</p>'
+                    )
+                else:
+                    parts.append('<p style="margin:2px 0;color:#555;">Today\'s drawdown: no baseline recorded yet this UTC day</p>')
+            except Exception as exc:
+                parts.append(f'<p style="color:#c62828;margin:2px 0;">could not compute today\'s drawdown: {_esc(exc)}</p>')
 
     seen_symbols: set[str] = set()
     for spec in TARGETS:
@@ -2681,7 +2739,7 @@ def _build_status_report() -> str:
 
     sys.path.insert(0, str(AGENT_DIR))
     from src.live.halt import halt_flag_set
-    from src.trading.service import get_account, get_positions
+    from src.trading.service import get_account, get_open_orders, get_positions
 
     seen_connections: set[str] = set()
     for spec in TARGETS:
@@ -2693,7 +2751,10 @@ def _build_status_report() -> str:
         lines.append(f"\nAccount ({connection}):")
         try:
             account = get_account(connection)["account"]
-            lines.append(f"  Balance: {account.get('balance')}  Equity: {account.get('equity')}")
+            lines.append(
+                f"  Balance: {account.get('balance')}  Equity: {account.get('equity')}  "
+                f"Margin level: {account.get('margin_level')}"
+            )
         except Exception as exc:
             lines.append(f"  could not read account: {exc}")
             continue
@@ -2711,12 +2772,38 @@ def _build_status_report() -> str:
                     f"@ {p.get('price_open')} SL {p.get('stop_loss', '?')} TP {p.get('take_profit', '?')} "
                     f"P&L {p.get('profit')}"
                 )
+        try:
+            pending = get_open_orders(connection).get("open_orders", [])
+        except Exception as exc:
+            lines.append(f"  could not read pending orders: {exc}")
+            pending = []
+        if pending:
+            for o in pending:
+                lines.append(
+                    f"  PENDING {o.get('side', '?').upper()} {o.get('quantity')} {o.get('symbol')} "
+                    f"{o.get('order_type')} @ {o.get('limit_price')}"
+                )
         if connection in LIVE_CONNECTIONS:
             try:
                 halted = halt_flag_set("mt5")
                 lines.append(f"  Kill switch: {'TRIPPED' if halted else 'clear'}")
             except Exception as exc:
                 lines.append(f"  could not read kill switch state: {exc}")
+            try:
+                baseline = _read_live_baseline()
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                if baseline.get("date") == today and baseline.get("equity"):
+                    baseline_equity = float(baseline["equity"])
+                    equity = float(account.get("equity") or 0)
+                    drawdown = (baseline_equity - equity) / baseline_equity if baseline_equity > 0 else 0
+                    lines.append(
+                        f"  Today's drawdown: {drawdown:.1%} of baseline ${baseline_equity:.2f} "
+                        f"(halts at {LIVE_DRAWDOWN_HALT_PCT:.0%})"
+                    )
+                else:
+                    lines.append("  Today's drawdown: no baseline recorded yet this UTC day")
+            except Exception as exc:
+                lines.append(f"  could not compute today's drawdown: {exc}")
 
     seen_symbols: set[str] = set()
     for spec in TARGETS:
