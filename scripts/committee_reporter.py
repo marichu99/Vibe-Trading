@@ -104,8 +104,19 @@ TARGETS: list[dict[str, object]] = [
         # (scripts/commit_mt5_mandate.py) — a mandate-only "commodity"
         # authorization will fail-closed deny every order here. max_stack=1:
         # same no-pyramiding policy as gold.
+        #
+        # early_profit_trigger_usd: added 2026-09-09 — the module default
+        # (EARLY_PROFIT_TRIGGER_USD=$8, see its own comment) needs an ~80-pip
+        # move to arm at this contract size, essentially never (this pair's
+        # actual realized wins run $0.01-$0.47). $1.00 is ~1.3x this pair's
+        # own ~0.00076-price-unit (~7.6-pip, ~$0.76) 15m-ATR stop floor
+        # verified above — enough headroom past ordinary noise to avoid
+        # arming on a whipsaw, but reachable by a real favorable move.
         "committee": "investment_committee", "target": "EURUSD", "market": "forex",
-        "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
+        "trade": {
+            "symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
+            "early_profit_trigger_usd": 1.00,
+        },
     },
     {
         # LIVE — added 2026-09-04 at the user's request, as a genuine
@@ -125,8 +136,16 @@ TARGETS: list[dict[str, object]] = [
         # 15m-ATR stop floor ~$0.54 at 0.01 lots — comfortably inside the $4
         # cap (see MAX_LOSS_PER_ORDER_USD above). max_stack=1: same
         # no-pyramiding policy as the other live targets.
+        #
+        # early_profit_trigger_usd: same 2026-09-09 fix as EURUSDm above,
+        # same reasoning — $0.75 is ~1.4x this pair's own $0.54 ATR-floor
+        # figure verified above (the module default's ~80-pip requirement is
+        # unreachable at 0.01 lots).
         "committee": "investment_committee", "target": "AUDUSD", "market": "forex",
-        "trade": {"symbol": "AUDUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
+        "trade": {
+            "symbol": "AUDUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
+            "early_profit_trigger_usd": 0.75,
+        },
     },
     # Re-enabled 2026-09-08, at the user's request — the milestone reminder
     # (_check_silver_milestone) had been firing every pass since equity first
@@ -144,9 +163,21 @@ TARGETS: list[dict[str, object]] = [
     # gold's 100 oz) — the VOLATILITY/SPREAD FLOOR check in _build_prompt
     # will force WAIT every time until commit_mt5_mandate.py (human-only) is
     # re-run with a wider per-symbol cap for this instrument.
+    #
+    # early_profit_trigger_usd: same 2026-09-09 fix as the FX targets above,
+    # set ahead of this symbol actually trading so it's not forgotten later.
+    # $20 is ~1.15x the ~$17.3 dollar value of this symbol's own 0.346-
+    # price-unit 15m-ATR stop floor verified above (0.346 * 5000oz * 0.01
+    # lots) — same "a bit past the initial stop floor" ratio used for
+    # EURUSDm/AUDUSDm, scaled to silver's much larger $/point contract size
+    # (the module default's $8 would arm on a trivial ~0.0016-unit tick
+    # here, effectively immediately, the opposite problem from FX).
     {
         "committee": "investment_committee", "target": "XAGUSD", "market": "commodity/forex",
-        "trade": {"symbol": "XAGUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
+        "trade": {
+            "symbol": "XAGUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
+            "early_profit_trigger_usd": 20.00,
+        },
     },
     # PAUSED 2026-08-25: an MT5 terminal can only be signed into ONE account at
     # a time. The terminal is now signed into the LIVE account (needed for the
@@ -445,6 +476,17 @@ BREAKEVEN_BUFFER_POINTS = 20
 # turning a real trend into a premature small win) or needlessly loose on a
 # calm one. Reusing the ATR floor adapts the trailing distance to each
 # instrument's actual current noise level instead of guessing one constant.
+#
+# This default (this module constant) is gold-shaped: $8 at 0.01 lots on
+# XAUUSDm (100 oz/lot contract, ~$1/point at that size) needs only an ~$8
+# price move to arm -- easy, gold moves that much intraday routinely. FX at
+# the same 0.01 lots has a ~$0.10/pip contract economics (100,000-unit
+# lot), so the SAME $8 trigger needs an ~80-pip move -- basically never
+# happens (2026-09-09: EURUSDm/AUDUSDm's actual realized wins run
+# $0.01-$0.47, a few pips), leaving the trail permanently unarmed and this
+# rule a no-op on forex despite being the exact behavior asked for. Override
+# per-target via an "early_profit_trigger_usd" key on that target's `trade`
+# dict (see TARGETS) -- same pattern as max_hold_hours below.
 EARLY_PROFIT_TRIGGER_USD = 8.0
 
 # Time-decay stop: closes a real gap found 2026-09-08. A PM decision routinely
@@ -1467,14 +1509,18 @@ def _profit_protection_check() -> None:
             # convert the $ trigger into a price distance, and the ATR
             # floor for the trailing distance -- fails open (skips this
             # rule only, breakeven above still applies) if either lookup
-            # fails.
+            # fails. A target's own trade dict may override the trigger via
+            # "early_profit_trigger_usd" (see EARLY_PROFIT_TRIGGER_USD's
+            # comment) -- $8 was calibrated for gold's $/point economics and
+            # is effectively unreachable at 0.01-lot FX position sizing.
             trail_candidate = None
             try:
                 size = mt5_sdk.contract_size(trade["symbol"])
             except Exception:
                 size = None
             if size and size > 0 and trade["lots"] > 0:
-                trigger_distance = EARLY_PROFIT_TRIGGER_USD / (size * trade["lots"])
+                trigger_usd = trade.get("early_profit_trigger_usd", EARLY_PROFIT_TRIGGER_USD)
+                trigger_distance = trigger_usd / (size * trade["lots"])
                 gained = (price - entry) if is_buy else (entry - price)
                 if gained >= trigger_distance:
                     atr_distance = _atr_stop_floor(trade["symbol"])

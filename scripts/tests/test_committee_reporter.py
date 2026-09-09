@@ -854,6 +854,65 @@ class TestProfitProtectionCheckTimeDecay:
 
         assert calls["close"] == ["T8"]  # would NOT have fired yet under the global MAX_HOLD_HOURS
 
+    def test_per_target_early_profit_trigger_usd_override(self, monkeypatch) -> None:
+        """Regression for the 2026-09-09 fix: the module default
+        (EARLY_PROFIT_TRIGGER_USD=$8) needs an ~80-pip move to arm at
+        100k-contract/0.01-lot FX sizing -- unreachable given EURUSDm/
+        AUDUSDm's actual realized wins ($0.01-$0.47). A lower per-target
+        override must arm the trail on a smaller, realistic favorable move
+        instead."""
+        import src.trading.service as service
+        import src.trading.profiles as profiles_module
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+
+        custom_trigger = 1.00  # trigger_distance = 1.00 / (100_000 * 0.01) = 0.001
+        # Price has moved 0.0015 above entry -- past the custom trigger_
+        # distance (0.001) but nowhere near the module default's 0.008, and
+        # short of halfway to TP (0.015) so rule 1 stays silent -- isolates
+        # rule 2.
+        pos = self._position(hours_open=1.0, ticket="T12", side="buy", entry=1.1600, sl=1.1580, tp=1.1900, price=1.1615)
+        monkeypatch.setattr(
+            cr, "TARGETS",
+            [{"committee": "x", "target": "x", "market": "forex",
+              "trade": self._trade(early_profit_trigger_usd=custom_trigger)}],
+        )
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": [pos]})
+
+        class _FakeProfile:
+            config: dict = {}
+
+        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: _FakeProfile())
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: "FAKE_CONFIG")
+        monkeypatch.setattr(mt5_sdk, "point_size", lambda symbol: 0.00001)
+        monkeypatch.setattr(mt5_sdk, "contract_size", lambda symbol: 100_000)
+        monkeypatch.setattr(cr, "_atr_stop_floor", lambda symbol: 0.0010)
+        calls = {"modify": []}
+        monkeypatch.setattr(
+            mt5_sdk, "modify_position",
+            lambda config, *, ticket, stop_loss, take_profit: calls["modify"].append(
+                {"ticket": ticket, "stop_loss": stop_loss}
+            ) or {"status": "ok"},
+        )
+
+        cr._profit_protection_check()
+
+        assert len(calls["modify"]) == 1
+        assert calls["modify"][0]["ticket"] == "T12"
+        # trail candidate = price - atr_floor = 1.1615 - 0.0010 = 1.1605
+        assert calls["modify"][0]["stop_loss"] == pytest.approx(1.1605)
+
+    def test_default_trigger_does_not_arm_on_the_same_fx_move_without_override(self, monkeypatch) -> None:
+        """Companion to the override test above: the exact same price move
+        that arms the trail WITH the override does nothing under the
+        un-overridden module default -- proves the gap the override closes."""
+        pos = self._position(hours_open=1.0, ticket="T13", side="buy", entry=1.1600, sl=1.1580, tp=1.1900, price=1.1615)
+        calls = self._patch_broker(monkeypatch, positions=[pos], atr_floor=0.0010)
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == []
+        assert calls["modify"] == []
+
     def test_close_position_error_status_does_not_raise(self, monkeypatch) -> None:
         pos = self._position(hours_open=cr.MAX_HOLD_HOURS + 1, ticket="T9")
         self._patch_broker(monkeypatch, positions=[pos], close_result={"status": "error", "error": "broker rejected"})
