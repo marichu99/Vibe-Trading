@@ -892,3 +892,177 @@ class TestProfitProtectionCheckTimeDecay:
         # entry for a buy) -- tighter than the original sl, still below entry.
         new_sl = calls["modify"][0]["stop_loss"]
         assert pos["stop_loss"] < new_sl < pos["price_open"]
+
+
+# ---------------------------------------------------------------------------
+# _live_circuit_breaker_check
+# ---------------------------------------------------------------------------
+
+
+class TestLiveCircuitBreakerCheck:
+    """Regression coverage for the 2026-09-09 fix: a tripped drawdown breaker
+    used to flatten only the ONE symbol whose pass detected it, leaving every
+    other live target's exposure open even though the kill switch blocked new
+    orders everywhere. It must now flatten every one of OUR positions across
+    all live TARGETS on the tripped connection."""
+
+    CONNECTION = "mt5-live-trade"
+
+    def _trade(self, symbol: str, **overrides) -> dict:
+        base = {"symbol": symbol, "connection": self.CONNECTION, "lots": 0.01, "max_stack": 1}
+        base.update(overrides)
+        return base
+
+    def _position(self, symbol: str, ticket: str, *, magic=None, **overrides) -> dict:
+        pos = {"ticket": ticket, "symbol": symbol, "magic": magic if magic is not None else cr.OUR_MAGIC}
+        pos.update(overrides)
+        return pos
+
+    def _patch_broker(
+        self, monkeypatch, tmp_path, *,
+        targets, positions, equity, baseline=None, halted=False, close_result=None,
+    ) -> dict:
+        """Wires every MT5/service/halt call _live_circuit_breaker_check makes
+        to a fake, and returns dicts recording each trip_halt/close_position
+        call for assertions."""
+        import src.live.halt as halt_module
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+        import src.trading.profiles as profiles_module
+        import src.trading.service as service
+
+        monkeypatch.setattr(cr, "TARGETS", targets)
+        monkeypatch.setattr(cr, "LIVE_BASELINE_PATH", tmp_path / "live_baseline.json")
+        if baseline is not None:
+            (tmp_path / "live_baseline.json").write_text(json.dumps(baseline), encoding="utf-8")
+
+        monkeypatch.setattr(halt_module, "halt_flag_set", lambda broker=None: halted)
+        calls = {"trip": [], "close": []}
+
+        def _trip(by, reason, broker=None):
+            calls["trip"].append({"by": by, "reason": reason, "broker": broker})
+            return tmp_path / "HALT"
+
+        monkeypatch.setattr(halt_module, "trip_halt", _trip)
+
+        monkeypatch.setattr(service, "get_account", lambda conn: {"account": {"equity": equity}})
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+
+        class _FakeProfile:
+            config: dict = {}
+
+        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: _FakeProfile())
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: "FAKE_CONFIG")
+
+        def _close(config, *, ticket):
+            calls["close"].append(ticket)
+            return close_result or {"status": "ok"}
+
+        monkeypatch.setattr(mt5_sdk, "close_position", _close)
+        return calls
+
+    def test_no_trip_when_drawdown_below_threshold(self, monkeypatch, tmp_path) -> None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
+        calls = self._patch_broker(
+            monkeypatch, tmp_path, targets=targets, positions=[],
+            equity=90.0, baseline={"date": today, "equity": 100.0},  # 10% drawdown, under 50%
+        )
+
+        result = cr._live_circuit_breaker_check(targets[0]["trade"])
+
+        assert result is None
+        assert calls["trip"] == []
+        assert calls["close"] == []
+
+    def test_already_halted_returns_message_without_re_tripping(self, monkeypatch, tmp_path) -> None:
+        targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
+        calls = self._patch_broker(monkeypatch, tmp_path, targets=targets, positions=[], equity=100.0, halted=True)
+
+        result = cr._live_circuit_breaker_check(targets[0]["trade"])
+
+        assert result is not None and "HALTED" in result
+        assert calls["trip"] == []
+        assert calls["close"] == []
+
+    def test_non_live_connection_is_a_no_op(self, monkeypatch, tmp_path) -> None:
+        trade = self._trade("EURUSDm", connection="mt5-demo-trade")
+        targets = [{"committee": "x", "target": "x", "market": "forex", "trade": trade}]
+        calls = self._patch_broker(monkeypatch, tmp_path, targets=targets, positions=[], equity=100.0)
+
+        assert cr._live_circuit_breaker_check(trade) is None
+        assert calls["trip"] == []
+
+    def test_trip_flattens_every_live_symbol_on_the_connection_not_just_the_triggering_one(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """The actual bug: previously only EURUSDm (the triggering pass's own
+        symbol) was closed -- AUDUSDm and XAGUSDm stayed open."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        eurusd_trade = self._trade("EURUSDm")
+        targets = [
+            {"committee": "x", "target": "EURUSD", "market": "forex", "trade": eurusd_trade},
+            {"committee": "x", "target": "AUDUSD", "market": "forex", "trade": self._trade("AUDUSDm")},
+            {"committee": "x", "target": "XAGUSD", "market": "commodity/forex", "trade": self._trade("XAGUSDm")},
+        ]
+        positions = [
+            self._position("EURUSDm", "T1"),
+            self._position("AUDUSDm", "T2"),
+            self._position("XAGUSDm", "T3"),
+        ]
+        calls = self._patch_broker(
+            monkeypatch, tmp_path, targets=targets, positions=positions,
+            equity=50.0, baseline={"date": today, "equity": 200.0},  # 75% drawdown, over 50%
+        )
+
+        result = cr._live_circuit_breaker_check(eurusd_trade)
+
+        assert result is not None and "TRIPPED" in result
+        assert len(calls["trip"]) == 1
+        assert sorted(calls["close"]) == ["T1", "T2", "T3"]
+
+    def test_trip_does_not_close_a_position_carrying_a_foreign_magic(self, monkeypatch, tmp_path) -> None:
+        """A separately-running signal-service EA's own position on the same
+        symbol must not be swept up by our flatten."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        eurusd_trade = self._trade("EURUSDm")
+        targets = [{"committee": "x", "target": "EURUSD", "market": "forex", "trade": eurusd_trade}]
+        positions = [
+            self._position("EURUSDm", "OURS"),
+            self._position("EURUSDm", "NOT_OURS", magic=999),
+        ]
+        calls = self._patch_broker(
+            monkeypatch, tmp_path, targets=targets, positions=positions,
+            equity=50.0, baseline={"date": today, "equity": 200.0},
+        )
+
+        cr._live_circuit_breaker_check(eurusd_trade)
+
+        assert calls["close"] == ["OURS"]
+
+    def test_flatten_failure_does_not_raise_and_is_reported(self, monkeypatch, tmp_path) -> None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        eurusd_trade = self._trade("EURUSDm")
+        targets = [{"committee": "x", "target": "EURUSD", "market": "forex", "trade": eurusd_trade}]
+        positions = [self._position("EURUSDm", "T1")]
+        self._patch_broker(
+            monkeypatch, tmp_path, targets=targets, positions=positions,
+            equity=50.0, baseline={"date": today, "equity": 200.0},
+            close_result={"status": "error", "error": "broker rejected"},
+        )
+
+        result = cr._live_circuit_breaker_check(eurusd_trade)  # must not raise
+
+        assert result is not None and "TRIPPED" in result
+
+    def test_baseline_established_on_first_call_of_day_does_not_trip(self, monkeypatch, tmp_path) -> None:
+        """No baseline file yet -> today's baseline is set to current equity
+        itself, so drawdown is 0 and nothing trips on the very first check."""
+        targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
+        calls = self._patch_broker(monkeypatch, tmp_path, targets=targets, positions=[], equity=100.0, baseline=None)
+
+        result = cr._live_circuit_breaker_check(targets[0]["trade"])
+
+        assert result is None
+        assert calls["trip"] == []
+        saved = json.loads((tmp_path / "live_baseline.json").read_text(encoding="utf-8"))
+        assert saved["equity"] == 100.0
