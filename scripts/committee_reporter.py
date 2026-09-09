@@ -172,13 +172,18 @@ TARGETS: list[dict[str, object]] = [
     # EURUSDm/AUDUSDm, scaled to silver's much larger $/point contract size
     # (the module default's $8 would arm on a trivial ~0.0016-unit tick
     # here, effectively immediately, the opposite problem from FX).
-    {
-        "committee": "investment_committee", "target": "XAGUSD", "market": "commodity/forex",
-        "trade": {
-            "symbol": "XAGUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
-            "early_profit_trigger_usd": 20.00,
-        },
-    },
+    # PAUSED 2026-09-09, at the user's explicit request ("hold all silver
+    # trades, focus only on fx") — no open XAGUSDm position existed at pause
+    # time (last silver trade closed 2026-08-31), so this is a clean stop,
+    # not a flatten. Re-enable by uncommenting; see the (still-applicable)
+    # per-symbol risk-cap note above for why it was WAIT-only anyway.
+    # {
+    #     "committee": "investment_committee", "target": "XAGUSD", "market": "commodity/forex",
+    #     "trade": {
+    #         "symbol": "XAGUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
+    #         "early_profit_trigger_usd": 20.00,
+    #     },
+    # },
     # PAUSED 2026-08-25: an MT5 terminal can only be signed into ONE account at
     # a time. The terminal is now signed into the LIVE account (needed for the
     # gold target above), so these mt5-demo-trade targets crash every pass with
