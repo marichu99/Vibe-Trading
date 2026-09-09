@@ -2144,8 +2144,8 @@ def _status_report_html() -> str:
                     f'<td style="padding:2px 8px;">{_esc(p.get("volume"))}</td>'
                     f'<td style="padding:2px 8px;">{_esc(p.get("symbol"))}</td>'
                     f'<td style="padding:2px 8px;">{_esc(p.get("price_open"))}</td>'
-                    f'<td style="padding:2px 8px;">{_esc(p.get("sl", "?"))}</td>'
-                    f'<td style="padding:2px 8px;">{_esc(p.get("tp", "?"))}</td>'
+                    f'<td style="padding:2px 8px;">{_esc(p.get("stop_loss", "?"))}</td>'
+                    f'<td style="padding:2px 8px;">{_esc(p.get("take_profit", "?"))}</td>'
                     f'<td style="padding:2px 8px;color:{pnl_color};font-weight:bold;">{_esc(profit)}</td>'
                     "</tr>"
                 )
@@ -2708,7 +2708,7 @@ def _build_status_report() -> str:
             for p in positions:
                 lines.append(
                     f"  OPEN {p.get('side', '?').upper()} {p.get('volume')} {p.get('symbol')} "
-                    f"@ {p.get('price_open')} SL {p.get('sl', '?')} TP {p.get('tp', '?')} "
+                    f"@ {p.get('price_open')} SL {p.get('stop_loss', '?')} TP {p.get('take_profit', '?')} "
                     f"P&L {p.get('profit')}"
                 )
         if connection in LIVE_CONNECTIONS:
