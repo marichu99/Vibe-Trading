@@ -18,6 +18,11 @@ _SDK_CONNECTOR_MODULES = {
     "longbridge": "src.trading.connectors.longbridge.sdk",
     "alpaca": "src.trading.connectors.alpaca.sdk",
     "mt5": "src.trading.connectors.mt5.sdk",
+    # Same connector module as "mt5" -- a distinct broker key so the FundedNext
+    # challenge account gets its own mandate/HALT/daily-count under
+    # <runtime_root>/live/mt5fn/ instead of sharing mt5-live-trade's (see
+    # _order_classification below, which also needs to recognize this key).
+    "mt5fn": "src.trading.connectors.mt5.sdk",
     "okx": "src.trading.connectors.okx.sdk",
     "binance": "src.trading.connectors.binance.sdk",
     "futu": "src.trading.connectors.futu.sdk",
@@ -252,7 +257,7 @@ def _order_classification(connector: str, symbol: str):
     """
     from src.live.mandate.model import AssetClass, InstrumentType
 
-    if connector == "mt5":
+    if connector in ("mt5", "mt5fn"):
         return InstrumentType.CFD, _mt5_asset_class(symbol)
 
     instrument_name, asset_name = _CONNECTOR_INSTRUMENT.get(connector, ("equity", None))

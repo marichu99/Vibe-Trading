@@ -19,6 +19,15 @@ the app's other live brokers — it is denied unless a committed mandate exists
 for broker key ``"mt5"`` (see ``scripts/commit_mt5_mandate.py``) authorizing
 the ``CFD`` instrument type and the order's asset class (``forex``/
 ``commodity``/``us_index`` — ``src.trading.service._mt5_asset_class``).
+
+``mt5fn-live-trade`` is the same connector module under a distinct connector
+key (``"mt5fn"``) for a separate prop-firm challenge account (FundedNext),
+running on its own machine/terminal so it never shares a live IPC session
+with the ``mt5`` profiles above. Using a different connector key (rather than
+just a different profile id) gives it a fully independent mandate/kill-switch/
+daily-count under ``<runtime_root>/live/mt5fn/`` — see
+``scripts/commit_fundednext_mandate.py`` and
+``src.trading.service._SDK_CONNECTOR_MODULES``/``_order_classification``.
 """
 
 from __future__ import annotations
@@ -67,6 +76,26 @@ MT5_PROFILES: tuple[TradingProfile, ...] = (
             "Every order is gated by the committed mt5 mandate (hard caps, kill "
             "switch, audit log) before it reaches the broker — see "
             "scripts/commit_mt5_mandate.py."
+        ),
+    ),
+    TradingProfile(
+        id="mt5fn-live-trade",
+        connector="mt5fn",
+        label="MetaTrader 5 · FundedNext Challenge Trade",
+        environment="live",
+        transport="broker_sdk",
+        capabilities=READ_CAPABILITIES + ("orders.place",),
+        readonly=False,
+        config={"profile": "live-trade", "magic": 20260001},
+        notes=(
+            "Places REAL orders against the FundedNext Stellar 2-Step challenge "
+            "account signed into this machine's MT5 terminal. Refuses to trade if "
+            "that account is a demo account. Uses the distinct 'mt5fn' broker key "
+            "so its mandate/kill-switch/daily-count (hard caps, self-imposed "
+            "daily-loss and max-drawdown circuit breakers, audit log) are fully "
+            "independent of the mt5-live-trade account — see "
+            "scripts/commit_fundednext_mandate.py and "
+            "scripts/fundednext_guardrails.py."
         ),
     ),
 )
