@@ -11,7 +11,8 @@ account, so this file copies the reusable *patterns* — not the files — and
 wires in FundedNext-specific pieces instead:
 
   - fundednext_state.py: challenge-progress tracking (start date, initial
-    balance, phase, trading-days-logged).
+    balance, trading-days-logged). Stellar 1-Step is single-phase (one 10%
+    target, then the funded account) — no phase-2 concept.
   - fundednext_guardrails.py: three hard, code-enforced risk limits (same-
     server-day loss halt, life-of-challenge static drawdown halt, 1%-of-
     balance per-trade risk cap) — see that module's docstring for the open
@@ -393,8 +394,9 @@ def _blocked_order_note(run_id: str) -> str | None:
 
 def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
     """Append a new open-trade record, and mark today as a trading day for
-    the 5-minimum-trading-days rule (fundednext_state.record_trading_day) —
-    the one behavioral addition over committee_reporter.py's version."""
+    the minimum-trading-days rule (fundednext_state.record_trading_day,
+    fn_state.MIN_TRADING_DAYS) — the one behavioral addition over
+    committee_reporter.py's version."""
     entries = _read_journal()
     entries.append({
         "ticket": str(order.get("order_id") or ""),
@@ -815,19 +817,23 @@ _REPORT_FORMAT_TRADE = (
 
 def _challenge_framing(connection: str | None) -> str:
     """Prop-firm-challenge framing, replacing committee_reporter.py's
-    _DAY_TRADE_FRAMING. States the hard phase target/loss limits up front and
+    _DAY_TRADE_FRAMING. States the hard profit target/loss limits up front and
     makes explicit that capital preservation/compliance beats speed — see
     the plan doc's Step 9 for the rationale.
 
     ``connection`` is None for a research-only (no ``trade`` dict) target —
     there is nothing to initialize/read an account balance for in that case,
-    so this falls back to whatever state already exists (or phase-1 defaults
-    if the challenge hasn't started tracking yet) without touching the
+    so this falls back to whatever state already exists without touching the
     connector.
+
+    Stellar 1-Step is a SINGLE-PHASE challenge (one 10% target, then straight
+    to the funded account) — this was originally written for the Stellar
+    2-Step model (two phases, 8%/5%) before the actual purchased account
+    turned out to be 1-Step; corrected 2026-09-15, see fundednext_state.py's
+    CHALLENGE_TARGET_PCT/MIN_TRADING_DAYS.
     """
     state = fn_state.ensure_initialized(connection) if connection else fn_state.get_state()
-    phase = state.get("current_phase", 1)
-    target_pct = fn_state.phase_target_pct(phase)
+    target_pct = fn_state.CHALLENGE_TARGET_PCT
     initial = state.get("initial_balance_usd")
     progress_note = ""
     if initial and connection:
@@ -840,20 +846,20 @@ def _challenge_framing(connection: str | None) -> str:
             days = fn_state.trading_days_count()
             if progress is not None:
                 progress_note = (
-                    f"Current progress: {progress:+.2f}% toward the {target_pct:.0f}% phase-{phase} "
+                    f"Current progress: {progress:+.2f}% toward the {target_pct:.0f}% "
                     f"target (starting balance ${float(initial):.2f}, current balance ${balance:.2f}). "
-                    f"Trading days logged so far: {days}/5 minimum (FundedNext's own rule; non-consecutive "
-                    f"is fine, no rush to hit it early).\n\n"
+                    f"Trading days logged so far: {days}/{fn_state.MIN_TRADING_DAYS} minimum (FundedNext's "
+                    f"own rule; non-consecutive is fine, no rush to hit it early).\n\n"
                 )
         except Exception:
             progress_note = ""
 
     return (
-        "IMPORTANT — this account is a FundedNext Stellar 2-Step PROP-FIRM CHALLENGE account, "
-        f"not a profit-maximizing live account. The goal is to clear an {target_pct:.0f}% phase target "
+        "IMPORTANT — this account is a FundedNext Stellar 1-Step PROP-FIRM CHALLENGE account, "
+        f"not a profit-maximizing live account. The goal is to clear a {target_pct:.0f}% profit target "
         "WITHOUT ever touching this account's hard daily-loss or overall-drawdown limits — capital "
         "preservation and staying compliant with FundedNext's own trading rules takes priority over "
-        "speed or size of gains. Do NOT chase the phase target aggressively: steady, low-variance "
+        "speed or size of gains. Do NOT chase the profit target aggressively: steady, low-variance "
         "progress that never approaches the risk limits below is the explicit goal, not maximizing "
         "return or hitting the target quickly. Treat every risk-budget figure given to you in this "
         "prompt as a hard CEILING, never a target to size up toward. Never propose anything resembling "
@@ -1430,8 +1436,13 @@ def _status_log_summary() -> dict:
 
 def _challenge_progress_lines(account: dict) -> list[str]:
     """The one genuinely new status-report section: challenge start date,
-    initial balance, phase, progress-to-target, trading-days-logged, and
-    today's remaining daily-loss room — see the plan doc's Step 7."""
+    initial balance, progress-to-target, trading-days-logged, and today's
+    remaining daily-loss room — see the plan doc's Step 7.
+
+    Stellar 1-Step is single-phase (see fn_state.CHALLENGE_TARGET_PCT) —
+    corrected 2026-09-15 from the Stellar 2-Step two-phase model this was
+    originally written for.
+    """
     lines: list[str] = ["\nFundedNext challenge progress:"]
     state = fn_state.get_state()
     initial = state.get("initial_balance_usd")
@@ -1439,11 +1450,12 @@ def _challenge_progress_lines(account: dict) -> list[str]:
         lines.append("  Not yet initialized (no pass has run against the live account yet).")
         return lines
     initial = float(initial)
-    phase = state.get("current_phase", 1)
-    target_pct = fn_state.phase_target_pct(phase)
+    target_pct = fn_state.CHALLENGE_TARGET_PCT
+    passed_date = state.get("passed_date")
+    status_note = f"passed as of {passed_date}" if passed_date else f"target {target_pct:.0f}%"
     lines.append(
         f"  Start date: {state.get('challenge_start_date', '?')}  Initial balance: ${initial:.2f}  "
-        f"Phase: {phase} (target {target_pct:.0f}%)"
+        f"Status: {status_note}"
     )
     try:
         balance = float(account.get("balance") or 0)
@@ -1454,7 +1466,7 @@ def _challenge_progress_lines(account: dict) -> list[str]:
         lines.append(f"  could not compute progress: {exc}")
 
     days = fn_state.trading_days_count()
-    lines.append(f"  Trading days logged: {days}/5 minimum (non-consecutive OK)")
+    lines.append(f"  Trading days logged: {days}/{fn_state.MIN_TRADING_DAYS} minimum (non-consecutive OK)")
 
     try:
         baseline = fn_guard._read_daily_baseline()

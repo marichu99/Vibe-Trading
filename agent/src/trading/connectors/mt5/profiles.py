@@ -88,7 +88,7 @@ MT5_PROFILES: tuple[TradingProfile, ...] = (
         readonly=False,
         config={"profile": "live-trade", "magic": 20260001},
         notes=(
-            "Places REAL orders against the FundedNext Stellar 2-Step challenge "
+            "Places REAL orders against the FundedNext Stellar 1-Step challenge "
             "account signed into this machine's MT5 terminal. Refuses to trade if "
             "that account is a demo account. Uses the distinct 'mt5fn' broker key "
             "so its mandate/kill-switch/daily-count (hard caps, self-imposed "

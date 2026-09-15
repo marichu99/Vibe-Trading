@@ -6,7 +6,7 @@ network/MT5 call is ever made for real: src.trading.service.get_account is
 monkeypatched with a fake matching the shape fundednext_state.py consumes.
 
 The highest-priority coverage here is TestEnsureInitializedImmutability:
-initial_balance_usd is the static 10%-drawdown floor's basis
+initial_balance_usd is the static 6%-drawdown floor's basis
 (fundednext_guardrails.static_drawdown_check) — a bug that let it drift on a
 second call would silently misprice the compliance floor.
 """
@@ -49,7 +49,6 @@ class TestEnsureInitializedImmutability:
         state = fn_state.ensure_initialized("mt5fn-live-trade")
 
         assert state["initial_balance_usd"] == 6000.0
-        assert state["current_phase"] == 1
         assert state["trading_days"] == []
         assert "challenge_start_date" in state
 
@@ -81,7 +80,7 @@ class TestEnsureInitializedImmutability:
 
         path = tmp_path / "state.json"
         monkeypatch.setattr(fn_state, "STATE_PATH", path)
-        fn_state._write_state({"initial_balance_usd": 6000.0, "challenge_start_date": "2026-09-01", "current_phase": 1})
+        fn_state._write_state({"initial_balance_usd": 6000.0, "challenge_start_date": "2026-09-01"})
 
         def _boom(conn):
             raise AssertionError("get_account should not be called when already initialized")
@@ -117,15 +116,16 @@ class TestRecordTradingDay:
         assert fn_state.get_state()["trading_days"] == ["2026-09-20"]
 
 
-class TestPhaseTargetPct:
-    def test_phase_1(self) -> None:
-        assert fn_state.phase_target_pct(1) == 8.0
+class TestChallengeConstants:
+    """Stellar 1-Step is single-phase: one 10% target, min 2 trading days —
+    see fundednext_state.py's module docstring for why this differs from the
+    Stellar 2-Step model it was originally scoped for."""
 
-    def test_phase_2(self) -> None:
-        assert fn_state.phase_target_pct(2) == 5.0
+    def test_challenge_target_pct(self) -> None:
+        assert fn_state.CHALLENGE_TARGET_PCT == 10.0
 
-    def test_unknown_phase_falls_back_to_tighter_figure(self) -> None:
-        assert fn_state.phase_target_pct(99) == 5.0
+    def test_min_trading_days(self) -> None:
+        assert fn_state.MIN_TRADING_DAYS == 2
 
 
 class TestProgressPct:
@@ -144,20 +144,21 @@ class TestProgressPct:
         assert fn_state.progress_pct(5700.0) == pytest.approx(-5.0)
 
 
-class TestAdvancePhase:
+class TestMarkPassed:
     def test_raises_when_uninitialized(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(fn_state, "STATE_PATH", tmp_path / "state.json")
         with pytest.raises(RuntimeError):
-            fn_state.advance_phase()
+            fn_state.mark_passed()
 
-    def test_advances_1_to_2(self, tmp_path, monkeypatch) -> None:
+    def test_sets_passed_date(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(fn_state, "STATE_PATH", tmp_path / "state.json")
-        fn_state._write_state({"initial_balance_usd": 6000.0, "current_phase": 1})
-        assert fn_state.advance_phase() == 2
-        assert fn_state.get_state()["current_phase"] == 2
+        monkeypatch.setattr(fn_state, "server_today", lambda now=None: "2026-09-20")
+        fn_state._write_state({"initial_balance_usd": 6000.0})
+        assert fn_state.mark_passed() == "2026-09-20"
+        assert fn_state.get_state()["passed_date"] == "2026-09-20"
 
-    def test_refuses_past_phase_2(self, tmp_path, monkeypatch) -> None:
+    def test_idempotent_does_not_overwrite(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(fn_state, "STATE_PATH", tmp_path / "state.json")
-        fn_state._write_state({"initial_balance_usd": 6000.0, "current_phase": 2})
-        with pytest.raises(RuntimeError):
-            fn_state.advance_phase()
+        fn_state._write_state({"initial_balance_usd": 6000.0, "passed_date": "2026-09-18"})
+        monkeypatch.setattr(fn_state, "server_today", lambda now=None: "2026-09-25")
+        assert fn_state.mark_passed() == "2026-09-18"

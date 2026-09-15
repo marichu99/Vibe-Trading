@@ -23,12 +23,18 @@ OPEN ITEMS — verify before relying on this at real money (see
      FundedNext's real daily-loss rule counts swap. Verify against a real
      account holding a position overnight before trusting this blind.
   3. Static-drawdown-floor "never trails up": sources disagree on whether
-     FundedNext's 10% max-drawdown floor stays pinned to the INITIAL balance
+     FundedNext's 6% max-drawdown floor stays pinned to the INITIAL balance
      forever, or ratchets up as profit is banked. This module implements the
      conservative (never-moves) reading — re-verify against the actual
      purchased challenge's contract/PDF terms, especially once the account
      has a meaningful profit cushion (exactly when a wrong assumption here
      would matter).
+
+NOTE: this was originally built assuming a Stellar 2-Step account (5% daily
+/ 10% static limits, two profit-target phases); the actual purchased account
+turned out to be Stellar 1-Step (3% daily / 6% static, single 10% target —
+see fundednext_state.py). All numbers below were corrected accordingly on
+2026-09-15.
 """
 
 from __future__ import annotations
@@ -50,10 +56,12 @@ logger = logging.getLogger("fundednext_guardrails")
 # and agent/src/trading/connectors/mt5/profiles.py's mt5fn-live-trade profile.
 BROKER = "mt5fn"
 
-# Self-imposed, tighter than FundedNext's own 5% daily / 10% overall limits —
-# see module docstring.
-DAILY_LOSS_HALT_PCT = 0.04
-MAX_DRAWDOWN_HALT_PCT = 0.08
+# Self-imposed, tighter than FundedNext's own Stellar 1-Step limits (3% daily
+# / 6% static overall, verified 2026-09 for the actual purchased account type
+# — NOT the 5%/10% Stellar 2-Step figures this was originally scoped for) —
+# same ~80% buffer ratio as before, see module docstring.
+DAILY_LOSS_HALT_PCT = 0.024
+MAX_DRAWDOWN_HALT_PCT = 0.048
 
 # 1% of CURRENT balance, matching FundedNext's own imposable "1% max risk per
 # trade" rule (not a portfolio-aggregate split like the Exness account's
@@ -136,7 +144,7 @@ def daily_trade_count_check(limit: int = MAX_DAILY_TRADES_SOFT_CEILING) -> str |
 
 def daily_loss_check(equity: float) -> str | None:
     """Same-server-day loss check: self-imposed DAILY_LOSS_HALT_PCT vs.
-    FundedNext's 5% daily loss limit.
+    FundedNext's 3% daily loss limit (Stellar 1-Step).
 
     Anchored to an equity snapshot taken at the first check of each
     server-day (see fundednext_state.server_today — see module docstring's
@@ -158,14 +166,14 @@ def daily_loss_check(equity: float) -> str | None:
         return None
     return (
         f"same-server-day equity drawdown {drawdown:.1%} (baseline ${baseline_equity:.2f} -> "
-        f"${equity:.2f}) reached the self-imposed {DAILY_LOSS_HALT_PCT:.0%} daily-loss halt "
-        f"(FundedNext's own limit is 5%)"
+        f"${equity:.2f}) reached the self-imposed {DAILY_LOSS_HALT_PCT:.1%} daily-loss halt "
+        f"(FundedNext's own limit is 3%)"
     )
 
 
 def static_drawdown_check(equity: float) -> str | None:
     """Life-of-challenge check: self-imposed MAX_DRAWDOWN_HALT_PCT vs.
-    FundedNext's 10% STATIC max drawdown.
+    FundedNext's 6% STATIC max drawdown (Stellar 1-Step).
 
     Anchored to ``initial_balance_usd`` from fundednext_state — a one-time
     snapshot taken on this account's first-ever run, NEVER re-baselined
@@ -185,8 +193,8 @@ def static_drawdown_check(equity: float) -> str | None:
         return None
     return (
         f"life-of-challenge equity drawdown {drawdown:.1%} (initial balance ${initial:.2f} -> "
-        f"${equity:.2f}) reached the self-imposed {MAX_DRAWDOWN_HALT_PCT:.0%} static max-drawdown "
-        f"halt (FundedNext's own static limit is 10%) — the challenge is likely breached"
+        f"${equity:.2f}) reached the self-imposed {MAX_DRAWDOWN_HALT_PCT:.1%} static max-drawdown "
+        f"halt (FundedNext's own static limit is 6%) — the challenge is likely breached"
     )
 
 

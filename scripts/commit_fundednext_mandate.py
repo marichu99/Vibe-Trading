@@ -11,7 +11,7 @@ own ``<runtime_root>/live/mt5fn/mandate.json`` and is completely independent
 of the existing Exness ``mt5`` mandate — halting one account never halts the
 other, and their daily-trade counters don't share a bucket.
 
-Numbers below are sized for a **$6,000 FundedNext Stellar 2-Step challenge
+Numbers below are sized for a **$6,000 FundedNext Stellar 1-Step challenge
 account**, trading EURUSDm/AUDUSDm at 0.01 lots (see
 ``scripts/fundednext_reporter.py``) — NOT copied from the Exness mandate's
 numbers, which were sized for a very different (much smaller, much higher
@@ -28,7 +28,7 @@ own MAX_LOSS_PER_ORDER_USD.
 
 MAX_LEVERAGE = 30 is a conservative placeholder, not a confirmed FundedNext
 platform figure — VERIFY against the actual leverage offered on your
-purchased Stellar 2-Step account (varies by instrument/account) before
+purchased Stellar 1-Step account (varies by instrument/account) before
 relying on it; it is not the binding constraint for 0.01-lot forex clips at
 this account size regardless (order notional and the per-order loss cap
 below bind first).
@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -57,13 +58,22 @@ sys.path.insert(0, str(AGENT_DIR))
 
 from src.live.mandate.commit import CommitError, commit_mandate, save_proposal  # noqa: E402
 from src.live.mandate.store import load_mandate  # noqa: E402
+from src.providers.llm import _ensure_dotenv  # noqa: E402
 
 BROKER = "mt5fn"
-# TODO: fill in the FundedNext MT5 login once the challenge account is
-# purchased and signed into a terminal — this is an id, not a credential.
-ACCOUNT_REF = "TODO-fundednext-login"
+# FundedNext MT5 login (an id, not a credential — the password itself is
+# never stored anywhere in this repo; see profiles.py's docstring: MT5
+# credentials only ever get entered directly into the terminal app).
+#
+# Deliberately NOT a hardcoded literal here, unlike commit_mt5_mandate.py's
+# ACCOUNT_REF — an account number is still identifying information, and this
+# repo's git history is not the place for it. Set FUNDEDNEXT_ACCOUNT_REF in
+# agent/.env (gitignored) instead; _ensure_dotenv() loads it the same way
+# committee_reporter.py/fundednext_reporter.py load SMTP_*/DEEPSEEK_API_KEY.
+_ensure_dotenv()
+ACCOUNT_REF = os.environ.get("FUNDEDNEXT_ACCOUNT_REF", "")
 
-# Sized for a $6,000 Stellar 2-Step challenge account — see module docstring.
+# Sized for a $6,000 Stellar 1-Step challenge account — see module docstring.
 MAX_ORDER_USD = 3000.0
 MAX_TOTAL_EXPOSURE_USD = 3000.0
 MAX_LEVERAGE = 30.0  # placeholder — verify against the actual FundedNext platform figure
@@ -94,7 +104,7 @@ def _build_proposal() -> dict:
         "exclude_symbols": [],
         "flatten_on_halt": FLATTEN_ON_HALT,
         "max_loss_per_order_usd": MAX_LOSS_PER_ORDER_USD,
-        "notes": "FundedNext Stellar 2-Step challenge mandate ($6,000 account), forex only (EURUSDm/AUDUSDm).",
+        "notes": "FundedNext Stellar 1-Step challenge mandate ($6,000 account), forex only (EURUSDm/AUDUSDm).",
     }
     ceilings = {
         "account_funding_usd": MAX_TOTAL_EXPOSURE_USD,
@@ -109,7 +119,7 @@ def _build_proposal() -> dict:
     return {
         "proposal_id": proposal_id,
         "session_id": "manual-chat-consent-fundednext-setup",
-        "intent_normalized": "FundedNext Stellar 2-Step challenge forex trading via fundednext_reporter.py",
+        "intent_normalized": "FundedNext Stellar 1-Step challenge forex trading via fundednext_reporter.py",
         "account": {"broker": BROKER, "type": "margin", "funded_by": "user"},
         "ceilings_ref": "manual_review_fundednext_setup",
         "ceilings": ceilings,
@@ -140,8 +150,8 @@ def main() -> int:
         ))
         return 0
 
-    if ACCOUNT_REF.startswith("TODO"):
-        print("refusing to commit: set ACCOUNT_REF to the real FundedNext MT5 login first")
+    if not ACCOUNT_REF:
+        print("refusing to commit: set FUNDEDNEXT_ACCOUNT_REF in agent/.env to the real FundedNext MT5 login first")
         return 1
 
     proposal = _build_proposal()

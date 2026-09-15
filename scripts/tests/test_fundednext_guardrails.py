@@ -80,16 +80,16 @@ class TestDailyLossCheck:
         monkeypatch.setattr(fn_guard, "DAILY_BASELINE_PATH", tmp_path / "daily.json")
         monkeypatch.setattr(fn_state, "server_today", lambda now=None: "2026-09-12")
         fn_guard.daily_loss_check(equity=6000.0)  # sets baseline
-        # 3% drawdown -- below the 4% halt.
-        assert fn_guard.daily_loss_check(equity=5820.0) is None
+        # 1.5% drawdown -- below the 2.4% halt.
+        assert fn_guard.daily_loss_check(equity=5910.0) is None
 
     def test_trips_at_threshold(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(fn_guard, "DAILY_BASELINE_PATH", tmp_path / "daily.json")
         monkeypatch.setattr(fn_state, "server_today", lambda now=None: "2026-09-12")
         fn_guard.daily_loss_check(equity=6000.0)  # sets baseline
-        # Exactly 4% drawdown.
-        reason = fn_guard.daily_loss_check(equity=5760.0)
-        assert reason is not None and "4" in reason
+        # Exactly 2.4% drawdown.
+        reason = fn_guard.daily_loss_check(equity=5856.0)
+        assert reason is not None and "2.4" in reason
 
     def test_new_server_day_resets_baseline(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(fn_guard, "DAILY_BASELINE_PATH", tmp_path / "daily.json")
@@ -111,14 +111,14 @@ class TestStaticDrawdownCheck:
     def test_no_trip_below_threshold(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(fn_state, "STATE_PATH", tmp_path / "state.json")
         fn_state._write_state({"initial_balance_usd": 6000.0})
-        # 7% drawdown -- below the 8% halt.
-        assert fn_guard.static_drawdown_check(equity=5580.0) is None
+        # 3% drawdown -- below the 4.8% halt.
+        assert fn_guard.static_drawdown_check(equity=5820.0) is None
 
     def test_trips_at_threshold(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(fn_state, "STATE_PATH", tmp_path / "state.json")
         fn_state._write_state({"initial_balance_usd": 6000.0})
-        # Exactly 8% drawdown.
-        reason = fn_guard.static_drawdown_check(equity=5520.0)
+        # Exactly 4.8% drawdown.
+        reason = fn_guard.static_drawdown_check(equity=5712.0)
         assert reason is not None and "breached" in reason
 
     def test_never_rebaselines_even_after_profit(self, tmp_path, monkeypatch) -> None:
@@ -127,8 +127,8 @@ class TestStaticDrawdownCheck:
         fn_state._write_state({"initial_balance_usd": 6000.0})
         assert fn_guard.static_drawdown_check(equity=6500.0) is None  # up 8.3%, fine
         # Drawdown measured from the ORIGINAL 6000 floor, not the 6500 peak.
-        assert fn_guard.static_drawdown_check(equity=5580.0) is None  # 7% off 6000, still fine
-        assert fn_guard.static_drawdown_check(equity=5520.0) is not None  # 8% off 6000, trips
+        assert fn_guard.static_drawdown_check(equity=5820.0) is None  # 3% off 6000, still fine
+        assert fn_guard.static_drawdown_check(equity=5712.0) is not None  # 4.8% off 6000, trips
 
 
 class TestGuardrailCheck:
