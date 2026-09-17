@@ -1131,3 +1131,150 @@ class TestLiveCircuitBreakerCheck:
         assert calls["trip"] == []
         saved = json.loads((tmp_path / "live_baseline.json").read_text(encoding="utf-8"))
         assert saved["equity"] == 100.0
+
+
+class TestPostTradeSpecCheck:
+    """Ported 2026-09-18 from the identical guardrail built for
+    fundednext_reporter.py first, after a real incident there (wrong
+    symbol, 25x mandated lot size, limit instead of market order). This
+    account has its own documented history of the same failure mode (see
+    run_committee's comment on the hallucinated 1.0-lot order)."""
+
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def _patch(self, monkeypatch, *, closed=None):
+        import src.live.halt as halt
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+        import src.trading.profiles as profiles_module
+        import src.trading.service as service
+
+        tripped = {}
+        monkeypatch.setattr(halt, "trip_halt", lambda by, reason, broker: tripped.update(by=by, reason=reason, broker=broker))
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": [{"ticket": "1", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC}] if closed else []})
+        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: type("P", (), {"config": {}})())
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: {})
+        monkeypatch.setattr(mt5_sdk, "close_position", lambda config, ticket: {"status": "ok"})
+        return tripped
+
+    def test_matching_order_is_a_no_op(self, monkeypatch) -> None:
+        tripped = self._patch(monkeypatch)
+        order = {"symbol": "EURUSDm", "quantity": 0.01, "order_type": "market"}
+        assert cr._post_trade_spec_check(self.TRADE, order) == ""
+        assert tripped == {}
+
+    def test_wrong_symbol_closes_and_halts(self, monkeypatch) -> None:
+        tripped = self._patch(monkeypatch, closed=True)
+        order = {"symbol": "EURUSDcm", "quantity": 0.01, "order_type": "market"}
+        note = cr._post_trade_spec_check(self.TRADE, order)
+        assert "CRITICAL" in note and "AUTO-CLOSED" in note
+        assert tripped.get("broker") == "mt5"
+
+    def test_wrong_quantity_closes_and_halts(self, monkeypatch) -> None:
+        tripped = self._patch(monkeypatch, closed=True)
+        order = {"symbol": "EURUSDm", "quantity": 1.0, "order_type": "market"}
+        note = cr._post_trade_spec_check(self.TRADE, order)
+        assert "CRITICAL" in note and "1.0" in note
+        assert tripped.get("broker") == "mt5"
+
+    def test_limit_order_closes_and_halts(self, monkeypatch) -> None:
+        tripped = self._patch(monkeypatch, closed=True)
+        order = {"symbol": "EURUSDm", "quantity": 0.01, "order_type": "limit"}
+        note = cr._post_trade_spec_check(self.TRADE, order)
+        assert "CRITICAL" in note and "not a market order" in note
+        assert tripped.get("broker") == "mt5"
+
+
+class TestResolveFillPrice:
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01}
+
+    def test_uses_placed_order_fill_price_when_valid(self, monkeypatch) -> None:
+        import src.trading.service as service
+
+        def _boom(conn):
+            raise AssertionError("get_positions should not be called when fill_price is already valid")
+
+        monkeypatch.setattr(service, "get_positions", _boom)
+        assert cr._resolve_fill_price(self.TRADE, {"fill_price": 1.1234, "symbol": "EURUSDm"}) == 1.1234
+
+    def test_falls_back_when_fill_price_is_zero(self, monkeypatch) -> None:
+        import src.trading.service as service
+
+        positions = [{"symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.1500}]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        assert cr._resolve_fill_price(self.TRADE, {"fill_price": 0.0, "symbol": "EURUSDm"}) == 1.1500
+
+    def test_returns_none_when_no_source_has_a_price(self, monkeypatch) -> None:
+        import src.trading.service as service
+
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": []})
+        assert cr._resolve_fill_price(self.TRADE, {"fill_price": 0.0, "symbol": "EURUSDm"}) is None
+
+
+class TestPostTradeRewardRiskCheck:
+    """Ported 2026-09-18 -- see MIN_REWARD_RISK_RATIO's own comment for the
+    real AUDUSDm data (net-negative despite a positive win rate) that
+    motivated this on the FundedNext side first."""
+
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01}
+
+    def _patch(self, monkeypatch, *, atr_floor=0.0002, spread_floor=0.0001, positions=None, modify_result=None):
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+        import src.trading.profiles as profiles_module
+        import src.trading.service as service
+
+        calls = {}
+        monkeypatch.setattr(cr, "_symbol_live_quote", lambda symbol, conn: {"bid": 1.1000, "ask": 1.1001})
+        monkeypatch.setattr(cr, "_atr_stop_floor", lambda symbol, connection: atr_floor)
+        monkeypatch.setattr(cr, "_spread_stop_floor", lambda quote: spread_floor)
+        default_positions = [{"ticket": "999", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC}]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions if positions is not None else default_positions})
+        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: type("P", (), {"config": {}})())
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: {})
+
+        def _modify(config, ticket=None, stop_loss=None, take_profit=None):
+            calls.update(ticket=ticket, stop_loss=stop_loss, take_profit=take_profit)
+            return modify_result or {"status": "ok"}
+
+        monkeypatch.setattr(mt5_sdk, "modify_position", _modify)
+        return calls
+
+    def test_ratio_already_healthy_is_a_no_op(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1020}
+        assert cr._post_trade_reward_risk_check(self.TRADE, order) == ""
+        assert calls == {}
+
+    def test_tightens_stop_when_floor_allows(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch, atr_floor=0.0002, spread_floor=0.0001)
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010}
+        note = cr._post_trade_reward_risk_check(self.TRADE, order)
+        assert "CORRECTED" in note and "tightened stop-loss" in note
+        assert calls["take_profit"] == 1.1010
+        assert calls["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
+
+    def test_widens_target_when_tightening_would_violate_floor(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch, atr_floor=0.0009, spread_floor=0.0001)
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010}
+        note = cr._post_trade_reward_risk_check(self.TRADE, order)
+        assert "CORRECTED" in note and "widened take-profit" in note
+        assert calls["stop_loss"] == 1.0990
+        assert calls["take_profit"] == pytest.approx(1.1015)
+
+    def test_zero_fill_price_falls_back_to_live_position(self, monkeypatch) -> None:
+        positions = [{"ticket": "999", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.1000}]
+        calls = self._patch(monkeypatch, atr_floor=0.0002, spread_floor=0.0001, positions=positions)
+        order = {"side": "buy", "fill_price": 0.0, "stop_loss": 1.0990, "take_profit": 1.1010}
+        note = cr._post_trade_reward_risk_check(self.TRADE, order)
+        assert "CORRECTED" in note and "tightened stop-loss" in note
+
+    def test_no_matching_position_reports_without_crashing(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch, positions=[])
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010}
+        note = cr._post_trade_reward_risk_check(self.TRADE, order)
+        assert "no matching open position" in note
+        assert calls == {}
+
+    def test_missing_fields_is_a_no_op(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        assert cr._post_trade_reward_risk_check(self.TRADE, {"side": "buy", "fill_price": 1.1}) == ""
+        assert calls == {}
