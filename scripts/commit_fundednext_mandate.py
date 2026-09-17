@@ -12,10 +12,20 @@ of the existing Exness ``mt5`` mandate — halting one account never halts the
 other, and their daily-trade counters don't share a bucket.
 
 Numbers below are sized for a **$6,000 FundedNext Stellar 1-Step challenge
-account**, trading EURUSDm/AUDUSDm at 0.01 lots (see
-``scripts/fundednext_reporter.py``) — NOT copied from the Exness mandate's
-numbers, which were sized for a very different (much smaller, much higher
-leverage) account.
+account**, trading EURUSD/AUDUSD at 0.24/0.33 lots respectively (see
+``scripts/fundednext_reporter.py`` TARGETS) — NOT copied from the Exness
+mandate's numbers, which were sized for a very different (much smaller,
+much higher leverage) account.
+
+MAX_ORDER_USD/MAX_TOTAL_EXPOSURE_USD RAISED 2026-09-17 from an initial
+$3,000/$3,000 (sized for the original 0.01-lot default, before the sizing
+analysis this session found that left real risk/trade under $1 on a $6,000
+account) to $35,000/$60,000, matching the real order notional at the new
+lot sizes: EURUSD 0.24 lots * 100,000 * ~1.148 ~= $27.5k, AUDUSD 0.33 lots *
+100,000 * ~0.712 ~= $23.5k (both live-quoted 2026-09-17), with headroom for
+normal price movement and both positions open at once. Re-verify these
+notional figures with a fresh quote before relying on this if either pair
+has moved meaningfully since, or if lots is tuned again.
 
 MAX_LOSS_PER_ORDER_USD = $60 is exactly 1% of the $6,000 starting balance,
 mirroring FundedNext's own imposable "1% max risk per trade" rule and
@@ -26,12 +36,12 @@ SCRIPT to bump it as the account balance grows, the same "two independently
 maintained numbers" caveat ``commit_mt5_mandate.py`` already carries for its
 own MAX_LOSS_PER_ORDER_USD.
 
-MAX_LEVERAGE = 30 is a conservative placeholder, not a confirmed FundedNext
-platform figure — VERIFY against the actual leverage offered on your
-purchased Stellar 1-Step account (varies by instrument/account) before
-relying on it; it is not the binding constraint for 0.01-lot forex clips at
-this account size regardless (order notional and the per-order loss cap
-below bind first).
+MAX_LEVERAGE = 30 matches the account's own actual leverage (confirmed live
+via get_account 2026-09-17: "leverage": 30) — no longer just a placeholder.
+Margin check at the new lot sizes: both EURUSD (0.24 lots) and AUDUSD (0.33
+lots) open simultaneously uses roughly $1,700 of the $6,000 balance at this
+leverage — well clear of a margin call, still leaves most of the account as
+free margin.
 
 MAX_TRADES_PER_DAY = 10 is well under FundedNext's 200/day "hyperactivity"
 threshold — the 2-hour pass cadence in fundednext_reporter.py implies at
@@ -74,14 +84,14 @@ _ensure_dotenv()
 ACCOUNT_REF = os.environ.get("FUNDEDNEXT_ACCOUNT_REF", "")
 
 # Sized for a $6,000 Stellar 1-Step challenge account — see module docstring.
-MAX_ORDER_USD = 3000.0
-MAX_TOTAL_EXPOSURE_USD = 3000.0
-MAX_LEVERAGE = 30.0  # placeholder — verify against the actual FundedNext platform figure
+MAX_ORDER_USD = 35000.0
+MAX_TOTAL_EXPOSURE_USD = 60000.0
+MAX_LEVERAGE = 30.0  # matches the account's own actual leverage — see module docstring
 MAX_TRADES_PER_DAY = 10
 LIFETIME_DAYS = 30
 FLATTEN_ON_HALT = True
 ALLOWED_INSTRUMENTS = ["cfd"]
-ASSET_CLASSES = ["forex"]  # EURUSDm, AUDUSDm — see fundednext_reporter.py TARGETS
+ASSET_CLASSES = ["forex"]  # EURUSD, AUDUSD — see fundednext_reporter.py TARGETS
 
 # 1% of the $6,000 starting balance — re-derive and re-commit as balance
 # grows (see module docstring).
@@ -104,7 +114,7 @@ def _build_proposal() -> dict:
         "exclude_symbols": [],
         "flatten_on_halt": FLATTEN_ON_HALT,
         "max_loss_per_order_usd": MAX_LOSS_PER_ORDER_USD,
-        "notes": "FundedNext Stellar 1-Step challenge mandate ($6,000 account), forex only (EURUSDm/AUDUSDm).",
+        "notes": "FundedNext Stellar 1-Step challenge mandate ($6,000 account), forex only (EURUSD/AUDUSD).",
     }
     ceilings = {
         "account_funding_usd": MAX_TOTAL_EXPOSURE_USD,

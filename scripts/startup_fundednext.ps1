@@ -57,7 +57,7 @@ function Archive-PreviousLog($SourcePath, $Label) {
     if (Test-Path $SourcePath) {
         $content = Get-Content -Path $SourcePath -Raw -ErrorAction SilentlyContinue
         if ($content) {
-            Add-Content -Path $HistoryLog -Value "===== $Label — boot $(Get-Date -Format o) ====="
+            Add-Content -Path $HistoryLog -Value "===== $Label -- boot $(Get-Date -Format o) ====="
             Add-Content -Path $HistoryLog -Value $content
         }
     }

@@ -93,26 +93,45 @@ logger = logging.getLogger("fundednext_reporter")
 # What to run each pass
 # --------------------------------------------------------------------------- #
 
-# Same symbols/lots as the Exness live account's proven EURUSDm/AUDUSDm
-# targets — TODO: FundedNext's own broker symbol suffix convention may NOT
-# be "m" (that's an Exness-specific naming quirk); verify the exact tradable
-# symbol names once the FundedNext MT5 terminal is actually signed into, and
-# adjust here before going live. max_stack=1 on both (no pyramiding) is a
-# deliberately tighter posture than even the Exness account, appropriate for
-# a challenge account where over-concentration risk matters more than upside.
+# VERIFIED live 2026-09-17 against the real FundedNext-Server 2 terminal
+# (via src.trading.service.get_quote): this broker uses PLAIN symbol names,
+# no "m" suffix — EURUSDm/AUDUSDm (Exness's own convention) return "-4:
+# Terminal: Not found" here, but EURUSD/AUDUSD resolve fine with live
+# quotes. max_stack=1 on both (no pyramiding) is a deliberately tighter
+# posture than even the Exness account, appropriate for a challenge account
+# where over-concentration risk matters more than upside.
+#
+# lots RAISED 2026-09-17 from the Exness-account-era 0.01 default (~$0.6-0.8
+# actual risk/trade at these pairs' own ATR floors -- see the sizing
+# analysis in the conversation this session) to target ~$20 risk/trade
+# (~0.33% of the $6,000 balance, well under both the $60/trade mandate cap
+# and FundedNext's own 1% guidance): lots = $20 / (contract_size *
+# atr_stop_floor), using contract_size=100,000 and the live-verified floors
+# (EURUSD 0.000815, AUDUSD 0.000610) at the time this was set. REQUIRES
+# commit_fundednext_mandate.py's max_order_notional_usd/max_total_exposure_usd
+# to be raised accordingly (done in the same change) -- the $3,000 notional
+# cap that existed before this would otherwise deny orders at these sizes
+# outright, independent of the loss-cap math.
+#
+# early_profit_trigger_usd RESCALED proportionally to the lots increase (24x
+# / 33x) to preserve the same ARMING DISTANCE in price terms (~10 pips
+# EURUSD, ~7.5 pips AUDUSD) that the original Exness-tuned $1.00/$0.75
+# figures were sized for at 0.01 lots -- leaving the dollar figures
+# unchanged would arm the early-profit trail almost immediately at the new
+# size, undermining the reward:risk floor this session also added.
 TARGETS: list[dict[str, object]] = [
     {
         "committee": "investment_committee", "target": "EURUSD", "market": "forex",
         "trade": {
-            "symbol": "EURUSDm", "connection": "mt5fn-live-trade", "lots": 0.01, "max_stack": 1,
-            "early_profit_trigger_usd": 1.00,
+            "symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1,
+            "early_profit_trigger_usd": 24.00,
         },
     },
     {
         "committee": "investment_committee", "target": "AUDUSD", "market": "forex",
         "trade": {
-            "symbol": "AUDUSDm", "connection": "mt5fn-live-trade", "lots": 0.01, "max_stack": 1,
-            "early_profit_trigger_usd": 0.75,
+            "symbol": "AUDUSD", "connection": "mt5fn-live-trade", "lots": 0.33, "max_stack": 1,
+            "early_profit_trigger_usd": 24.75,
         },
     },
 ]
@@ -132,6 +151,13 @@ OUR_MAGIC = 20260001
 TRADE_JOURNAL_PATH = REPO_ROOT / "logs" / "fundednext_trade_journal.json"
 JOURNAL_SUMMARY_WINDOW = 8
 JOURNAL_RECONCILE_GRACE = timedelta(seconds=120)
+
+# Minimum acceptable reward:risk ratio on a filled order, enforced in CODE
+# (not just prompt guidance) -- added 2026-09-17 after real Exness trade
+# data showed the live account's average loss ($2.02) running ~1.7x its
+# average win ($1.17) despite a 67% win rate, a fragile foundation. See
+# _post_trade_reward_risk_check's docstring for the correction logic.
+MIN_REWARD_RISK_RATIO = 1.5
 
 EXCURSION_BAR_PERIOD = "15m"
 REVERSAL_THRESHOLD_FRACTION = 0.5
@@ -158,6 +184,21 @@ TIME_DECAY_START_FRACTION = 0.75
 # pass — see fundednext_news_calendar.py's module docstring for why this is
 # risk-avoidance, not a FundedNext compliance requirement.
 NEWS_BLACKOUT_WINDOW_MINUTES = 5
+
+# Model override for THIS account's committee subprocess only (2026-09-17,
+# user request for better-quality decisions on the challenge account) --
+# passed as the child process's own environment, NOT written to agent/.env,
+# so the Exness reporter's separate subprocess calls are completely
+# unaffected (agent/.env currently has LANGCHAIN_MODEL_NAME=deepseek-v4-
+# flash, chosen there for cost; _ensure_dotenv()'s load_dotenv(override=
+# False) means an already-set env var always wins over the .env file's
+# value, which is what makes this override reliable). deepseek-v4-pro is
+# the provider's own default/flagship model (see agent/src/providers/
+# llm_providers.json's default_model) -- meaningfully more capable than
+# flash, but priced accordingly; this account's tighter 3%/6% self-imposed
+# error budget (vs. the live account's looser posture) is the reasoning for
+# spending more per decision here specifically.
+LLM_MODEL_OVERRIDE = {"LANGCHAIN_PROVIDER": "deepseek", "LANGCHAIN_MODEL_NAME": "deepseek-v4-pro"}
 
 
 def _kill_process_tree(pid: int) -> None:
@@ -273,12 +314,42 @@ def _symbol_currencies(symbol: str) -> set[str]:
     return {letters[:3], letters[3:6]}
 
 
-def _max_stop_distance(symbol: str, lots: float, budget_usd: float) -> float | None:
+def _mt5_config_for(connection: str):
+    """Resolve the actual MT5Config (incl. terminal_path) for a connection id.
+
+    Real bug found 2026-09-17: several call sites below used to call
+    mt5_sdk.contract_size()/get_historical_bars() with NO config at all,
+    which defaults to load_config() (the GLOBAL ~/.vibe-trading/mt5.json,
+    which doesn't even exist -- bare MT5Config() defaults, terminal_path="").
+    With only one MT5 terminal ever running (the Exness setup this was
+    originally built against), that accidentally worked -- there was only
+    one terminal for the ambiguous "whatever's already attached" call to
+    find. Now that mt5fn-live-trade runs a SEPARATE terminal alongside the
+    Exness one, an unpathed call silently connects to the wrong terminal
+    (or whichever one the process's MT5 handle happens to be attached to),
+    returning None for a symbol name that only exists on the other broker.
+    This silently zeroed out the ATR/volatility-floor guidance in the
+    prompt ("size the stop-loss at or beyond 0.000 price units from entry")
+    during the 2026-09-17 EURUSDm/0.25-lot incident -- likely a contributing
+    factor, not just a coincidence. Every call needs the CORRECT profile's
+    config explicitly, same as _symbol_live_quote/_flatten_positions
+    already do via profile_by_id + build_config.
+    """
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.profiles import profile_by_id
+
+    profile = profile_by_id(connection)
+    return mt5_sdk.build_config(profile.config, {})
+
+
+def _max_stop_distance(symbol: str, lots: float, budget_usd: float, connection: str) -> float | None:
     sys.path.insert(0, str(AGENT_DIR))
     from src.trading.connectors.mt5 import sdk as mt5_sdk
 
     try:
-        size = mt5_sdk.contract_size(symbol)
+        config = _mt5_config_for(connection)
+        size = mt5_sdk.contract_size(symbol, config=config)
     except Exception:
         return None
     if not size or size <= 0 or lots <= 0:
@@ -286,12 +357,13 @@ def _max_stop_distance(symbol: str, lots: float, budget_usd: float) -> float | N
     return budget_usd / (size * lots)
 
 
-def _atr_stop_floor(symbol: str) -> float | None:
+def _atr_stop_floor(symbol: str, connection: str) -> float | None:
     sys.path.insert(0, str(AGENT_DIR))
     from src.trading.connectors.mt5 import sdk as mt5_sdk
 
     try:
-        bars = mt5_sdk.get_historical_bars(symbol, period=ATR_PERIOD, limit=ATR_LOOKBACK_BARS + 1)["bars"]
+        config = _mt5_config_for(connection)
+        bars = mt5_sdk.get_historical_bars(symbol, config=config, period=ATR_PERIOD, limit=ATR_LOOKBACK_BARS + 1)["bars"]
     except Exception:
         return None
 
@@ -428,10 +500,12 @@ def _classify_excursion(entry: dict, deal: dict) -> dict:
         return {}
 
     try:
+        config = _mt5_config_for(entry["connection"])
         bars = mt5_sdk.get_historical_bars_range(
             entry["symbol"],
             opened - timedelta(minutes=15),
             closed + timedelta(minutes=15),
+            config=config,
             period=EXCURSION_BAR_PERIOD,
         )["bars"]
     except Exception:
@@ -726,7 +800,7 @@ def _profit_protection_check() -> None:
             reached_halfway = price >= halfway if is_buy else price <= halfway
             if reached_halfway:
                 try:
-                    point = mt5_sdk.point_size(trade["symbol"])
+                    point = mt5_sdk.point_size(trade["symbol"], config=config)
                 except Exception:
                     point = None
                 if point and point > 0:
@@ -735,7 +809,7 @@ def _profit_protection_check() -> None:
 
             trail_candidate = None
             try:
-                size = mt5_sdk.contract_size(trade["symbol"])
+                size = mt5_sdk.contract_size(trade["symbol"], config=config)
             except Exception:
                 size = None
             if size and size > 0 and trade["lots"] > 0:
@@ -743,13 +817,13 @@ def _profit_protection_check() -> None:
                 trigger_distance = trigger_usd / (size * trade["lots"])
                 gained = (price - entry) if is_buy else (entry - price)
                 if gained >= trigger_distance:
-                    atr_distance = _atr_stop_floor(trade["symbol"])
+                    atr_distance = _atr_stop_floor(trade["symbol"], trade["connection"])
                     if atr_distance:
                         trail_candidate = price - atr_distance if is_buy else price + atr_distance
 
             decay_candidate = None
             if elapsed_hours is not None and elapsed_hours >= max_hold_hours * TIME_DECAY_START_FRACTION:
-                atr_distance = _atr_stop_floor(trade["symbol"])
+                atr_distance = _atr_stop_floor(trade["symbol"], trade["connection"])
                 if atr_distance:
                     decay_candidate = price - atr_distance if is_buy else price + atr_distance
 
@@ -920,7 +994,7 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
         )
 
     effective_budget = fn_guard.effective_max_loss_usd(connection)
-    max_distance = _max_stop_distance(symbol, lots, effective_budget)
+    max_distance = _max_stop_distance(symbol, lots, effective_budget, connection)
     if max_distance is not None:
         budget_note = (
             f"${effective_budget:.2f} (this account's self-imposed {fn_guard.RISK_PER_TRADE_FRACTION:.0%}-of-"
@@ -946,7 +1020,7 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
             f"broker gate regardless of what you propose."
         )
 
-    atr_floor = _atr_stop_floor(symbol)
+    atr_floor = _atr_stop_floor(symbol, connection)
     spread_floor = _spread_stop_floor(quote)
     floor_candidates = [
         (v, reason) for v, reason in (
@@ -1079,6 +1153,7 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         text=True,
         encoding="utf-8",
         errors="replace",
+        env={**os.environ, **LLM_MODEL_OVERRIDE},
     )
     try:
         stdout, stderr = popen.communicate(timeout=RUN_TIMEOUT_SECONDS)
@@ -1114,9 +1189,18 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     placed_order = _extract_placed_order(run_id) if trade else None
     traded = bool(placed_order)
     if traded:
-        report_text = report_text + _post_trade_cap_check(trade)
-        report_text = report_text + _post_trade_spread_check(trade, placed_order)
-        _journal_record_open(trade["symbol"], trade["connection"], placed_order)
+        spec_note = _post_trade_spec_check(trade, placed_order)
+        if spec_note:
+            # A spec violation is CLOSED, not just reported -- see
+            # _post_trade_spec_check's docstring for why this is a real
+            # corrective action, not another informational-only check.
+            report_text = report_text + spec_note
+            traded = False
+        else:
+            report_text = report_text + _post_trade_cap_check(trade)
+            report_text = report_text + _post_trade_spread_check(trade, placed_order)
+            report_text = report_text + _post_trade_reward_risk_check(trade, placed_order)
+            _journal_record_open(trade["symbol"], trade["connection"], placed_order)
     elif trade:
         blocked_note = _blocked_order_note(run_id)
         if blocked_note:
@@ -1124,6 +1208,70 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     if breaker_note:
         report_text = report_text + f"\n\n{breaker_note}"
     return CommitteeResult(committee, target, market, "success", run_id, report_text, traded=traded)
+
+
+def _post_trade_spec_check(trade: dict, placed_order: dict) -> str:
+    """Verify a just-filled order actually matches TARGETS' spec (symbol,
+    lots, market order) -- and if not, CLOSE it immediately and halt further
+    trading, rather than just noting the mismatch in the email afterward.
+
+    Real incident 2026-09-17: the committee submitted symbol="EURUSDm"
+    (wrong -- TARGETS says "EURUSD"), quantity=0.25 (25x the mandated 0.01),
+    as a limit order with its own staged price levels, directly
+    contradicting the prompt's explicit, hardcoded
+    trading_place_order(...) template and its "no partial/scaled/limit-
+    order version of this call" instruction. The mandate gate happened to
+    deny it (EURUSDm doesn't resolve to a priceable instrument on this
+    broker), and separately the $3,000 max_order_notional_usd cap would
+    also have denied a 0.25-lot fill even with a VALID symbol -- but the
+    mandate's caps are a coarse net sized around dollar limits, not a
+    guarantee of catching every parameter deviation (e.g. a more modestly
+    oversized order, ~0.02 lots, could clear both the notional and
+    per-order-loss caps while still being 2x the intended size). This
+    function is the actual, specific backstop for "did the LLM follow the
+    fixed order parameters," independent of whether the broker-side dollar
+    caps happen to also catch a given deviation.
+
+    Returns "" if the order matches spec (nothing to do). Returns a
+    [CRITICAL] message (and has already closed the position + tripped the
+    halt) if it doesn't.
+    """
+    mismatches: list[str] = []
+    actual_symbol = placed_order.get("symbol")
+    if actual_symbol != trade["symbol"]:
+        mismatches.append(f'symbol "{actual_symbol}" != expected "{trade["symbol"]}"')
+    actual_lots = placed_order.get("quantity")
+    try:
+        lots_ok = actual_lots is not None and abs(float(actual_lots) - float(trade["lots"])) < 1e-9
+    except (TypeError, ValueError):
+        lots_ok = False
+    if not lots_ok:
+        mismatches.append(f"quantity {actual_lots} != expected {trade['lots']} lots")
+    order_type = str(placed_order.get("order_type") or "").lower()
+    if order_type and "market" not in order_type:
+        mismatches.append(f'order_type "{order_type}" is not a market order')
+    if not mismatches:
+        return ""
+
+    reason = "; ".join(mismatches)
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.live.halt import trip_halt
+
+    closed = fn_guard._flatten_positions(trade["connection"], OUR_MAGIC, {actual_symbol or trade["symbol"]})
+    trip_halt(
+        by="cli",
+        reason=f"post-trade spec violation on {trade['symbol']}: {reason}",
+        broker=fn_guard.BROKER,
+    )
+    closed_note = "; ".join(closed) if closed else "no position found to close (already flat?)"
+    return (
+        f"\n\n[CRITICAL — SPEC VIOLATION, AUTO-CLOSED] The filled order did NOT match TARGETS' "
+        f"fixed spec: {reason}. This position has been closed immediately and {fn_guard.BROKER} "
+        f"trading is now HALTED (kill switch) until manually cleared "
+        f"(src.live.halt.clear_halt) — the committee did not follow the prompt's hardcoded "
+        f"order parameters, and this needs human review before further automated trading. "
+        f"Close attempt: {closed_note}."
+    )
 
 
 def _post_trade_cap_check(trade: dict) -> str:
@@ -1145,7 +1293,7 @@ def _post_trade_cap_check(trade: dict) -> str:
 
 
 def _post_trade_spread_check(trade: dict, placed_order: dict) -> str:
-    entry = placed_order.get("fill_price")
+    entry = _resolve_fill_price(trade, placed_order)
     stop_loss = placed_order.get("stop_loss")
     if entry is None or stop_loss is None:
         return ""
@@ -1171,6 +1319,130 @@ def _post_trade_spread_check(trade: dict, placed_order: dict) -> str:
         f"fill slippage on top). The prompt's volatility/spread floor should have prevented this; check why "
         f"it didn't."
     )
+
+
+def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
+    """placed_order['fill_price'] from trading_place_order's own immediate
+    response.
+
+    Real incident 2026-09-17: MT5's order_send() result sometimes doesn't
+    have the deal's fill price populated yet at the moment the tool call
+    returns (a known propagation gap between order confirmation and the
+    fill being reflected) — this showed up as a literal 0.0, not a missing
+    field, so callers checking `is None` alone don't catch it. That 0.0 fed
+    straight into _post_trade_reward_risk_check's math produced a negative
+    reward distance, which was silently (and technically correctly, given
+    the bad input) treated as "nothing sane to enforce" — meaning the
+    guardrail never actually ran on a real trade the very first time it had
+    the chance to. Falls back to the live position's own price_open (a
+    fresh get_positions() read, same source --status uses) whenever
+    fill_price is missing OR non-positive.
+    """
+    price = placed_order.get("fill_price")
+    try:
+        if price is not None and float(price) > 0:
+            return float(price)
+    except (TypeError, ValueError):
+        pass
+
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.service import get_positions
+
+    try:
+        positions = get_positions(trade["connection"]).get("positions", [])
+    except Exception:
+        return None
+    symbol = placed_order.get("symbol") or trade["symbol"]
+    for pos in positions:
+        if pos.get("symbol") == symbol and pos.get("magic") == OUR_MAGIC:
+            try:
+                open_price = float(pos.get("price_open"))
+            except (TypeError, ValueError):
+                continue
+            if open_price > 0:
+                return open_price
+    return None
+
+
+def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
+    """Enforce MIN_REWARD_RISK_RATIO on a just-filled order — not just
+    prompt guidance (the PM already claims to target ~1.5:1 in its own
+    reasoning, but nothing enforced that in code). See MIN_REWARD_RISK_RATIO's
+    own comment for the real trade data that motivated this.
+
+    If the filled stop_loss/take_profit imply a ratio below the floor,
+    corrects it immediately on the live position:
+      - Prefer TIGHTENING the stop-loss (more conservative — reduces risk
+        without changing the profit target) down to whatever restores the
+        ratio, but never past the ATR/spread volatility floor
+        (_atr_stop_floor/_spread_stop_floor) — an over-tight stop just
+        trades "loses less" for "gets stopped out by ordinary noise more
+        often," the opposite of the goal.
+      - If tightening the stop that far would violate the volatility floor
+        (the stop was already at/near the floor and the target was simply
+        too close), WIDEN the take-profit instead, preserving the stop's
+        already-floor-respecting distance.
+
+    Returns "" if the ratio is already fine, missing data means nothing
+    can be safely checked, or no matching position exists.
+    """
+    side = placed_order.get("side")
+    entry = _resolve_fill_price(trade, placed_order)
+    sl = placed_order.get("stop_loss")
+    tp = placed_order.get("take_profit")
+    if side not in ("buy", "sell") or entry is None or sl is None or tp is None:
+        return ""
+    entry, sl, tp = float(entry), float(sl), float(tp)
+    is_buy = side == "buy"
+
+    risk_distance = (entry - sl) if is_buy else (sl - entry)
+    reward_distance = (tp - entry) if is_buy else (entry - tp)
+    if risk_distance <= 0 or reward_distance <= 0:
+        return ""  # malformed levels -- nothing sane to enforce
+
+    ratio = reward_distance / risk_distance
+    if ratio >= MIN_REWARD_RISK_RATIO:
+        return ""
+
+    symbol = trade["symbol"]
+    quote = _symbol_live_quote(symbol, trade["connection"])
+    floor_distance = max(_atr_stop_floor(symbol, trade["connection"]) or 0.0, _spread_stop_floor(quote) or 0.0)
+
+    desired_risk_distance = reward_distance / MIN_REWARD_RISK_RATIO
+    if desired_risk_distance >= floor_distance:
+        new_sl = entry - desired_risk_distance if is_buy else entry + desired_risk_distance
+        new_tp = tp
+        action = f"tightened stop-loss to {new_sl:.5f}"
+    else:
+        desired_reward_distance = risk_distance * MIN_REWARD_RISK_RATIO
+        new_sl = sl
+        new_tp = entry + desired_reward_distance if is_buy else entry - desired_reward_distance
+        action = f"widened take-profit to {new_tp:.5f}"
+
+    header = (
+        f"{symbol}'s filled order has only a {ratio:.2f}:1 reward:risk ratio "
+        f"(entry {entry:.5f}, stop {sl:.5f}, target {tp:.5f}), below the {MIN_REWARD_RISK_RATIO:.1f}:1 floor"
+    )
+
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.profiles import profile_by_id
+    from src.trading.service import get_positions
+
+    try:
+        positions = get_positions(trade["connection"]).get("positions", [])
+        ours = [p for p in positions if p.get("symbol") == symbol and p.get("magic") == OUR_MAGIC]
+        if not ours:
+            return f"\n\n[AUTOMATED CHECK] {header} — no matching open position was found to correct; check manually."
+        profile = profile_by_id(trade["connection"])
+        config = mt5_sdk.build_config(profile.config, {})
+        result = mt5_sdk.modify_position(config, ticket=ours[0].get("ticket"), stop_loss=new_sl, take_profit=new_tp)
+    except Exception as exc:
+        return f"\n\n[AUTOMATED CHECK] {header} — correction attempt raised: {exc}."
+
+    if result.get("status") != "ok":
+        return f"\n\n[AUTOMATED CHECK] {header} — correction attempt failed: {result.get('error')}."
+    return f"\n\n[AUTOMATED CHECK — CORRECTED] {header} — {action} to restore it."
 
 
 def _last_json_line(stdout: str | None) -> dict | None:
