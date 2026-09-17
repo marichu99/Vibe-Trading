@@ -24,13 +24,13 @@ OPEN ITEMS — verify before relying on this at real money (see
      already net in swap charges (both floating and realized), since
      FundedNext's real daily-loss rule counts swap. Verify against a real
      account holding a position overnight before trusting this blind.
-  3. Static-drawdown-floor "never trails up": sources disagree on whether
-     FundedNext's 6% max-drawdown floor stays pinned to the INITIAL balance
-     forever, or ratchets up as profit is banked. This module implements the
-     conservative (never-moves) reading — re-verify against the actual
-     purchased challenge's contract/PDF terms, especially once the account
-     has a meaningful profit cushion (exactly when a wrong assumption here
-     would matter).
+  3. RESOLVED 2026-09-18: confirmed directly on FundedNext's own official
+     general-rules page (fundednext.com/general-rules/cfds/trading-
+     objectives, not a third-party summary) — "Maximum Loss Limit: 6%
+     (Static)... Static means the loss limit is set from your starting
+     balance and remains unchanged throughout." This module's never-moves
+     implementation (anchored to initial_balance_usd, never re-baselined)
+     matches FundedNext's own stated rule exactly. No longer open.
 
 NOTE: this was originally built assuming a Stellar 2-Step account (5% daily
 / 10% static limits, two profit-target phases); the actual purchased account
@@ -179,9 +179,10 @@ def static_drawdown_check(equity: float) -> str | None:
 
     Anchored to ``initial_balance_usd`` from fundednext_state — a one-time
     snapshot taken on this account's first-ever run, NEVER re-baselined
-    (unlike daily_loss_check above). A trip here means the challenge is
-    likely breached outright, not a same-day pause — see module docstring's
-    open item 3 on whether this floor genuinely never trails up.
+    (unlike daily_loss_check above) — confirmed correct against FundedNext's
+    own official rules (see module docstring's resolved open item 3). A
+    trip here means the challenge is likely breached outright, not a
+    same-day pause.
     """
     state = fn_state.get_state()
     initial = state.get("initial_balance_usd")
