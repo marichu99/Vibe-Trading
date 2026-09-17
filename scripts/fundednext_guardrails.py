@@ -15,9 +15,11 @@ rule.
 
 OPEN ITEMS — verify before relying on this at real money (see
 ``C:\\Users\\Hp\\.claude\\plans\\calm-wondering-snail.md``):
-  1. Server-day timezone: ``fundednext_state.server_today()`` assumes
-     GMT+3 DST / GMT+2 standard (Europe/Bucharest) for FundedNext's server
-     time. Verify against the real MT5 terminal's displayed time.
+  1. RESOLVED 2026-09-17: server-day timezone was originally assumed as
+     GMT+3 DST / GMT+2 standard (Europe/Bucharest) — live-verified against
+     real EURUSD D1 bar timestamps from this account's own terminal and
+     corrected to plain UTC (see ``fundednext_state.py``'s module
+     docstring for the exact check). No longer open.
   2. Swap-in-equity: this module trusts MT5's own ``equity`` figure to
      already net in swap charges (both floating and realized), since
      FundedNext's real daily-loss rule counts swap. Verify against a real

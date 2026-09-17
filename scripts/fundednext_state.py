@@ -28,15 +28,18 @@ FundedNext's own dashboard is the authority on when the challenge has
 actually passed (their own consistency/KYC/etc. checks might not agree with
 a balance-based guess), not something this bot should self-declare.
 
-Server-day boundary: FundedNext's daily-loss-limit day rolls over at
-00:00 SERVER time, documented as GMT+3 during DST / GMT+2 standard — the
-same summer/winter offset ``Europe/Bucharest`` uses (EU DST schedule).
-``server_today()`` assumes that timezone. VERIFY this against the actual
-FundedNext MT5 terminal's displayed server time before relying on it,
-especially close to a DST transition — a wrong assumption shifts the
-daily-loss reset boundary by an hour for about a week each transition, which
-could open or close the day's loss budget at the wrong moment. See the
-matching caveat in ``fundednext_guardrails.py``.
+Server-day boundary: originally assumed GMT+3 DST / GMT+2 standard
+(Europe/Bucharest, matching FundedNext's own general documentation for
+their server time) — CORRECTED 2026-09-17 after live-verifying against
+this specific account's own MT5 terminal: fetched real EURUSD D1
+(TIMEFRAME_D1, unmodified/unresampled) daily bars via
+``src.trading.connectors.mt5.sdk.get_historical_bars`` and found every
+bar's open timestamp landed on exactly ``00:00:00 UTC`` — not offset by
+2-3 hours as the EET assumption would produce. FundedNext-Server 2's
+actual day boundary is plain UTC, not EET. ``server_today()`` now assumes
+UTC. If this account is ever moved to a different FundedNext server,
+re-verify with the same D1-bar-timestamp check before trusting the
+timezone again — don't just re-assume EET from their general docs.
 """
 
 from __future__ import annotations
@@ -44,9 +47,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT_DIR = REPO_ROOT / "agent"
@@ -63,13 +65,14 @@ CHALLENGE_TARGET_PCT = 10.0
 # >=1 trade each, non-consecutive OK.
 MIN_TRADING_DAYS = 2
 
-# Same GMT+3 DST / GMT+2 standard offset FundedNext documents for its server
-# time — see module docstring's caveat.
-_SERVER_TZ = ZoneInfo("Europe/Bucharest")
+# Live-verified 2026-09-17 via real EURUSD D1 bar timestamps (see module
+# docstring) -- FundedNext-Server 2's actual day boundary is plain UTC, not
+# the EET (GMT+2/+3) their general docs would suggest.
+_SERVER_TZ = timezone.utc
 
 
 def server_today(now: datetime | None = None) -> str:
-    """Today's date (YYYY-MM-DD) in the assumed FundedNext server timezone."""
+    """Today's date (YYYY-MM-DD) in FundedNext-Server 2's actual day boundary (UTC — see module docstring)."""
     moment = now or datetime.now(_SERVER_TZ)
     if moment.tzinfo is None:
         moment = moment.astimezone(_SERVER_TZ)

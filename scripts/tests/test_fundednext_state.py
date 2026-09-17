@@ -34,8 +34,19 @@ class TestServerToday:
     def test_respects_passed_now(self) -> None:
         from datetime import datetime, timezone
 
-        # A UTC noon in January is unambiguously EET (GMT+2, no DST).
         now = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+        assert fn_state.server_today(now) == "2026-01-15"
+
+    def test_uses_utc_not_eet(self) -> None:
+        """Real fix 2026-09-17: this was originally EET (GMT+2/+3), live-
+        verified wrong against real D1 bar timestamps and corrected to UTC
+        -- see fundednext_state.py's module docstring. 23:30 UTC is still
+        "today" under UTC but would already be "tomorrow" under EET
+        (GMT+2 or +3), so this specifically catches a regression back to
+        the wrong timezone."""
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 1, 15, 23, 30, tzinfo=timezone.utc)
         assert fn_state.server_today(now) == "2026-01-15"
 
 
