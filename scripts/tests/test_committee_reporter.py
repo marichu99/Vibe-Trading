@@ -578,6 +578,7 @@ class TestClassifyExcursion:
     def _entry(self, **overrides) -> dict:
         base = {
             "symbol": "EURUSDm",
+            "connection": "mt5-live-trade",
             "opened_at": "2026-09-07T10:00:00+00:00",
             "entry_price": 1.1620,
             "stop_loss": 1.1600,
@@ -594,10 +595,11 @@ class TestClassifyExcursion:
 
     def test_tags_reversal_when_favorable_move_was_large(self, monkeypatch) -> None:
         import src.trading.connectors.mt5.sdk as mt5_sdk
+        monkeypatch.setattr(cr, "_mt5_config_for", lambda connection: None)
         # Stop distance 0.0020; a favorable excursion of 0.0018 is >= 50% of it.
         monkeypatch.setattr(
             mt5_sdk, "get_historical_bars_range",
-            lambda symbol, start, end, period: {"bars": [{"high": 1.1638, "low": 1.1605, "close": 1.1610}]},
+            lambda symbol, start, end, config=None, period="15m": {"bars": [{"high": 1.1638, "low": 1.1605, "close": 1.1610}]},
         )
         result = cr._classify_excursion(self._entry(), self._deal())
         assert result["excursion_tag"] == "reversal"
@@ -606,9 +608,10 @@ class TestClassifyExcursion:
 
     def test_tags_clean_when_no_meaningful_favorable_move(self, monkeypatch) -> None:
         import src.trading.connectors.mt5.sdk as mt5_sdk
+        monkeypatch.setattr(cr, "_mt5_config_for", lambda connection: None)
         monkeypatch.setattr(
             mt5_sdk, "get_historical_bars_range",
-            lambda symbol, start, end, period: {"bars": [{"high": 1.1622, "low": 1.1600, "close": 1.1610}]},
+            lambda symbol, start, end, config=None, period="15m": {"bars": [{"high": 1.1622, "low": 1.1600, "close": 1.1610}]},
         )
         result = cr._classify_excursion(self._entry(), self._deal())
         assert result["excursion_tag"] == "clean"
@@ -618,9 +621,10 @@ class TestClassifyExcursion:
         working before turning -- a win with a big favorable excursion is
         just... winning."""
         import src.trading.connectors.mt5.sdk as mt5_sdk
+        monkeypatch.setattr(cr, "_mt5_config_for", lambda connection: None)
         monkeypatch.setattr(
             mt5_sdk, "get_historical_bars_range",
-            lambda symbol, start, end, period: {"bars": [{"high": 1.1660, "low": 1.1605, "close": 1.1650}]},
+            lambda symbol, start, end, config=None, period="15m": {"bars": [{"high": 1.1660, "low": 1.1605, "close": 1.1650}]},
         )
         result = cr._classify_excursion(self._entry(outcome="win"), self._deal())
         assert result["excursion_tag"] == "clean"
@@ -628,7 +632,9 @@ class TestClassifyExcursion:
     def test_empty_dict_on_read_failure(self, monkeypatch) -> None:
         import src.trading.connectors.mt5.sdk as mt5_sdk
 
-        def _boom(symbol, start, end, period):
+        monkeypatch.setattr(cr, "_mt5_config_for", lambda connection: None)
+
+        def _boom(symbol, start, end, config=None, period="15m"):
             raise RuntimeError("no bars")
 
         monkeypatch.setattr(mt5_sdk, "get_historical_bars_range", _boom)
@@ -735,9 +741,9 @@ class TestProfitProtectionCheckTimeDecay:
 
         monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: _FakeProfile())
         monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: "FAKE_CONFIG")
-        monkeypatch.setattr(mt5_sdk, "point_size", lambda symbol: 0.00001)
-        monkeypatch.setattr(mt5_sdk, "contract_size", lambda symbol: 100_000)
-        monkeypatch.setattr(cr, "_atr_stop_floor", lambda symbol: atr_floor)
+        monkeypatch.setattr(mt5_sdk, "point_size", lambda symbol, config=None: 0.00001)
+        monkeypatch.setattr(mt5_sdk, "contract_size", lambda symbol, config=None: 100_000)
+        monkeypatch.setattr(cr, "_atr_stop_floor", lambda symbol, connection: atr_floor)
 
         calls = {"modify": [], "close": []}
 
@@ -883,9 +889,9 @@ class TestProfitProtectionCheckTimeDecay:
 
         monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: _FakeProfile())
         monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: "FAKE_CONFIG")
-        monkeypatch.setattr(mt5_sdk, "point_size", lambda symbol: 0.00001)
-        monkeypatch.setattr(mt5_sdk, "contract_size", lambda symbol: 100_000)
-        monkeypatch.setattr(cr, "_atr_stop_floor", lambda symbol: 0.0010)
+        monkeypatch.setattr(mt5_sdk, "point_size", lambda symbol, config=None: 0.00001)
+        monkeypatch.setattr(mt5_sdk, "contract_size", lambda symbol, config=None: 100_000)
+        monkeypatch.setattr(cr, "_atr_stop_floor", lambda symbol, connection: 0.0010)
         calls = {"modify": []}
         monkeypatch.setattr(
             mt5_sdk, "modify_position",

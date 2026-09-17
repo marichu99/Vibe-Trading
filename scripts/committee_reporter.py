@@ -731,7 +731,33 @@ def _effective_max_loss_usd(connection: str) -> float:
     return min(MAX_LOSS_PER_ORDER_USD, portfolio_budget)
 
 
-def _max_stop_distance(symbol: str, lots: float, budget_usd: float = MAX_LOSS_PER_ORDER_USD) -> float | None:
+def _mt5_config_for(connection: str):
+    """Resolve the actual MT5Config (incl. terminal_path) for a connection id.
+
+    Real bug found 2026-09-18 (originally caught and fixed on the sibling
+    fundednext_reporter.py first): _max_stop_distance/_atr_stop_floor used
+    to call mt5_sdk.contract_size()/get_historical_bars() with NO config,
+    which defaults to load_config() (the global ~/.vibe-trading/mt5.json --
+    bare MT5Config() if that file doesn't exist, terminal_path=""). With
+    only the Exness terminal ever running, an unpathed call had nothing
+    ambiguous to resolve against and accidentally always worked. Now that
+    the FundedNext bot runs a SEPARATE terminal on this SAME machine, an
+    unpathed call from a fresh `cli run` subprocess (a new one spawns every
+    pass) can silently attach to WHICHEVER terminal MT5 happens to find --
+    non-deterministic, not just "it worked once so it's fine." Every call
+    needs the correct profile's config explicitly, same pattern already
+    used elsewhere in this file (_live_circuit_breaker_check,
+    _weekend_flatten_and_notify, _profit_protection_check).
+    """
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.profiles import profile_by_id
+
+    profile = profile_by_id(connection)
+    return mt5_sdk.build_config(profile.config, {})
+
+
+def _max_stop_distance(symbol: str, lots: float, budget_usd: float, connection: str) -> float | None:
     """Max stop-loss distance (price units) that stays within ``budget_usd``.
 
     ``budget_usd / (contract_size * lots)`` — the same formula the mandate
@@ -746,7 +772,8 @@ def _max_stop_distance(symbol: str, lots: float, budget_usd: float = MAX_LOSS_PE
     from src.trading.connectors.mt5 import sdk as mt5_sdk
 
     try:
-        size = mt5_sdk.contract_size(symbol)
+        config = _mt5_config_for(connection)
+        size = mt5_sdk.contract_size(symbol, config=config)
     except Exception:
         return None
     if not size or size <= 0 or lots <= 0:
@@ -754,21 +781,21 @@ def _max_stop_distance(symbol: str, lots: float, budget_usd: float = MAX_LOSS_PE
     return budget_usd / (size * lots)
 
 
-def _atr_stop_floor(symbol: str) -> float | None:
+def _atr_stop_floor(symbol: str, connection: str) -> float | None:
     """Minimum stop-loss distance (price units) to sit outside normal noise, or None if unavailable.
 
     ATR_STOP_MULTIPLE x ATR(ATR_LOOKBACK_BARS) on ATR_PERIOD bars, computed
-    from the most recent real bars — pure historical-bar math, zero LLM cost,
-    same data source and connector-default-config pattern as
-    ``_max_stop_distance``. Fails open (returns None) on any read error; a
-    pass this can't compute for just proceeds without the floor rather than
-    blocking trading over a transient data-feed hiccup.
+    from the most recent real bars — pure historical-bar math, zero LLM cost.
+    Fails open (returns None) on any read error; a pass this can't compute
+    for just proceeds without the floor rather than blocking trading over a
+    transient data-feed hiccup.
     """
     sys.path.insert(0, str(AGENT_DIR))
     from src.trading.connectors.mt5 import sdk as mt5_sdk
 
     try:
-        bars = mt5_sdk.get_historical_bars(symbol, period=ATR_PERIOD, limit=ATR_LOOKBACK_BARS + 1)["bars"]
+        config = _mt5_config_for(connection)
+        bars = mt5_sdk.get_historical_bars(symbol, config=config, period=ATR_PERIOD, limit=ATR_LOOKBACK_BARS + 1)["bars"]
     except Exception:
         return None
 
@@ -1008,10 +1035,12 @@ def _classify_excursion(entry: dict, deal: dict) -> dict:
         return {}
 
     try:
+        config = _mt5_config_for(entry["connection"])
         bars = mt5_sdk.get_historical_bars_range(
             entry["symbol"],
             opened - timedelta(minutes=15),
             closed + timedelta(minutes=15),
+            config=config,
             period=EXCURSION_BAR_PERIOD,
         )["bars"]
     except Exception:
@@ -1503,7 +1532,7 @@ def _profit_protection_check() -> None:
             reached_halfway = price >= halfway if is_buy else price <= halfway
             if reached_halfway:
                 try:
-                    point = mt5_sdk.point_size(trade["symbol"])
+                    point = mt5_sdk.point_size(trade["symbol"], config=config)
                 except Exception:
                     point = None
                 if point and point > 0:
@@ -1520,7 +1549,7 @@ def _profit_protection_check() -> None:
             # is effectively unreachable at 0.01-lot FX position sizing.
             trail_candidate = None
             try:
-                size = mt5_sdk.contract_size(trade["symbol"])
+                size = mt5_sdk.contract_size(trade["symbol"], config=config)
             except Exception:
                 size = None
             if size and size > 0 and trade["lots"] > 0:
@@ -1528,7 +1557,7 @@ def _profit_protection_check() -> None:
                 trigger_distance = trigger_usd / (size * trade["lots"])
                 gained = (price - entry) if is_buy else (entry - price)
                 if gained >= trigger_distance:
-                    atr_distance = _atr_stop_floor(trade["symbol"])
+                    atr_distance = _atr_stop_floor(trade["symbol"], trade["connection"])
                     if atr_distance:
                         trail_candidate = price - atr_distance if is_buy else price + atr_distance
 
@@ -1540,7 +1569,7 @@ def _profit_protection_check() -> None:
             # tighten, never widen, a losing position's stop.
             decay_candidate = None
             if elapsed_hours is not None and elapsed_hours >= max_hold_hours * TIME_DECAY_START_FRACTION:
-                atr_distance = _atr_stop_floor(trade["symbol"])
+                atr_distance = _atr_stop_floor(trade["symbol"], trade["connection"])
                 if atr_distance:
                     decay_candidate = price - atr_distance if is_buy else price + atr_distance
 
@@ -1672,7 +1701,7 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
         )
 
     effective_budget = _effective_max_loss_usd(connection)
-    max_distance = _max_stop_distance(symbol, lots, effective_budget)
+    max_distance = _max_stop_distance(symbol, lots, effective_budget, connection)
     if max_distance is not None:
         budget_note = (
             f"${effective_budget:.2f} (this account's {PORTFOLIO_RISK_FRACTION:.0%}-of-equity / "
@@ -1697,7 +1726,7 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
             f"broker gate regardless of what you propose."
         )
 
-    atr_floor = _atr_stop_floor(symbol)
+    atr_floor = _atr_stop_floor(symbol, connection)
     spread_floor = _spread_stop_floor(quote)
     # Whichever constraint is currently wider governs — a stop that clears
     # the ATR noise floor but leaves the spread eating a huge share of the
@@ -2542,8 +2571,8 @@ def _check_cap_fit_alert() -> None:
         key = f"{trade['connection']}:{symbol}"
 
         effective_budget = _effective_max_loss_usd(trade["connection"])
-        max_distance = _max_stop_distance(symbol, trade["lots"], effective_budget)
-        atr_floor = _atr_stop_floor(symbol)
+        max_distance = _max_stop_distance(symbol, trade["lots"], effective_budget, trade["connection"])
+        atr_floor = _atr_stop_floor(symbol, trade["connection"])
         if max_distance is None or atr_floor is None:
             continue
 
@@ -2589,8 +2618,8 @@ def _log_cap_gap() -> None:
         symbol = trade["symbol"]
 
         effective_budget = _effective_max_loss_usd(trade["connection"])
-        max_distance = _max_stop_distance(symbol, trade["lots"], effective_budget)
-        atr_floor = _atr_stop_floor(symbol)
+        max_distance = _max_stop_distance(symbol, trade["lots"], effective_budget, trade["connection"])
+        atr_floor = _atr_stop_floor(symbol, trade["connection"])
         if max_distance is None or atr_floor is None:
             continue
 
