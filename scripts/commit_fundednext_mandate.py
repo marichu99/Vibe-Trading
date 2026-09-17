@@ -85,13 +85,20 @@ ACCOUNT_REF = os.environ.get("FUNDEDNEXT_ACCOUNT_REF", "")
 
 # Sized for a $6,000 Stellar 1-Step challenge account — see module docstring.
 MAX_ORDER_USD = 35000.0
-MAX_TOTAL_EXPOSURE_USD = 60000.0
+# Raised 2026-09-17 from $60,000 to $75,000 when gold was added: EURUSD
+# ($27.5k) + AUDUSD ($23.5k) + XAUUSD 0.02 lots (~$8.7k at the live gold
+# price) = ~$59.7k if all three are open at once, leaving almost no buffer
+# against normal price movement at the old $60k cap.
+MAX_TOTAL_EXPOSURE_USD = 75000.0
 MAX_LEVERAGE = 30.0  # matches the account's own actual leverage — see module docstring
 MAX_TRADES_PER_DAY = 10
 LIFETIME_DAYS = 30
 FLATTEN_ON_HALT = True
 ALLOWED_INSTRUMENTS = ["cfd"]
-ASSET_CLASSES = ["forex"]  # EURUSD, AUDUSD — see fundednext_reporter.py TARGETS
+# "commodity" added 2026-09-17 for XAUUSD (gold) — see fundednext_reporter.py
+# TARGETS for the live symbol-availability/cost comparison that picked gold
+# over silver/platinum.
+ASSET_CLASSES = ["forex", "commodity"]  # EURUSD, AUDUSD, XAUUSD — see fundednext_reporter.py TARGETS
 
 # 1% of the $6,000 starting balance — re-derive and re-commit as balance
 # grows (see module docstring).
@@ -114,7 +121,7 @@ def _build_proposal() -> dict:
         "exclude_symbols": [],
         "flatten_on_halt": FLATTEN_ON_HALT,
         "max_loss_per_order_usd": MAX_LOSS_PER_ORDER_USD,
-        "notes": "FundedNext Stellar 1-Step challenge mandate ($6,000 account), forex only (EURUSD/AUDUSD).",
+        "notes": "FundedNext Stellar 1-Step challenge mandate ($6,000 account), forex + gold (EURUSD/AUDUSD/XAUUSD).",
     }
     ceilings = {
         "account_funding_usd": MAX_TOTAL_EXPOSURE_USD,
