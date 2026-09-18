@@ -216,20 +216,23 @@ TIME_DECAY_START_FRACTION = 0.75
 # risk-avoidance, not a FundedNext compliance requirement.
 NEWS_BLACKOUT_WINDOW_MINUTES = 5
 
-# Model override for THIS account's committee subprocess only (2026-09-17,
-# user request for better-quality decisions on the challenge account) --
-# passed as the child process's own environment, NOT written to agent/.env,
-# so the Exness reporter's separate subprocess calls are completely
-# unaffected (agent/.env currently has LANGCHAIN_MODEL_NAME=deepseek-v4-
-# flash, chosen there for cost; _ensure_dotenv()'s load_dotenv(override=
-# False) means an already-set env var always wins over the .env file's
-# value, which is what makes this override reliable). deepseek-v4-pro is
-# the provider's own default/flagship model (see agent/src/providers/
-# llm_providers.json's default_model) -- meaningfully more capable than
-# flash, but priced accordingly; this account's tighter 3%/6% self-imposed
-# error budget (vs. the live account's looser posture) is the reasoning for
-# spending more per decision here specifically.
-LLM_MODEL_OVERRIDE = {"LANGCHAIN_PROVIDER": "deepseek", "LANGCHAIN_MODEL_NAME": "deepseek-v4-pro"}
+# Model override for THIS account's committee subprocess only -- passed as
+# the child process's own environment, NOT written to agent/.env, so the
+# Exness reporter's separate subprocess calls are completely unaffected
+# (_ensure_dotenv()'s load_dotenv(override=False) means an already-set env
+# var always wins over the .env file's value, which is what makes this
+# override reliable).
+#
+# 2026-09-18: DeepSeek's account balance went negative (both bots moved off
+# it entirely -- see agent/.env). Moved this override to OpenRouter/Claude
+# too, matching the Exness reporter's shared agent/.env default, rather than
+# leaving it pointed at an unusable provider. Kept an explicit override
+# (instead of just deleting this and falling through to agent/.env) so this
+# account's model choice stays independently controllable -- originally
+# deepseek-v4-pro over flash for this account's tighter 3%/6% self-imposed
+# error budget; same reasoning would apply again if/when the account's
+# cost budget allows Sonnet over Haiku specifically for this account.
+LLM_MODEL_OVERRIDE = {"LANGCHAIN_PROVIDER": "openrouter", "LANGCHAIN_MODEL_NAME": "anthropic/claude-haiku-4-5"}
 
 
 def _kill_process_tree(pid: int) -> None:
@@ -1237,6 +1240,16 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     placed_order = _extract_placed_order(run_id) if trade else None
     traded = bool(placed_order)
     if traded:
+        # Resolve the real fill price ONCE here and patch it into
+        # placed_order, so every downstream consumer (_post_trade_spread_
+        # check, _post_trade_reward_risk_check, _journal_record_open) can
+        # just read placed_order["fill_price"] directly instead of each
+        # independently calling _resolve_fill_price (and its own
+        # get_positions broker round-trip) -- mirrors the identical fix in
+        # committee_reporter.py's run_committee, found by /code-review.
+        resolved_price = _resolve_fill_price(trade, placed_order)
+        if resolved_price is not None:
+            placed_order["fill_price"] = resolved_price
         spec_note = _post_trade_spec_check(trade, placed_order)
         if spec_note:
             # A spec violation is CLOSED, not just reported -- see
@@ -1304,8 +1317,45 @@ def _post_trade_spec_check(trade: dict, placed_order: dict) -> str:
     reason = "; ".join(mismatches)
     sys.path.insert(0, str(AGENT_DIR))
     from src.live.halt import trip_halt
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.service import get_positions
 
-    closed = fn_guard._flatten_positions(trade["connection"], OUR_MAGIC, {actual_symbol or trade["symbol"]})
+    # Match by the NEW order's own ticket (order_id), not fn_guard's
+    # _flatten_positions(symbol+magic) -- real bug found by /code-review
+    # (mirrored from the identical fix in committee_reporter.py): with
+    # multiple legitimate stacked positions on this symbol, symbol+magic
+    # alone force-closes ALL of them on a spec violation, not just the one
+    # bad new fill. _flatten_positions itself is correct and untouched --
+    # it's still the right tool for a real portfolio-level halt flatten
+    # elsewhere in fundednext_guardrails.py, just not for this ticket-
+    # specific case.
+    target_ticket = str(placed_order.get("order_id") or "").strip()
+    closed: list[str] = []
+    try:
+        positions = get_positions(trade["connection"]).get("positions", [])
+        matches = [
+            p for p in positions
+            if p.get("symbol") == (actual_symbol or trade["symbol"])
+            and p.get("magic") == OUR_MAGIC
+            and target_ticket
+            and str(p.get("ticket")) == target_ticket
+        ]
+        if matches:
+            config = _mt5_config_for(trade["connection"])
+            for pos in matches:  # should be exactly one; loop defensively
+                ticket = pos.get("ticket")
+                result = mt5_sdk.close_position(config, ticket=ticket)
+                closed.append(f"{pos.get('symbol')} ticket {ticket}: {result.get('status')}")
+        elif not target_ticket:
+            closed.append(
+                "could not identify the new position's own ticket (order_id missing) -- "
+                "refusing to blindly close other positions on this symbol; close manually"
+            )
+        else:
+            closed.append(f"no open position found with ticket {target_ticket} (already closed/never opened?)")
+    except Exception as exc:
+        closed.append(f"flatten attempt raised: {exc}")
+
     trip_halt(
         by="cli",
         reason=f"post-trade spec violation on {trade['symbol']}: {reason}",
@@ -1474,22 +1524,40 @@ def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
 
     sys.path.insert(0, str(AGENT_DIR))
     from src.trading.connectors.mt5 import sdk as mt5_sdk
-    from src.trading.profiles import profile_by_id
     from src.trading.service import get_positions
 
+    # Match by the NEW order's own ticket (order_id), not ours[0] -- real
+    # bug found by /code-review (mirrored from the identical fix in
+    # committee_reporter.py): with multiple legitimate stacked positions on
+    # this symbol, ours[0] (whatever order the broker happens to return)
+    # could be an older, already-compliant position -- modifying it leaves
+    # the actual sub-floor new fill uncorrected while altering a healthy one.
+    target_ticket = str(placed_order.get("order_id") or "").strip()
     try:
         positions = get_positions(trade["connection"]).get("positions", [])
-        ours = [p for p in positions if p.get("symbol") == symbol and p.get("magic") == OUR_MAGIC]
-        if not ours:
-            return f"\n\n[AUTOMATED CHECK] {header} — no matching open position was found to correct; check manually."
-        profile = profile_by_id(trade["connection"])
-        config = mt5_sdk.build_config(profile.config, {})
-        result = mt5_sdk.modify_position(config, ticket=ours[0].get("ticket"), stop_loss=new_sl, take_profit=new_tp)
+        matches = [
+            p for p in positions
+            if p.get("symbol") == symbol and p.get("magic") == OUR_MAGIC
+            and target_ticket and str(p.get("ticket")) == target_ticket
+        ]
+        if not matches:
+            return (
+                f"\n\n[AUTOMATED CHECK] {header} — no matching open position "
+                f"(ticket {target_ticket or '?'}) was found to correct; check manually."
+            )
+        config = _mt5_config_for(trade["connection"])
+        result = mt5_sdk.modify_position(config, ticket=matches[0].get("ticket"), stop_loss=new_sl, take_profit=new_tp)
     except Exception as exc:
         return f"\n\n[AUTOMATED CHECK] {header} — correction attempt raised: {exc}."
 
     if result.get("status") != "ok":
         return f"\n\n[AUTOMATED CHECK] {header} — correction attempt failed: {result.get('error')}."
+    # Mutate placed_order in place so the caller's subsequent journal write
+    # (_journal_record_open) records the ACTUAL live stop/target, not the
+    # stale pre-correction values -- mirrors the identical fix in
+    # committee_reporter.py, found by /code-review.
+    placed_order["stop_loss"] = new_sl
+    placed_order["take_profit"] = new_tp
     return f"\n\n[AUTOMATED CHECK — CORRECTED] {header} — {action} to restore it."
 
 

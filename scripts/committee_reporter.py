@@ -1951,6 +1951,16 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     placed_order = _extract_placed_order(run_id) if trade else None
     traded = bool(placed_order)
     if traded:
+        # Resolve the real fill price ONCE here and patch it into
+        # placed_order, so every downstream consumer (_post_trade_spread_
+        # check, _post_trade_reward_risk_check, _journal_record_open) can
+        # just read placed_order["fill_price"] directly instead of each
+        # independently calling _resolve_fill_price (and its own
+        # get_positions broker round-trip) -- real inefficiency found by
+        # /code-review: up to 3 redundant broker calls per trade.
+        resolved_price = _resolve_fill_price(trade, placed_order)
+        if resolved_price is not None:
+            placed_order["fill_price"] = resolved_price
         spec_note = _post_trade_spec_check(trade, placed_order)
         if spec_note:
             # A spec violation is CLOSED, not just reported -- see
@@ -2126,25 +2136,40 @@ def _post_trade_spec_check(trade: dict, placed_order: dict) -> str:
     sys.path.insert(0, str(AGENT_DIR))
     from src.live.halt import trip_halt
     from src.trading.connectors.mt5 import sdk as mt5_sdk
-    from src.trading.profiles import profile_by_id
     from src.trading.service import get_positions
 
     broker = "mt5"  # every mt5-live-* profile shares this mandate/halt broker key
     connection = trade["connection"]
+    # Match by the NEW order's own ticket (order_id), not just symbol+magic
+    # -- real bug found by /code-review: with MAX_SAME_DIRECTION_POSITIONS
+    # (or a target's own max_stack) > 1, this symbol can legitimately have
+    # several already-open, healthy positions. Matching on symbol+magic
+    # alone force-closed ALL of them on a spec violation, not just the one
+    # bad new fill.
+    target_ticket = str(placed_order.get("order_id") or "").strip()
     closed: list[str] = []
     try:
         positions = get_positions(connection).get("positions", [])
-        ours = [
+        matches = [
             p for p in positions
-            if p.get("symbol") == (actual_symbol or trade["symbol"]) and p.get("magic") == OUR_MAGIC
+            if p.get("symbol") == (actual_symbol or trade["symbol"])
+            and p.get("magic") == OUR_MAGIC
+            and target_ticket
+            and str(p.get("ticket")) == target_ticket
         ]
-        if ours:
-            profile = profile_by_id(connection)
-            config = mt5_sdk.build_config(profile.config, {})
-            for pos in ours:
+        if matches:
+            config = _mt5_config_for(connection)
+            for pos in matches:  # should be exactly one; loop defensively
                 ticket = pos.get("ticket")
                 result = mt5_sdk.close_position(config, ticket=ticket)
                 closed.append(f"{pos.get('symbol')} ticket {ticket}: {result.get('status')}")
+        elif not target_ticket:
+            closed.append(
+                "could not identify the new position's own ticket (order_id missing) -- "
+                "refusing to blindly close other positions on this symbol; close manually"
+            )
+        else:
+            closed.append(f"no open position found with ticket {target_ticket} (already closed/never opened?)")
     except Exception as exc:
         closed.append(f"flatten attempt raised: {exc}")
 
@@ -2224,22 +2249,40 @@ def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
 
     sys.path.insert(0, str(AGENT_DIR))
     from src.trading.connectors.mt5 import sdk as mt5_sdk
-    from src.trading.profiles import profile_by_id
     from src.trading.service import get_positions
 
+    # Match by the NEW order's own ticket (order_id), not ours[0] -- real
+    # bug found by /code-review: with multiple legitimate stacked positions
+    # on this symbol, ours[0] (whatever order the broker happens to return)
+    # could be an older, already-compliant position -- modifying it leaves
+    # the actual sub-floor new fill uncorrected while altering a healthy one.
+    target_ticket = str(placed_order.get("order_id") or "").strip()
     try:
         positions = get_positions(connection).get("positions", [])
-        ours = [p for p in positions if p.get("symbol") == symbol and p.get("magic") == OUR_MAGIC]
-        if not ours:
-            return f"\n\n[AUTOMATED CHECK] {header} — no matching open position was found to correct; check manually."
-        profile = profile_by_id(connection)
-        config = mt5_sdk.build_config(profile.config, {})
-        result = mt5_sdk.modify_position(config, ticket=ours[0].get("ticket"), stop_loss=new_sl, take_profit=new_tp)
+        matches = [
+            p for p in positions
+            if p.get("symbol") == symbol and p.get("magic") == OUR_MAGIC
+            and target_ticket and str(p.get("ticket")) == target_ticket
+        ]
+        if not matches:
+            return (
+                f"\n\n[AUTOMATED CHECK] {header} — no matching open position "
+                f"(ticket {target_ticket or '?'}) was found to correct; check manually."
+            )
+        config = _mt5_config_for(connection)
+        result = mt5_sdk.modify_position(config, ticket=matches[0].get("ticket"), stop_loss=new_sl, take_profit=new_tp)
     except Exception as exc:
         return f"\n\n[AUTOMATED CHECK] {header} — correction attempt raised: {exc}."
 
     if result.get("status") != "ok":
         return f"\n\n[AUTOMATED CHECK] {header} — correction attempt failed: {result.get('error')}."
+    # Mutate placed_order in place so the caller's subsequent journal write
+    # (_journal_record_open) records the ACTUAL live stop/target, not the
+    # stale pre-correction values -- real bug found by /code-review: the
+    # journal used to silently diverge from what's really on the broker,
+    # corrupting later excursion/reversal-tag analysis for this trade.
+    placed_order["stop_loss"] = new_sl
+    placed_order["take_profit"] = new_tp
     return f"\n\n[AUTOMATED CHECK — CORRECTED] {header} — {action} to restore it."
 
 

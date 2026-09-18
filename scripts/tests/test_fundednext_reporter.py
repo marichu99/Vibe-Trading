@@ -133,49 +133,90 @@ class TestPostTradeSpecCheck:
     """
 
     TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.01, "max_stack": 1}
+    NEW_TICKET = "999"
 
-    def _patch(self, monkeypatch, *, closed=None):
+    def _patch(self, monkeypatch, *, positions=None):
         import src.live.halt as halt
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+        import src.trading.service as service
 
-        tripped = {}
+        tripped: dict = {}
+        closed_tickets: list = []
         monkeypatch.setattr(halt, "trip_halt", lambda by, reason, broker: tripped.update(by=by, reason=reason, broker=broker))
-        monkeypatch.setattr(fn_guard, "_flatten_positions", lambda conn, magic, symbols: closed or [])
-        return tripped
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions if positions is not None else []})
+        monkeypatch.setattr(fr, "_mt5_config_for", lambda connection: {})
+
+        def _close(config, ticket):
+            closed_tickets.append(ticket)
+            return {"status": "ok"}
+
+        monkeypatch.setattr(mt5_sdk, "close_position", _close)
+        return tripped, closed_tickets
 
     def test_matching_order_is_a_no_op(self, monkeypatch) -> None:
-        tripped = self._patch(monkeypatch)
-        order = {"symbol": "EURUSD", "quantity": 0.01, "order_type": "market"}
+        tripped, closed_tickets = self._patch(monkeypatch)
+        order = {"symbol": "EURUSD", "quantity": 0.01, "order_type": "market", "order_id": self.NEW_TICKET}
         assert fr._post_trade_spec_check(self.TRADE, order) == ""
-        assert tripped == {}
+        assert tripped == {} and closed_tickets == []
 
     def test_wrong_symbol_closes_and_halts(self, monkeypatch) -> None:
-        tripped = self._patch(monkeypatch, closed=["EURUSDm ticket 123: ok"])
-        order = {"symbol": "EURUSDm", "quantity": 0.01, "order_type": "market"}
+        positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSDm", "magic": fr.OUR_MAGIC}]
+        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        order = {"symbol": "EURUSDm", "quantity": 0.01, "order_type": "market", "order_id": self.NEW_TICKET}
         note = fr._post_trade_spec_check(self.TRADE, order)
         assert "CRITICAL" in note and "AUTO-CLOSED" in note and "EURUSDm" in note
         assert tripped.get("broker") == fn_guard.BROKER
+        assert closed_tickets == [self.NEW_TICKET]
 
     def test_wrong_quantity_closes_and_halts(self, monkeypatch) -> None:
-        tripped = self._patch(monkeypatch, closed=["EURUSD ticket 124: ok"])
-        order = {"symbol": "EURUSD", "quantity": 0.25, "order_type": "market"}
+        positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSD", "magic": fr.OUR_MAGIC}]
+        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        order = {"symbol": "EURUSD", "quantity": 0.25, "order_type": "market", "order_id": self.NEW_TICKET}
         note = fr._post_trade_spec_check(self.TRADE, order)
         assert "CRITICAL" in note and "0.25" in note
         assert tripped.get("broker") == fn_guard.BROKER
+        assert closed_tickets == [self.NEW_TICKET]
 
     def test_limit_order_closes_and_halts(self, monkeypatch) -> None:
-        tripped = self._patch(monkeypatch, closed=["EURUSD ticket 125: ok"])
-        order = {"symbol": "EURUSD", "quantity": 0.01, "order_type": "limit"}
+        positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSD", "magic": fr.OUR_MAGIC}]
+        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        order = {"symbol": "EURUSD", "quantity": 0.01, "order_type": "limit", "order_id": self.NEW_TICKET}
         note = fr._post_trade_spec_check(self.TRADE, order)
         assert "CRITICAL" in note and "not a market order" in note
         assert tripped.get("broker") == fn_guard.BROKER
+        assert closed_tickets == [self.NEW_TICKET]
 
     def test_multiple_mismatches_all_reported_in_one_pass(self, monkeypatch) -> None:
-        tripped = self._patch(monkeypatch, closed=[])
-        order = {"symbol": "EURUSDm", "quantity": 0.25, "order_type": "limit"}
+        tripped, closed_tickets = self._patch(monkeypatch, positions=[])
+        order = {"symbol": "EURUSDm", "quantity": 0.25, "order_type": "limit", "order_id": self.NEW_TICKET}
         note = fr._post_trade_spec_check(self.TRADE, order)
         assert "EURUSDm" in note and "0.25" in note and "not a market order" in note
-        assert "no position found to close" in note
+        assert "no open position found with ticket" in note
         assert tripped.get("broker") == fn_guard.BROKER
+
+    def test_does_not_close_other_legitimate_stacked_positions(self, monkeypatch) -> None:
+        """Real bug found by /code-review: fn_guard._flatten_positions
+        matches by symbol+magic alone, which force-closed ALL positions on
+        the symbol, including healthy pre-existing stacked ones -- must
+        only touch the new violating fill."""
+        positions = [
+            {"ticket": "111", "symbol": "EURUSD", "magic": fr.OUR_MAGIC},  # pre-existing, healthy
+            {"ticket": "222", "symbol": "EURUSD", "magic": fr.OUR_MAGIC},  # pre-existing, healthy
+            {"ticket": self.NEW_TICKET, "symbol": "EURUSD", "magic": fr.OUR_MAGIC},  # the new, bad one
+        ]
+        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        order = {"symbol": "EURUSD", "quantity": 0.25, "order_type": "market", "order_id": self.NEW_TICKET}
+        note = fr._post_trade_spec_check(self.TRADE, order)
+        assert "CRITICAL" in note
+        assert closed_tickets == [self.NEW_TICKET]
+
+    def test_missing_order_id_refuses_to_close_anything(self, monkeypatch) -> None:
+        positions = [{"ticket": "111", "symbol": "EURUSD", "magic": fr.OUR_MAGIC}]
+        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        order = {"symbol": "EURUSD", "quantity": 0.25, "order_type": "market"}  # no order_id
+        note = fr._post_trade_spec_check(self.TRADE, order)
+        assert "CRITICAL" in note and "refusing to blindly close" in note
+        assert closed_tickets == []
 
 
 class TestPostTradeRewardRiskCheck:
@@ -184,20 +225,19 @@ class TestPostTradeRewardRiskCheck:
     ~1.7:1 skew) that motivated this."""
 
     TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.01}
+    NEW_TICKET = "999"
 
     def _patch(self, monkeypatch, *, atr_floor=0.0002, spread_floor=0.0001, positions=None, modify_result=None):
         import src.trading.connectors.mt5.sdk as mt5_sdk
-        import src.trading.profiles as profiles
         import src.trading.service as service
 
         calls = {}
         monkeypatch.setattr(fr, "_symbol_live_quote", lambda symbol, conn: {"bid": 1.1000, "ask": 1.1001})
         monkeypatch.setattr(fr, "_atr_stop_floor", lambda symbol, connection: atr_floor)
         monkeypatch.setattr(fr, "_spread_stop_floor", lambda quote: spread_floor)
-        default_positions = [{"ticket": "999", "symbol": "EURUSD", "magic": fr.OUR_MAGIC}]
+        default_positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSD", "magic": fr.OUR_MAGIC}]
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions if positions is not None else default_positions})
-        monkeypatch.setattr(profiles, "profile_by_id", lambda conn: type("P", (), {"config": {}})())
-        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: {})
+        monkeypatch.setattr(fr, "_mt5_config_for", lambda connection: {})
 
         def _modify(config, ticket=None, stop_loss=None, take_profit=None):
             calls.update(ticket=ticket, stop_loss=stop_loss, take_profit=take_profit)
@@ -209,7 +249,7 @@ class TestPostTradeRewardRiskCheck:
     def test_ratio_already_healthy_is_a_no_op(self, monkeypatch) -> None:
         calls = self._patch(monkeypatch)
         # buy: risk 0.0010 (1.1000->1.0990), reward 0.0020 (1.1000->1.1020) = 2:1, above the 1.5 floor
-        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1020}
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1020, "order_id": self.NEW_TICKET}
         assert fr._post_trade_reward_risk_check(self.TRADE, order) == ""
         assert calls == {}
 
@@ -218,12 +258,14 @@ class TestPostTradeRewardRiskCheck:
         # for 1.5:1 = 0.0010/1.5 = 0.000667, which is >= atr_floor (0.0002)
         # -- safe to tighten the stop instead of touching the target.
         calls = self._patch(monkeypatch, atr_floor=0.0002, spread_floor=0.0001)
-        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010}
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
         note = fr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "tightened stop-loss" in note
-        assert calls["ticket"] == "999"
+        assert calls["ticket"] == self.NEW_TICKET
         assert calls["take_profit"] == 1.1010  # target left untouched
         assert calls["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
+        assert order["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
+        assert order["take_profit"] == 1.1010
 
     def test_widens_target_when_tightening_would_violate_floor(self, monkeypatch) -> None:
         # buy: risk 0.0010, reward 0.0010 = 1:1. Desired risk for 1.5:1 =
@@ -231,7 +273,7 @@ class TestPostTradeRewardRiskCheck:
         # would put the stop inside normal noise, so widen the target
         # instead: new reward = 0.0010 * 1.5 = 0.0015 -> new tp = 1.1015.
         calls = self._patch(monkeypatch, atr_floor=0.0009, spread_floor=0.0001)
-        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010}
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
         note = fr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "widened take-profit" in note
         assert calls["stop_loss"] == 1.0990  # stop left untouched
@@ -240,14 +282,14 @@ class TestPostTradeRewardRiskCheck:
     def test_sell_side_mirrors_the_math(self, monkeypatch) -> None:
         # sell: risk 0.0010 (1.1000->1.1010), reward 0.0010 (1.1000->1.0990) = 1:1
         calls = self._patch(monkeypatch, atr_floor=0.0002, spread_floor=0.0001)
-        order = {"side": "sell", "fill_price": 1.1000, "stop_loss": 1.1010, "take_profit": 1.0990}
+        order = {"side": "sell", "fill_price": 1.1000, "stop_loss": 1.1010, "take_profit": 1.0990, "order_id": self.NEW_TICKET}
         note = fr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "tightened stop-loss" in note
         assert calls["stop_loss"] == pytest.approx(1.1000 + 0.0010 / 1.5)
 
     def test_no_matching_position_reports_without_crashing(self, monkeypatch) -> None:
         calls = self._patch(monkeypatch, positions=[])
-        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010}
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
         note = fr._post_trade_reward_risk_check(self.TRADE, order)
         assert "no matching open position" in note
         assert calls == {}
@@ -263,19 +305,42 @@ class TestPostTradeRewardRiskCheck:
         made the ratio math nonsensical and silently no-op'd -- the
         guardrail never actually ran on the first real trade. Must fall
         back to the live position's price_open instead of trusting 0.0."""
-        positions = [{"ticket": "999", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1000}]
+        positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1000}]
         calls = self._patch(monkeypatch, atr_floor=0.0002, spread_floor=0.0001, positions=positions)
         # Same 1:1 shape as test_tightens_stop_when_floor_allows, but with
         # the real-incident's fill_price=0.0 instead of a valid one.
-        order = {"side": "buy", "fill_price": 0.0, "stop_loss": 1.0990, "take_profit": 1.1010}
+        order = {"side": "buy", "fill_price": 0.0, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
         note = fr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "tightened stop-loss" in note
         assert calls["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
 
     def test_missing_fill_price_and_no_position_is_a_safe_no_op(self, monkeypatch) -> None:
         calls = self._patch(monkeypatch, positions=[])
-        order = {"side": "buy", "fill_price": 0.0, "stop_loss": 1.0990, "take_profit": 1.1010}
+        order = {"side": "buy", "fill_price": 0.0, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
         assert fr._post_trade_reward_risk_check(self.TRADE, order) == ""
+        assert calls == {}
+
+    def test_does_not_correct_other_legitimate_stacked_positions(self, monkeypatch) -> None:
+        """Real bug found by /code-review: matching ours[0] (whatever the
+        broker happened to return first) could silently modify an older,
+        already-compliant stacked position while leaving the actual
+        sub-floor new fill uncorrected -- must only touch the new ticket."""
+        positions = [
+            {"ticket": "111", "symbol": "EURUSD", "magic": fr.OUR_MAGIC},  # pre-existing, healthy
+            {"ticket": self.NEW_TICKET, "symbol": "EURUSD", "magic": fr.OUR_MAGIC},  # the new, sub-floor one
+        ]
+        calls = self._patch(monkeypatch, atr_floor=0.0002, spread_floor=0.0001, positions=positions)
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
+        note = fr._post_trade_reward_risk_check(self.TRADE, order)
+        assert "CORRECTED" in note
+        assert calls["ticket"] == self.NEW_TICKET
+
+    def test_missing_order_id_reports_without_crashing(self, monkeypatch) -> None:
+        positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSD", "magic": fr.OUR_MAGIC}]
+        calls = self._patch(monkeypatch, positions=positions)
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010}  # no order_id
+        note = fr._post_trade_reward_risk_check(self.TRADE, order)
+        assert "no matching open position" in note
         assert calls == {}
 
 
