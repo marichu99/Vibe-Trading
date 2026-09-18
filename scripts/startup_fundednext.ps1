@@ -71,10 +71,15 @@ if ((Test-Path $HistoryLog) -and (Get-Item $HistoryLog).Length -gt $MaxHistoryBy
     Write-StartupLog "rotated fundednext_reporter.history.log (exceeded ${MaxHistoryBytes} bytes)"
 }
 
-# Same 2-hour cadence as the Exness reporter -- see startup.ps1's comment on
-# why a short interval is a bad idea (overlapping runs, LLM spend). Tighten
-# only after confirming actual trade rate/cost at this interval.
-$ReporterIntervalSeconds = 2 * 60 * 60   # 2 hours
+# WIDENED 2026-09-18 from 2h to 4h at the user's request, to cut LLM spend
+# -- deepseek-v4-pro cost $11.67 in a single day (684 requests) on an
+# account that was still flat, and this challenge has no time limit, so
+# there's no reason to run at the same cadence as the live Exness account.
+# Halving pass frequency roughly halves the frequency-driven share of
+# cost. Revisit if trade opportunities are being missed, not just to save
+# more money -- see startup.ps1's comment for why a SHORT interval is the
+# actual risk (overlapping runs), which widening only helps.
+$ReporterIntervalSeconds = 4 * 60 * 60   # 4 hours
 
 Start-Process -FilePath (Join-Path $Venv "python.exe") `
     -ArgumentList @(

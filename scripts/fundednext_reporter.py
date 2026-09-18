@@ -134,32 +134,37 @@ TARGETS: list[dict[str, object]] = [
             "early_profit_trigger_usd": 24.75,
         },
     },
-    {
-        # Added 2026-09-17 at the user's request, after live-verifying (via
-        # a full symbols_get() scan of FundedNext-Server 2's 96-symbol
-        # catalog) that XAUUSD/XAGUSD/XPTUSD are the only commodities this
-        # broker offers, and comparing their $-cost-per-minimum-lot: gold
-        # $11.12 (spread-floor-bound, not ATR — this broker's live gold
-        # spread was $1.39 at the time), silver $26.00, platinum $47.60
-        # (already near the $60 mandate ceiling at the SMALLEST possible
-        # lot, i.e. structurally expensive regardless of direction) —
-        # skipped platinum and silver's inflexibility for gold's better
-        # cost/sizing-headroom tradeoff. Requires the mandate's
-        # asset_classes to include "commodity" (commit_fundednext_mandate.py)
-        # — a forex-only mandate would fail-closed deny every order here.
-        #
-        # lots=0.02 targets ~$22 risk at the live-verified binding floor
-        # (11.12 price units * 100 oz/lot contract size * 0.02 lots), in
-        # the same ~$20 range as the EURUSD/AUDUSD sizing above.
-        # early_profit_trigger_usd=$30 is ~1.35x that $22 floor value (same
-        # "past ordinary noise, but reachable by a real move" ratio the
-        # EURUSD/AUDUSD triggers above use).
-        "committee": "investment_committee", "target": "XAUUSD", "market": "commodity/forex",
-        "trade": {
-            "symbol": "XAUUSD", "connection": "mt5fn-live-trade", "lots": 0.02, "max_stack": 1,
-            "early_profit_trigger_usd": 30.00,
-        },
-    },
+    # PAUSED 2026-09-18 at the user's request, purely to cut LLM spend while
+    # EURUSD/AUDUSD alone prove out today's fixes (terminal-routing,
+    # reward:risk enforcement, spec-check, fill-price fallback) -- NOT
+    # because anything about gold itself was a problem. No mandate change
+    # needed to re-enable (asset_classes already includes "commodity") --
+    # just uncomment this block.
+    #
+    # Added 2026-09-17 at the user's request, after live-verifying (via
+    # a full symbols_get() scan of FundedNext-Server 2's 96-symbol
+    # catalog) that XAUUSD/XAGUSD/XPTUSD are the only commodities this
+    # broker offers, and comparing their $-cost-per-minimum-lot: gold
+    # $11.12 (spread-floor-bound, not ATR -- this broker's live gold
+    # spread was $1.39 at the time), silver $26.00, platinum $47.60
+    # (already near the $60 mandate ceiling at the SMALLEST possible
+    # lot, i.e. structurally expensive regardless of direction) --
+    # skipped platinum and silver's inflexibility for gold's better
+    # cost/sizing-headroom tradeoff.
+    #
+    # lots=0.02 targets ~$22 risk at the live-verified binding floor
+    # (11.12 price units * 100 oz/lot contract size * 0.02 lots), in
+    # the same ~$20 range as the EURUSD/AUDUSD sizing above.
+    # early_profit_trigger_usd=$30 is ~1.35x that $22 floor value (same
+    # "past ordinary noise, but reachable by a real move" ratio the
+    # EURUSD/AUDUSD triggers above use).
+    # {
+    #     "committee": "investment_committee", "target": "XAUUSD", "market": "commodity/forex",
+    #     "trade": {
+    #         "symbol": "XAUUSD", "connection": "mt5fn-live-trade", "lots": 0.02, "max_stack": 1,
+    #         "early_profit_trigger_usd": 30.00,
+    #     },
+    # },
 ]
 
 MAX_ITER = 15
