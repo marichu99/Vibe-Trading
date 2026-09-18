@@ -144,11 +144,23 @@ def _normalize_llm_usage(usage: Any) -> dict[str, int] | None:
         total_tokens = input_tokens + output_tokens
     if not (input_tokens or output_tokens or total_tokens):
         return None
-    return {
+    result = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
     }
+    # cache_read: how much of input_tokens was served from a provider-side
+    # prompt cache (langchain_openai maps OpenAI/OpenRouter's response
+    # `prompt_tokens_details.cached_tokens` here). Surfaced so caching's
+    # real effect (see providers/llm.py's _apply_prompt_caching) is
+    # actually visible in llm_usage.json instead of requiring a manual
+    # check against the provider's own dashboard/API every time. Omitted
+    # (not zero) when the provider doesn't report cache details at all, so
+    # "0" (reported, no hit) stays distinguishable from "not reported."
+    input_details = usage.get("input_token_details")
+    if isinstance(input_details, dict) and input_details.get("cache_read") is not None:
+        result["cache_read_tokens"] = _coerce_usage_int(input_details.get("cache_read"))
+    return result
 
 
 def _new_llm_usage_summary(llm: Any) -> dict[str, Any]:
@@ -186,6 +198,8 @@ def _record_llm_usage(
     totals["output_tokens"] = int(totals.get("output_tokens") or 0) + normalized["output_tokens"]
     totals["total_tokens"] = int(totals.get("total_tokens") or 0) + normalized["total_tokens"]
     totals["calls"] = int(totals.get("calls") or 0) + 1
+    if "cache_read_tokens" in normalized:
+        totals["cache_read_tokens"] = int(totals.get("cache_read_tokens") or 0) + normalized["cache_read_tokens"]
     summary.setdefault("per_iteration", []).append({"iter": iteration, **normalized})
     summary["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
