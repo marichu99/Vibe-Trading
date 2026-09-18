@@ -1008,7 +1008,15 @@ def _blocked_order_note(run_id: str) -> str | None:
 
 
 def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
-    """Append a new open-trade record from a verified place_order result."""
+    """Append a new open-trade record from a verified place_order result.
+
+    Real incident 2026-09-18 (found on the FundedNext sibling first, same
+    bug here): order.get("fill_price") can be 0.0 (MT5's order-send
+    response doesn't always have the real fill price populated yet — see
+    _resolve_fill_price). A journal entry recorded with entry_price=0.0 can
+    never be correctly classified win/loss on close (outcome stays
+    "unknown" forever). Use the same fallback here, at write time.
+    """
     entries = _read_journal()
     entries.append({
         "ticket": str(order.get("order_id") or ""),
@@ -1016,7 +1024,7 @@ def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
         "connection": connection,
         "side": order.get("side"),
         "lots": order.get("quantity"),
-        "entry_price": order.get("fill_price"),
+        "entry_price": _resolve_fill_price({"connection": connection}, order),
         "stop_loss": order.get("stop_loss"),
         "take_profit": order.get("take_profit"),
         "opened_at": datetime.now(timezone.utc).isoformat(),
@@ -1492,6 +1500,14 @@ def _profit_protection_check() -> None:
             # price gate below -- needs only the broker's own reported open
             # time, so it still backstops a stray naked position that the
             # rest of this function can't otherwise touch.
+            #
+            # Note: pos["time"] is a raw MT5 epoch value -- same broker-
+            # local-time-mislabeled-as-UTC skew found and fixed in
+            # _recent_deals (agent/src/trading/connectors/mt5/sdk.py) can
+            # under-count elapsed_hours here by roughly the broker's UTC
+            # offset (currently ~3h). Lower severity than the journal-
+            # reconciliation miss that fix addressed, so left as a known
+            # imprecision rather than reworked here.
             max_hold_hours = trade.get("max_hold_hours", MAX_HOLD_HOURS)
             elapsed_hours = None
             opened_raw = pos.get("time")

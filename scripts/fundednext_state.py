@@ -30,16 +30,32 @@ a balance-based guess), not something this bot should self-declare.
 
 Server-day boundary: originally assumed GMT+3 DST / GMT+2 standard
 (Europe/Bucharest, matching FundedNext's own general documentation for
-their server time) — CORRECTED 2026-09-17 after live-verifying against
-this specific account's own MT5 terminal: fetched real EURUSD D1
-(TIMEFRAME_D1, unmodified/unresampled) daily bars via
-``src.trading.connectors.mt5.sdk.get_historical_bars`` and found every
-bar's open timestamp landed on exactly ``00:00:00 UTC`` — not offset by
-2-3 hours as the EET assumption would produce. FundedNext-Server 2's
-actual day boundary is plain UTC, not EET. ``server_today()`` now assumes
-UTC. If this account is ever moved to a different FundedNext server,
-re-verify with the same D1-bar-timestamp check before trusting the
-timezone again — don't just re-assume EET from their general docs.
+their server time). Briefly "corrected" 2026-09-17 to plain UTC after a
+flawed verification: D1 bar timestamps read via _epoch_to_iso
+(``datetime.fromtimestamp(value, tz=timezone.utc)``) landed on exactly
+00:00:00, which was read as "the server's real boundary is UTC" — but
+REVERTED 2026-09-18 after finding the actual bug: MT5's raw epoch values
+from this broker are NOT true UTC seconds, they're the broker's own
+LOCAL server clock (EET/EEST) encoded as if it were epoch/UTC — a common
+MT5 platform behavior, and exactly what FundedNext's own docs say (GMT+3
+DST / GMT+2 standard). Confirmed directly: this machine's own clock is
+correct (Windows Get-Date/[DateTime]::UtcNow agree, E. Africa Standard
+Time UTC+3, no DST), yet a live MT5 tick's "UTC" timestamp read 3 hours
+AHEAD of true UtcNow at the moment of comparison -- exactly the DST-season
+EET offset FundedNext documents, not a genuine UTC reading. The
+2026-09-17 D1-bar check was comparing a mislabeled-but-internally-
+consistent value against itself, not against true UTC, so "00:00:00"
+proved nothing. ``server_today()`` is UNAFFECTED by this specific mislabel
+bug (it computes from ``datetime.now()`` on THIS machine's own confirmed-
+correct clock, converted to the broker's timezone -- it never reads an
+MT5 epoch value), so reverting it back to Europe/Bucharest is the correct
+fix here. The epoch-mislabeling bug itself is separate and lives in
+``agent/src/trading/connectors/mt5/sdk.py``'s ``_recent_deals`` (see its
+own comment) -- IT does read broker epoch values, and needed its own fix.
+If this account is ever moved to a different FundedNext server, re-verify
+the timezone by comparing a live MT5 tick's reported time against this
+machine's own confirmed-correct UtcNow (NOT by reading MT5 epoch values
+and comparing them only to each other, which is what went wrong here).
 """
 
 from __future__ import annotations
@@ -47,8 +63,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT_DIR = REPO_ROOT / "agent"
@@ -65,14 +82,14 @@ CHALLENGE_TARGET_PCT = 10.0
 # >=1 trade each, non-consecutive OK.
 MIN_TRADING_DAYS = 2
 
-# Live-verified 2026-09-17 via real EURUSD D1 bar timestamps (see module
-# docstring) -- FundedNext-Server 2's actual day boundary is plain UTC, not
-# the EET (GMT+2/+3) their general docs would suggest.
-_SERVER_TZ = timezone.utc
+# Reverted 2026-09-18 back to FundedNext's documented GMT+3 DST / GMT+2
+# standard (Europe/Bucharest) -- see module docstring for the full story of
+# why the brief 2026-09-17 "UTC" correction was itself wrong.
+_SERVER_TZ = ZoneInfo("Europe/Bucharest")
 
 
 def server_today(now: datetime | None = None) -> str:
-    """Today's date (YYYY-MM-DD) in FundedNext-Server 2's actual day boundary (UTC — see module docstring)."""
+    """Today's date (YYYY-MM-DD) in the assumed FundedNext server timezone (see module docstring)."""
     moment = now or datetime.now(_SERVER_TZ)
     if moment.tzinfo is None:
         moment = moment.astimezone(_SERVER_TZ)

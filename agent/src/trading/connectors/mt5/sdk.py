@@ -1118,11 +1118,27 @@ def _timeframe(module: ModuleType, period: str) -> Any:
 
 
 def _recent_deals(module: ModuleType, days: int = 7) -> list[Any]:
+    """Real incident 2026-09-18: MT5's raw deal ``time`` field is the
+    broker's own LOCAL server clock (EET/EEST for at least this broker,
+    confirmed live against this machine's independently-verified system
+    clock), encoded as if it were epoch/UTC seconds — not genuine UTC. A
+    deal that closed moments ago can carry a timestamp that reads as being
+    several hours AHEAD of true ``datetime.now(timezone.utc)``, which
+    history_deals_get's own upper bound would then exclude as "in the
+    future" — silently dropping the most recently closed deals from
+    reconciliation (a stop-out that closed minutes before a status check
+    came back with outcome "unknown" and no exit price). Pad the upper
+    (and, symmetrically, lower) bound generously past any plausible
+    broker-server UTC offset (+/-14h covers every real-world timezone) —
+    deals can't genuinely be in the true future, so padding the window has
+    no downside, only guards against this mislabeling.
+    """
     try:
         from datetime import timedelta
 
         now = datetime.now(timezone.utc)
-        deals = module.history_deals_get(now - timedelta(days=days), now)
+        skew_guard = timedelta(hours=14)
+        deals = module.history_deals_get(now - timedelta(days=days) - skew_guard, now + skew_guard)
         return list(deals) if deals else []
     except Exception:
         return []

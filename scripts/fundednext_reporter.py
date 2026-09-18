@@ -496,13 +496,20 @@ def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
     fn_state.MIN_TRADING_DAYS) — the one behavioral addition over
     committee_reporter.py's version."""
     entries = _read_journal()
+    # Real incident 2026-09-18: order.get("fill_price") can be 0.0 (same MT5
+    # propagation-gap bug _resolve_fill_price already works around for the
+    # post-trade checks) -- a journal entry recorded with entry_price=0.0
+    # can never be correctly classified win/loss on close (outcome ends up
+    # "unknown" forever, entry_price wrong in every downstream report). Use
+    # the same fallback here, at write time, instead of just patching the
+    # symptom in _post_trade_reward_risk_check/_post_trade_spread_check.
     entries.append({
         "ticket": str(order.get("order_id") or ""),
         "symbol": symbol,
         "connection": connection,
         "side": order.get("side"),
         "lots": order.get("quantity"),
-        "entry_price": order.get("fill_price"),
+        "entry_price": _resolve_fill_price({"connection": connection}, order),
         "stop_loss": order.get("stop_loss"),
         "take_profit": order.get("take_profit"),
         "opened_at": datetime.now(timezone.utc).isoformat(),
@@ -784,6 +791,16 @@ def _profit_protection_check() -> None:
         for pos in ours:
             max_hold_hours = trade.get("max_hold_hours", MAX_HOLD_HOURS)
             elapsed_hours = None
+            # Note: pos["time"] is a raw MT5 epoch value -- same broker-
+            # local-time-mislabeled-as-UTC skew found and fixed in
+            # _recent_deals (agent/src/trading/connectors/mt5/sdk.py) can
+            # under-count elapsed_hours here by roughly the broker's UTC
+            # offset (currently ~3h). Lower severity than the journal-
+            # reconciliation miss that fix addressed (this only shifts
+            # MAX_HOLD_HOURS's ~40h window by a few hours, not a hard
+            # correctness failure), so left as a known imprecision rather
+            # than reworked here -- revisit if MAX_HOLD_HOURS is ever
+            # tightened close to that offset's scale.
             opened_raw = pos.get("time")
             if opened_raw:
                 try:

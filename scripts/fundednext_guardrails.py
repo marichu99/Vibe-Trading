@@ -15,11 +15,14 @@ rule.
 
 OPEN ITEMS — verify before relying on this at real money (see
 ``C:\\Users\\Hp\\.claude\\plans\\calm-wondering-snail.md``):
-  1. RESOLVED 2026-09-17: server-day timezone was originally assumed as
-     GMT+3 DST / GMT+2 standard (Europe/Bucharest) — live-verified against
-     real EURUSD D1 bar timestamps from this account's own terminal and
-     corrected to plain UTC (see ``fundednext_state.py``'s module
-     docstring for the exact check). No longer open.
+  1. RESOLVED 2026-09-18: server-day timezone assumed GMT+3 DST / GMT+2
+     standard (Europe/Bucharest). Briefly "corrected" 2026-09-17 to plain
+     UTC based on a flawed check (D1 bar timestamps compared only to
+     themselves), then confirmed CORRECT as originally assumed on
+     2026-09-18 by directly measuring MT5 tick time against this
+     machine's own independently-verified system clock — see
+     ``fundednext_state.py``'s module docstring for the full story. No
+     longer open (in the "originally assumed EET" direction).
   2. Swap-in-equity: this module trusts MT5's own ``equity`` figure to
      already net in swap charges (both floating and realized), since
      FundedNext's real daily-loss rule counts swap. Verify against a real

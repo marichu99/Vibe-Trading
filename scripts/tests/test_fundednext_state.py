@@ -37,17 +37,24 @@ class TestServerToday:
         now = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
         assert fn_state.server_today(now) == "2026-01-15"
 
-    def test_uses_utc_not_eet(self) -> None:
-        """Real fix 2026-09-17: this was originally EET (GMT+2/+3), live-
-        verified wrong against real D1 bar timestamps and corrected to UTC
-        -- see fundednext_state.py's module docstring. 23:30 UTC is still
-        "today" under UTC but would already be "tomorrow" under EET
-        (GMT+2 or +3), so this specifically catches a regression back to
-        the wrong timezone."""
+    def test_uses_eet_not_utc(self) -> None:
+        """See fundednext_state.py's module docstring for the full story: a
+        2026-09-17 "fix" briefly switched this to plain UTC based on a
+        flawed verification (D1 bar timestamps compared only to
+        themselves, not to a true UTC reference), then REVERTED 2026-09-18
+        after directly measuring that MT5's raw epoch values from this
+        broker are broker-LOCAL time (EET/EEST) mislabeled as UTC -- this
+        machine's own clock was independently confirmed correct
+        (Get-Date/[DateTime]::UtcNow agree) and a live tick's "UTC"
+        timestamp still read 3 hours ahead of it. 23:30 UTC in January
+        (EET standard, GMT+2, no DST) is already "tomorrow" in the
+        server's actual local day -- this catches a regression back to
+        the wrong (UTC) assumption.
+        """
         from datetime import datetime, timezone
 
         now = datetime(2026, 1, 15, 23, 30, tzinfo=timezone.utc)
-        assert fn_state.server_today(now) == "2026-01-15"
+        assert fn_state.server_today(now) == "2026-01-16"
 
 
 class TestEnsureInitializedImmutability:
