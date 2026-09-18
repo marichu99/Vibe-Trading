@@ -279,9 +279,56 @@ if ChatOpenAI is not None:
                     self._inject_tool_call_thought_signatures(m.get("tool_calls"), source_message)
                 else:
                     self._strip_tool_call_extra_content(m.get("tool_calls"))
+            if caps.prompt_caching:
+                _apply_prompt_caching(payload)
             return payload
 else:
     ChatOpenAIWithReasoning = None  # type: ignore
+
+
+def _apply_prompt_caching(payload: dict) -> None:
+    """Mark the system prompt (and, best-effort, the tools array) cacheable.
+
+    Anthropic-style prompt caching (``cache_control: {"type": "ephemeral"}``),
+    relayed by OpenRouter for ``anthropic/*`` models (see
+    ``capabilities.py``'s ``prompt_caching`` field -- only set when both
+    provider and model support this). Caches everything up to and
+    including the marked block (tools, then system, in Anthropic's own
+    prompt order) -- confirmed 2026-09-18 via a real committee run's trace
+    that this account's system prompt + full tool-schema definitions
+    (~75-80k tokens) get resent byte-for-byte on every single call in a
+    pass (10+ calls: the orchestrator's own loop plus each investment-
+    committee swarm sub-agent's independent loop), with zero reuse
+    discount. Cache reads cost ~10% of normal input price vs. a one-time
+    ~1.25x write -- a large win here specifically because of how much gets
+    repeated, unchanged, within one run.
+
+    Tool-array placement is best-effort and UNCONFIRMED: Anthropic's own
+    docs confirm ``cache_control`` on the last tool object works for their
+    native Messages API, but OpenRouter's docs don't state whether that
+    key survives their OpenAI-tools-format-to-Anthropic translation.
+    System-message caching, by contrast, IS documented with a concrete
+    OpenRouter example and is safe to rely on. Worst case for the tools
+    array: the extra key is silently dropped (no error, no benefit) --
+    verify by checking ``cached_tokens``/``cache_read_input_tokens`` in a
+    real response's usage after this ships, and remove the tools-array
+    attempt here if it never shows a nonzero cache read.
+    """
+    messages = payload.get("messages") or []
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            message["content"] = [
+                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+            ]
+        break  # exactly one system message is expected in this codebase's prompts
+
+    tools = payload.get("tools")
+    if tools:
+        tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+
 
 AGENT_DIR = Path(__file__).resolve().parents[2]
 

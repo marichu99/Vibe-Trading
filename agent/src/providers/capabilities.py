@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib.metadata import PackageNotFoundError, version
 from typing import Mapping, Optional
 
@@ -26,6 +26,12 @@ class ProviderCapabilities:
             OpenRouter request option.
         default_headers: Provider-scoped headers passed to ChatOpenAI.
         native_adapter_package: Optional native adapter package to report.
+        prompt_caching: Whether Anthropic-style ``cache_control: ephemeral``
+            breakpoints should be injected into the system message (and,
+            best-effort, the tools array). Model-dependent even within a
+            single provider (only Claude models support it) -- see
+            ``get_provider_capabilities``'s model-based override below,
+            not this static per-provider table.
     """
 
     name: str
@@ -38,6 +44,7 @@ class ProviderCapabilities:
     openrouter_reasoning_body: bool = False
     default_headers: Mapping[str, str] = field(default_factory=dict)
     native_adapter_package: Optional[str] = None
+    prompt_caching: bool = False
 
 
 # Distribution name from pyproject.toml [project].name.
@@ -174,6 +181,11 @@ def _infer_from_model(model: str) -> str | None:
     return None
 
 
+def _is_anthropic_model(model: str) -> bool:
+    lowered = model.strip().lower()
+    return lowered.startswith("anthropic/") or "claude" in lowered
+
+
 def get_provider_capabilities(
     provider: str | None = None,
     model: str | None = None,
@@ -191,7 +203,15 @@ def get_provider_capabilities(
     if normalized == "openai-codex":
         return _PROVIDERS["openai-codex"]
     if normalized and normalized != "openai":
-        return _PROVIDERS.get(normalized, _PROVIDERS["openai"])
+        caps = _PROVIDERS.get(normalized, _PROVIDERS["openai"])
+        # prompt_caching is model-dependent even within one provider (only
+        # Claude models support it) -- unlike every other field on
+        # ProviderCapabilities, which is fixed per-provider. openrouter is
+        # the only relay this repo has verified caching through; requesty
+        # is architecturally similar but unverified, so left off on purpose.
+        if caps.name == "openrouter" and _is_anthropic_model(model or ""):
+            caps = replace(caps, prompt_caching=True)
+        return caps
     inferred = _infer_from_model(model or "")
     if inferred:
         return _PROVIDERS[inferred]
