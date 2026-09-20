@@ -221,6 +221,76 @@ def test_unreadable_positions_fail_closed() -> None:
     assert breach.limit == "max_total_exposure_usd"
 
 
+def _cfd_mandate(**caps_overrides: Any) -> Mandate:
+    """A CFD-permitting mandate (mirrors an MT5 forex/commodity account)."""
+    mandate = _mandate(allowed_instruments=(InstrumentType.CFD,), **caps_overrides)
+    return Mandate(
+        schema_version=mandate.schema_version,
+        hard_caps=mandate.hard_caps,
+        universe=UniverseConstraint(
+            asset_classes=(AssetClass.FOREX,),
+            min_market_cap_usd=None,
+            min_avg_daily_volume_usd=None,
+            exclude_symbols=mandate.universe.exclude_symbols,
+        ),
+        consent=mandate.consent,
+    )
+
+
+def test_cfd_sell_from_flat_adds_to_exposure_not_subtracts() -> None:
+    """A CFD "sell" opens a NEW short — MT5 closes are ticket-based via
+    close_position, never through place_order/this gate — so it must ADD to
+    gross exposure like a buy, not be treated as reducing an existing long.
+
+    Regression: the old sign logic (buy=+, sell=-) let a short-opening sell
+    slip straight through the exposure cap while flat (post_exposure went
+    negative instead of to +notional), silently exceeding the mandate's
+    intended risk ceiling.
+    """
+    mandate = _cfd_mandate(max_total_exposure_usd=100.0)
+    intent = _intent(
+        side="sell", notional_usd=150.0,
+        instrument_type=InstrumentType.CFD, asset_class=AssetClass.FOREX,
+    )
+    breach = _check(intent, mandate, positions=[])
+    assert breach is not None
+    assert breach.limit == "max_total_exposure_usd"
+    assert breach.attempted_value == pytest.approx(150.0)
+
+
+def test_cfd_sell_from_flat_checked_against_funding_too() -> None:
+    """The funding defense-in-depth check must also see a CFD short as exposure."""
+    mandate = _cfd_mandate(account_funding_usd=100.0, max_total_exposure_usd=1e9, max_leverage=1e9)
+    intent = _intent(
+        side="sell", notional_usd=150.0,
+        instrument_type=InstrumentType.CFD, asset_class=AssetClass.FOREX,
+    )
+    breach = _check(intent, mandate, positions=[])
+    assert breach is not None
+    assert breach.limit == "account_funding_usd"
+
+
+def test_cfd_buy_from_flat_still_adds_to_exposure() -> None:
+    """A CFD buy (opening long) is unaffected by the sell-side fix."""
+    mandate = _cfd_mandate(max_total_exposure_usd=100.0)
+    intent = _intent(
+        side="buy", notional_usd=150.0,
+        instrument_type=InstrumentType.CFD, asset_class=AssetClass.FOREX,
+    )
+    breach = _check(intent, mandate, positions=[])
+    assert breach is not None
+    assert breach.limit == "max_total_exposure_usd"
+
+
+def test_equity_sell_still_reduces_exposure() -> None:
+    """Non-CFD instruments keep the original semantics: a sell closes a long."""
+    mandate = _mandate(max_total_exposure_usd=100.0)
+    intent = _intent(side="sell", notional_usd=50.0)
+    # $90 of existing long, sell $50 -> $40 post-exposure, well under the $100 cap.
+    breach = _check(intent, mandate, positions=[{"market_value": 90.0}])
+    assert breach is None
+
+
 def test_universe_market_cap_floor_denies_when_below(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(enforcement, "market_cap_usd", lambda s, ac: 1.0e8)
     mandate = _mandate()

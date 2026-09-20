@@ -508,7 +508,12 @@ def check_mandate(
             )
 
     # 5–6. Exposure + leverage need observable positions; fail-closed on any
-    #      unparseable position. A sell reduces gross exposure (signed by side).
+    #      unparseable position. A sell reduces gross exposure (signed by side)
+    #      for cash/long-only instruments, where selling can only close part of
+    #      an existing long. CFD orders (MT5) never close a position through
+    #      this gate — closing goes through the connector's own ticket-based
+    #      close_position, outside place_order — so a CFD "sell" always OPENS a
+    #      new short and must add to exposure exactly like a buy.
     current_exposure = _positions_market_value(positions)
     if current_exposure is None:
         return _breach(
@@ -517,7 +522,10 @@ def check_mandate(
             limit_value=caps.max_total_exposure_usd, attempted_value=0.0,
             detail="current positions could not be read (fail-closed)",
         )
-    signed = notional if intent.side == "buy" else -notional
+    if intent.instrument_type is InstrumentType.CFD:
+        signed = notional
+    else:
+        signed = notional if intent.side == "buy" else -notional
     post_exposure = current_exposure + signed
     if post_exposure > caps.max_total_exposure_usd:
         return _breach(
@@ -553,8 +561,11 @@ def check_mandate(
         )
 
     # 8. Funding (defense-in-depth; broker is the real ceiling). Only a buy can
-    #    push us past funding — never block a sell on this.
-    if intent.side == "buy" and post_exposure > caps.account_funding_usd:
+    #    push us past funding for cash/long-only instruments — never block a
+    #    sell on this. A CFD sell opens a new short (see step 5–6), which is
+    #    equally funding-relevant.
+    funding_relevant = intent.side == "buy" or intent.instrument_type is InstrumentType.CFD
+    if funding_relevant and post_exposure > caps.account_funding_usd:
         return _breach(
             broker=broker, remote_tool=remote_tool, intent=intent,
             kind=BREACH_KIND_QUANTITATIVE, limit="account_funding_usd",
