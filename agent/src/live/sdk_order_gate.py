@@ -33,6 +33,7 @@ from src.live.enforcement import (
     BREACH_KIND_INSTRUMENT,
     BREACH_KIND_UNIVERSE,
     OrderIntent,
+    _coerce_position_rows,
     check_mandate,
     instrument_asset_class,
     last_price_usd,
@@ -98,7 +99,7 @@ def execute_live_order(
         )
     intent = normalized
 
-    positions = _safe_read(connector_module, "get_positions", config)
+    positions = _normalize_positions(_safe_read(connector_module, "get_positions", config), connector_module, config)
     balance = _safe_read(connector_module, "get_account_snapshot", config)
     daily_count = read_daily_count(broker)
 
@@ -314,6 +315,43 @@ def _connector_quote_price(connector_module: Any, config: Any, symbol: str) -> f
             if value == value and value > 0:
                 return value
     return None
+
+
+def _normalize_positions(positions: object, connector_module: Any, config: Any) -> object:
+    """Price lot-based (MT5) open positions before the mandate gate reads them.
+
+    ``check_mandate``'s exposure check (``enforcement._position_market_value``)
+    only recognizes share/coin-style rows (``quantity`` x price); MT5's own
+    position rows expose lots (``volume``) and a raw ``price_current`` with no
+    per-unit multiplier, so without this every order placed while any MT5
+    position is open fails the exposure check as "positions could not be
+    read" — even though they were read fine — and gets paused for re-auth.
+    Mirrors the same ``contract_size`` lookup ``_normalize_notional`` already
+    applies to the order itself. A row whose multiplier can't be resolved is
+    left alone, so the existing fail-closed behavior is unchanged for it.
+    """
+    if getattr(connector_module, "contract_size", None) is None:
+        return positions
+    rows = _coerce_position_rows(positions)
+    if rows is None:
+        return positions
+    multipliers: dict[str, float | None] = {}
+    for row in rows:
+        if "market_value" in row:
+            continue
+        volume, price, symbol = row.get("volume"), row.get("price_current"), row.get("symbol")
+        if volume is None or price is None or not symbol:
+            continue
+        if symbol not in multipliers:
+            multipliers[symbol] = _contract_multiplier(connector_module, config, symbol)
+        multiplier = multipliers[symbol]
+        if multiplier is None:
+            continue
+        try:
+            row["market_value"] = abs(float(volume)) * float(price) * multiplier
+        except (TypeError, ValueError):
+            continue
+    return positions
 
 
 def _safe_read(connector_module: Any, fn_name: str, config: Any) -> object:

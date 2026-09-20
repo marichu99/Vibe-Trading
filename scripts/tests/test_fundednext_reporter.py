@@ -123,6 +123,56 @@ class TestJournalSummaryText:
         assert summary is not None and "1W/1L" in summary
 
 
+class TestJournalReconcileClosed:
+    def _entry(self, **overrides) -> dict:
+        base = {
+            "ticket": "555",
+            "symbol": "AUDUSD",
+            "connection": "mt5fn-live-trade",
+            "side": "buy",
+            "lots": 0.01,
+            "entry_price": 0.7200,
+            "stop_loss": 0.7180,
+            "opened_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+            "status": "open",
+        }
+        base.update(overrides)
+        return base
+
+    def test_concurrent_append_during_reconcile_is_not_lost(self, tmp_path, monkeypatch) -> None:
+        """Regression: --status runs this reconciliation with no lock while
+        the live loop can concurrently append a new open trade via
+        _journal_record_open. The old code wrote back the `entries` snapshot
+        captured before the broker round-trip (get_positions/get_open_orders),
+        silently erasing any entry appended in the meantime. Simulates that
+        race by appending a new entry from inside get_positions() itself (this
+        reconciliation's own network round-trip) and asserts it survives."""
+        monkeypatch.setattr(fr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        fr._write_journal([self._entry(ticket="555")])
+
+        import src.trading.service as service
+
+        def _get_positions(conn):
+            entries = fr._read_journal()
+            entries.append(self._entry(ticket="777", symbol="EURUSD"))
+            fr._write_journal(entries)
+            return {"positions": []}
+
+        monkeypatch.setattr(service, "get_positions", _get_positions)
+        monkeypatch.setattr(
+            service, "get_open_orders", lambda conn, include_executions=False: {"open_orders": [], "executions": []}
+        )
+
+        fr._journal_reconcile_closed("AUDUSD", "mt5fn-live-trade")
+
+        entries = fr._read_journal()
+        assert {e["ticket"] for e in entries} == {"555", "777"}
+        closed = next(e for e in entries if e["ticket"] == "555")
+        assert closed["status"] == "closed"
+        concurrent = next(e for e in entries if e["ticket"] == "777")
+        assert concurrent["status"] == "open"
+
+
 class TestPostTradeSpecCheck:
     """Real incident 2026-09-17: the committee filled an order with the
     wrong symbol, 25x the mandated lot size, as a limit order -- directly
@@ -375,3 +425,29 @@ class TestResolveFillPrice:
 
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": []})
         assert fr._resolve_fill_price(self.TRADE, {"fill_price": 0.0, "symbol": "EURUSD"}) is None
+
+    def test_falls_back_by_ticket_not_first_match_when_stacked(self, monkeypatch) -> None:
+        """With max_stack > 1, an older healthy position can share this
+        symbol+magic with the new fill -- must pick the position whose
+        ticket matches the new order's own order_id, not whichever the
+        broker happens to list first."""
+        import src.trading.service as service
+
+        positions = [
+            {"ticket": "111", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1000},  # older, unrelated
+            {"ticket": "999", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1500},  # the new fill
+        ]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        order = {"fill_price": 0.0, "symbol": "EURUSD", "order_id": "999"}
+        assert fr._resolve_fill_price(self.TRADE, order) == 1.1500
+
+    def test_no_fallback_when_ticket_given_but_not_found(self, monkeypatch) -> None:
+        """A ticket that isn't (yet) among the read positions must not fall
+        back to a symbol+magic guess -- that would risk grabbing the wrong
+        position's price again."""
+        import src.trading.service as service
+
+        positions = [{"ticket": "111", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1000}]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        order = {"fill_price": 0.0, "symbol": "EURUSD", "order_id": "999"}
+        assert fr._resolve_fill_price(self.TRADE, order) is None

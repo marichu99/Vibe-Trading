@@ -221,6 +221,39 @@ def test_gate_lot_based_notional_denies_oversized_quantity(monkeypatch) -> None:
     assert conn.placed == []
 
 
+def test_gate_prices_existing_mt5_position_for_exposure_check(monkeypatch) -> None:
+    """An MT5 position row (lots + price_current, no market_value/quantity/price
+    keys) must be priced by the gate, not silently fail the exposure check.
+
+    Regression: enforcement._position_market_value only recognizes share/coin
+    -style rows; without contract-size normalization here, ANY open MT5
+    position made every subsequent order's exposure check return None
+    ("positions could not be read"), pausing the bot for re-auth on every
+    order after the first — even though the position was read fine.
+    """
+    conn = _FakeConnector(
+        quote_last=4651.0,
+        positions={"status": "ok", "positions": [
+            {"symbol": "XAUUSDm", "side": "buy", "volume": 0.01, "price_open": 4600.0, "price_current": 4651.0},
+        ]},
+    )
+    conn.contract_size = lambda symbol, *, config=None: 100.0
+    # Before the fix, the existing MT5-shaped row couldn't be priced at all,
+    # so the exposure check returned None and every order was blocked with
+    # "current positions could not be read (fail-closed)" regardless of side
+    # or size. With the fix, the position prices to 0.01 lot * 100 oz *
+    # $4651 = $4651 and the new $4651 order clears the (default, generous)
+    # exposure cap normally.
+    _patch_gate(monkeypatch, mandate=_mt5_gold_mandate(max_order=6000.0))
+    out = gate.execute_live_order(
+        broker="mt5", connector_module=conn, config=object(),
+        intent=_mt5_gold_intent(qty=0.01),
+        place_kwargs={"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01},
+    )
+    assert out["status"] == "ok"
+    assert conn.placed == [{"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01}]
+
+
 def test_gate_lot_based_notional_fails_closed_when_contract_size_unreadable(monkeypatch) -> None:
     """A lot-based connector whose contract_size lookup fails must deny, not assume 1:1."""
     conn = _FakeConnector(quote_last=4651.0)

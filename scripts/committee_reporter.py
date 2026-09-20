@@ -1158,7 +1158,7 @@ def _journal_reconcile_closed(symbol: str, connection: str) -> None:
             latest_close_by_position[key] = d
 
     now = datetime.now(timezone.utc)
-    changed = False
+    updates_by_ticket: dict[str, dict] = {}
     for entry in open_entries:
         ticket = str(entry.get("ticket"))
         if ticket in live_tickets:
@@ -1185,10 +1185,23 @@ def _journal_reconcile_closed(symbol: str, connection: str) -> None:
         else:
             entry["closed_at"] = datetime.now(timezone.utc).isoformat()
             entry["outcome"] = "unknown"  # closed, but couldn't match the closing deal
-        changed = True
+        updates_by_ticket[ticket] = entry
 
-    if changed:
-        _write_journal(entries)
+    if updates_by_ticket:
+        # Re-read the journal right before writing (this function's own read
+        # above is stale by the time we get here -- get_positions/get_open_orders
+        # are real broker round trips) and merge into that fresh copy by
+        # ticket, rather than writing back the whole `entries` snapshot taken
+        # at the top. --status runs this same reconciliation with no lock
+        # while the live loop can concurrently append a brand-new open entry
+        # via _journal_record_open; writing back the stale snapshot would
+        # silently drop that new entry.
+        fresh = _read_journal()
+        for fresh_entry in fresh:
+            update = updates_by_ticket.get(str(fresh_entry.get("ticket")))
+            if update is not None:
+                fresh_entry.update(update)
+        _write_journal(fresh)
 
 
 def _journal_summary_text(symbol: str) -> str | None:
@@ -2064,6 +2077,15 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
     to the live position's own price_open (a fresh get_positions() read,
     same source --status uses) whenever fill_price is missing OR
     non-positive.
+
+    Matches the fallback position by the NEW order's own ticket (order_id)
+    first, same class of bug already fixed by /code-review in
+    _post_trade_spec_check/_post_trade_reward_risk_check: with a target's
+    max_stack > 1, more than one position can legitimately be open on this
+    symbol, and "first match by symbol+magic" can silently return an OLDER
+    position's entry price instead of the one that just filled — which then
+    corrupts the journal's entry_price and any reward:risk correction
+    computed from it.
     """
     price = placed_order.get("fill_price")
     try:
@@ -2078,6 +2100,17 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
     try:
         positions = get_positions(trade["connection"]).get("positions", [])
     except Exception:
+        return None
+    target_ticket = str(placed_order.get("order_id") or "").strip()
+    if target_ticket:
+        for pos in positions:
+            if str(pos.get("ticket")) == target_ticket:
+                try:
+                    open_price = float(pos.get("price_open"))
+                except (TypeError, ValueError):
+                    continue
+                if open_price > 0:
+                    return open_price
         return None
     symbol = placed_order.get("symbol") or trade["symbol"]
     for pos in positions:
