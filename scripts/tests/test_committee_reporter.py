@@ -1170,6 +1170,110 @@ class TestProfitProtectionCheckTimeDecay:
         assert pos["stop_loss"] < new_sl < pos["price_open"]
 
 
+class TestProfitProtectionCheckSilentLookupFailures:
+    """2026-09-21: found while investigating two gold reversal trades that
+    moved well past every protection trigger and still closed at a near-
+    full loss. point_size/contract_size used to fail completely silently
+    (bare except, no log) inside the two rules that need them -- these
+    confirm a lookup failure now logs a warning AND the position still
+    gets whatever protection the OTHER rule can still provide (fails open,
+    not fails silent-and-total). Own copy of TestProfitProtectionCheckTimeDecay's
+    small helpers (not inherited) so this class's test output doesn't also
+    silently re-run that class's unrelated tests under a new name."""
+
+    SYMBOL = "EURUSDm"
+    CONNECTION = "mt5-live-trade"
+
+    def _trade(self, **overrides) -> dict:
+        base = {"symbol": self.SYMBOL, "connection": self.CONNECTION, "lots": 0.01, "max_stack": 1}
+        base.update(overrides)
+        return base
+
+    def _position(self, *, hours_open: float, side="buy", entry=1.1600, sl=1.1580, tp=1.1650,
+                   price=1.1605, ticket="1", profit=0.0) -> dict:
+        opened = (datetime.now(timezone.utc) - timedelta(hours=hours_open)).isoformat()
+        return {
+            "ticket": ticket, "symbol": self.SYMBOL, "magic": cr.OUR_MAGIC, "side": side,
+            "price_open": entry, "stop_loss": sl, "take_profit": tp, "price_current": price,
+            "time": opened, "profit": profit,
+        }
+
+    def _patch_broker(self, monkeypatch, *, positions, atr_floor=0.0010, modify_result=None, trade_overrides=None) -> dict:
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+        import src.trading.profiles as profiles_module
+        import src.trading.service as service
+
+        trade = self._trade(**(trade_overrides or {}))
+        monkeypatch.setattr(cr, "TARGETS", [{"committee": "x", "target": "x", "market": "forex", "trade": trade}])
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+
+        class _FakeProfile:
+            config: dict = {}
+
+        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: _FakeProfile())
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: "FAKE_CONFIG")
+        monkeypatch.setattr(mt5_sdk, "point_size", lambda symbol, config=None: 0.00001)
+        monkeypatch.setattr(mt5_sdk, "contract_size", lambda symbol, config=None: 100_000)
+        monkeypatch.setattr(cr, "_atr_stop_floor", lambda symbol, connection: atr_floor)
+
+        calls = {"modify": [], "close": []}
+
+        def _modify(config, *, ticket, stop_loss, take_profit):
+            calls["modify"].append({"ticket": ticket, "stop_loss": stop_loss, "take_profit": take_profit})
+            return modify_result or {"status": "ok"}
+
+        def _close(config, *, ticket):
+            calls["close"].append({"ticket": ticket})
+            return {"status": "ok", "fill_price": 1.0, "closed_volume": 0.01}
+
+        monkeypatch.setattr(mt5_sdk, "modify_position", _modify)
+        monkeypatch.setattr(mt5_sdk, "close_position", _close)
+        return calls
+
+    def test_point_size_failure_is_logged_and_trail_rule_still_applies(self, monkeypatch, caplog) -> None:
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+
+        def _raise_point_size(symbol, config=None):
+            raise RuntimeError("symbol not found")
+
+        # entry 1.1600, tp 1.1620 -> halfway 1.1610; price 1.1615 is past
+        # halfway (arms the point_size call/warning) AND, with a $1
+        # early_profit_trigger_usd override (trigger_distance = 1 /
+        # (100_000 * 0.01) = 0.001), past the trail's own $ trigger too --
+        # so trail_candidate can independently protect this position even
+        # with point_size broken.
+        pos = self._position(hours_open=1.0, ticket="T4", side="buy", entry=1.1600, sl=1.1580, tp=1.1620, price=1.1615)
+        calls = self._patch_broker(
+            monkeypatch, positions=[pos], atr_floor=0.0010, trade_overrides={"early_profit_trigger_usd": 1.00},
+        )
+        monkeypatch.setattr(mt5_sdk, "point_size", _raise_point_size)
+
+        with caplog.at_level("WARNING"):
+            cr._profit_protection_check()
+
+        assert any("point_size lookup failed" in r.message for r in caplog.records)
+        assert calls["modify"], "trail rule should still have protected the position"
+
+    def test_contract_size_failure_is_logged_and_breakeven_rule_still_applies(self, monkeypatch, caplog) -> None:
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+
+        def _raise_contract_size(symbol, config=None):
+            raise RuntimeError("symbol not found")
+
+        # Past the breakeven halfway point (halfway to 1.1650 tp is
+        # 1.1625) so breakeven_candidate can independently protect this
+        # position even with contract_size broken.
+        pos = self._position(hours_open=1.0, ticket="T5", side="buy", entry=1.1600, sl=1.1580, tp=1.1650, price=1.1630)
+        calls = self._patch_broker(monkeypatch, positions=[pos])
+        monkeypatch.setattr(mt5_sdk, "contract_size", _raise_contract_size)
+
+        with caplog.at_level("WARNING"):
+            cr._profit_protection_check()
+
+        assert any("contract_size lookup failed" in r.message for r in caplog.records)
+        assert calls["modify"], "breakeven rule should still have protected the position"
+
+
 # ---------------------------------------------------------------------------
 # _live_circuit_breaker_check
 # ---------------------------------------------------------------------------

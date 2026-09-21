@@ -1683,7 +1683,19 @@ def _profit_protection_check() -> None:
             if reached_halfway:
                 try:
                     point = mt5_sdk.point_size(trade["symbol"], config=config)
-                except Exception:
+                except Exception as exc:
+                    # 2026-09-21: found while investigating two gold reversal
+                    # trades (Exness + FundedNext) that moved 67%/89% of the
+                    # way to target -- well past every protection trigger --
+                    # and still closed at a near-full loss. Couldn't
+                    # reproduce a live failure here, but this call used to
+                    # fail dead silent (bare except, no log), which would
+                    # make a repeat of that pattern undiagnosable. Logged
+                    # now so a real recurrence leaves a trace.
+                    logger.warning(
+                        "profit protection check: point_size lookup failed for %s, skipping breakeven rule this cycle: %s",
+                        trade["symbol"], exc,
+                    )
                     point = None
                 if point and point > 0:
                     buffer = point * BREAKEVEN_BUFFER_POINTS
@@ -1700,7 +1712,11 @@ def _profit_protection_check() -> None:
             trail_candidate = None
             try:
                 size = mt5_sdk.contract_size(trade["symbol"], config=config)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "profit protection check: contract_size lookup failed for %s, skipping trail rule this cycle: %s",
+                    trade["symbol"], exc,
+                )
                 size = None
             if size and size > 0 and trade["lots"] > 0:
                 trigger_usd = trade.get("early_profit_trigger_usd", EARLY_PROFIT_TRIGGER_USD)
