@@ -16,6 +16,7 @@ that same scope rather than expanding it.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -42,6 +43,155 @@ class TestInWeekendWindow:
 
     def test_weekday(self) -> None:
         assert not fr._in_weekend_window(datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# _next_session_boundary -- mirrored from committee_reporter.py's identical
+# feature/tests (2026-09-21). See that file's test class for the full
+# DST-transition rationale; kept here in full (not abbreviated) since a
+# regression in either copy is equally capable of misfiring a real trade.
+# ---------------------------------------------------------------------------
+
+
+class TestNextSessionBoundary:
+    def test_winter_standard_time_offsets(self) -> None:
+        now = datetime(2026, 1, 15, 0, 0, 1, tzinfo=timezone.utc)
+        boundary, session = fr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 1, 15, 8, 0, tzinfo=timezone.utc), "london")
+
+        now = boundary + timedelta(seconds=1)
+        boundary, session = fr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc), "new_york")
+
+    def test_summer_dst_offsets(self) -> None:
+        now = datetime(2026, 6, 15, 0, 0, 1, tzinfo=timezone.utc)
+        boundary, session = fr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 6, 15, 7, 0, tzinfo=timezone.utc), "london")
+
+        now = boundary + timedelta(seconds=1)
+        boundary, session = fr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc), "new_york")
+
+    def test_before_asia_open_returns_asia(self) -> None:
+        now = datetime(2026, 9, 21, 0, 0, 0, tzinfo=timezone.utc) - timedelta(seconds=1)
+        boundary, session = fr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 9, 21, 0, 0, tzinfo=timezone.utc), "asia")
+
+    def test_after_last_boundary_rolls_to_tomorrows_asia(self) -> None:
+        now = datetime(2026, 9, 21, 12, 0, 1, tzinfo=timezone.utc)
+        boundary, session = fr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 9, 22, 0, 0, tzinfo=timezone.utc), "asia")
+
+    def test_exactly_at_a_boundary_is_not_returned_again(self) -> None:
+        asia_open = datetime(2026, 9, 21, 0, 0, 0, tzinfo=timezone.utc)
+        boundary, session = fr._next_session_boundary(asia_open)
+        assert session != "asia"
+
+    def test_america_new_york_dst_spring_forward_2026(self) -> None:
+        before = datetime(2026, 3, 7, 12, 0, tzinfo=timezone.utc)
+        boundary, session = fr._next_session_boundary(before)
+        assert (boundary, session) == (datetime(2026, 3, 7, 13, 0, tzinfo=timezone.utc), "new_york")
+
+        after = datetime(2026, 3, 9, 11, 59, tzinfo=timezone.utc)
+        boundary, session = fr._next_session_boundary(after)
+        assert (boundary, session) == (datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc), "new_york")
+
+    def test_europe_london_dst_spring_forward_2026(self) -> None:
+        before = datetime(2026, 3, 28, 1, 0, tzinfo=timezone.utc)
+        boundary, session = fr._next_session_boundary(before)
+        assert (boundary, session) == (datetime(2026, 3, 28, 8, 0, tzinfo=timezone.utc), "london")
+
+        after = datetime(2026, 3, 30, 1, 0, tzinfo=timezone.utc)
+        boundary, session = fr._next_session_boundary(after)
+        assert (boundary, session) == (datetime(2026, 3, 30, 7, 0, tzinfo=timezone.utc), "london")
+
+
+class TestParseDecisionReasoning:
+    def test_parses_well_formed_report(self) -> None:
+        text = "Decision: long, momentum favors EURUSD\nReasoning: broke resistance on volume\nConfidence: high"
+        assert fr._parse_decision_reasoning(text) == ("long, momentum favors EURUSD", "broke resistance on volume")
+
+    def test_missing_decision_returns_none(self) -> None:
+        assert fr._parse_decision_reasoning("Reasoning: because\nConfidence: high") is None
+
+    def test_garbage_text_returns_none(self) -> None:
+        assert fr._parse_decision_reasoning("the committee had an error") is None
+
+
+class TestSessionBiasReadWrite:
+    def test_record_then_fact_round_trip(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(fr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        fr._record_session_bias("EURUSD", "asia", "Decision: long\nReasoning: broke resistance")
+
+        fact = fr._session_bias_fact("EURUSD")
+
+        assert "Asia session read on EURUSD today" in fact
+        assert "long" in fact and "broke resistance" in fact
+
+    def test_no_entries_returns_empty_string(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(fr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        assert fr._session_bias_fact("EURUSD") == ""
+
+    def test_stale_prior_day_entry_is_ignored(self, tmp_path, monkeypatch) -> None:
+        path = tmp_path / "session_bias.json"
+        monkeypatch.setattr(fr, "SESSION_BIAS_STATE_PATH", path)
+        path.write_text(
+            json.dumps({"EURUSD": {"asia": {"date": "2020-01-01", "decision": "long", "reasoning": "old"}}}),
+            encoding="utf-8",
+        )
+        assert fr._session_bias_fact("EURUSD") == ""
+
+
+class TestRunOnceSessionGating:
+    def _patch(self, monkeypatch, *, report_text: str = "Decision: long\nReasoning: because") -> list[dict]:
+        calls: list[dict] = []
+        monkeypatch.setattr(fr, "is_reportable", lambda result: False)
+        monkeypatch.setattr(
+            fr, "TARGETS",
+            [{
+                "committee": "investment_committee", "target": "EURUSD", "market": "forex",
+                "trade": {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1},
+            }],
+        )
+
+        def _fake_run_committee(**kwargs):
+            calls.append(kwargs)
+            return fr.CommitteeResult(
+                committee=kwargs["committee"], target=kwargs["target"], market=kwargs["market"],
+                status="success", run_id="r1", report_text=report_text, traded=False,
+            )
+
+        monkeypatch.setattr(fr, "run_committee", _fake_run_committee)
+        return calls
+
+    def test_asia_session_strips_trade_and_records_bias(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        recorded = []
+        monkeypatch.setattr(fr, "_record_session_bias", lambda symbol, session, text: recorded.append((symbol, session, text)))
+
+        fr.run_once("asia")
+
+        assert calls[0]["trade"] is None
+        assert recorded == [("EURUSD", "asia", "Decision: long\nReasoning: because")]
+
+    def test_new_york_session_keeps_trade_and_does_not_record_bias(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        recorded = []
+        monkeypatch.setattr(fr, "_record_session_bias", lambda *a: recorded.append(a))
+
+        fr.run_once("new_york")
+
+        assert calls[0]["trade"] == {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
+        assert recorded == []
+
+    def test_targets_list_itself_is_never_mutated(self, monkeypatch) -> None:
+        self._patch(monkeypatch)
+        monkeypatch.setattr(fr, "_record_session_bias", lambda *a: None)
+        original_trade = fr.TARGETS[0]["trade"]
+
+        fr.run_once("asia")
+
+        assert fr.TARGETS[0]["trade"] is original_trade
 
 
 class TestJournalReadWrite:

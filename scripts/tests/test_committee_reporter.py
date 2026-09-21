@@ -58,6 +58,214 @@ class TestInWeekendWindow:
 
 
 # ---------------------------------------------------------------------------
+# _next_session_boundary -- session-gated trading (2026-09-21): 3 passes/
+# day anchored to session opens, only "new_york" trades. Must stay correct
+# across DST transitions (America/New_York and Europe/London both observe
+# it, on different dates) without a hardcoded UTC offset.
+# ---------------------------------------------------------------------------
+
+
+class TestNextSessionBoundary:
+    def test_winter_standard_time_offsets(self) -> None:
+        """Mid-January: both London (GMT, UTC+0) and New York (EST, UTC-5)
+        are in standard time."""
+        now = datetime(2026, 1, 15, 0, 0, 1, tzinfo=timezone.utc)  # just after Asia's 00:00 boundary
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 1, 15, 8, 0, tzinfo=timezone.utc), "london")
+
+        now = boundary + timedelta(seconds=1)
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc), "new_york")
+
+    def test_summer_dst_offsets(self) -> None:
+        """Mid-June: both London (BST, UTC+1) and New York (EDT, UTC-4)
+        are in daylight time."""
+        now = datetime(2026, 6, 15, 0, 0, 1, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 6, 15, 7, 0, tzinfo=timezone.utc), "london")
+
+        now = boundary + timedelta(seconds=1)
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc), "new_york")
+
+    def test_before_asia_open_returns_asia(self) -> None:
+        now = datetime(2026, 9, 21, 0, 0, 0, tzinfo=timezone.utc) - timedelta(seconds=1)
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 9, 21, 0, 0, tzinfo=timezone.utc), "asia")
+
+    def test_after_last_boundary_rolls_to_tomorrows_asia(self) -> None:
+        # 2026-09-21 is a weekday in BST/EDT: NY opens 12:00 UTC that day.
+        now = datetime(2026, 9, 21, 12, 0, 1, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 9, 22, 0, 0, tzinfo=timezone.utc), "asia")
+
+    def test_exactly_at_a_boundary_is_not_returned_again(self) -> None:
+        """A boundary equal to `now` must not be selected as "next" -- the
+        caller (main()'s loop) treats now_utc >= next_boundary as "fire
+        now", so the boundary that just fired must roll forward, not repeat."""
+        asia_open = datetime(2026, 9, 21, 0, 0, 0, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(asia_open)
+        assert session != "asia"
+
+    def test_america_new_york_dst_spring_forward_2026(self) -> None:
+        """US DST starts 2026-03-08 (2nd Sunday of March) -- the day before
+        is still EST (UTC-5), the day itself/after is EDT (UTC-4)."""
+        before = datetime(2026, 3, 7, 12, 0, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(before)
+        assert (boundary, session) == (datetime(2026, 3, 7, 13, 0, tzinfo=timezone.utc), "new_york")
+
+        after = datetime(2026, 3, 9, 11, 59, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(after)
+        assert (boundary, session) == (datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc), "new_york")
+
+    def test_europe_london_dst_spring_forward_2026(self) -> None:
+        """UK DST (BST) starts 2026-03-29 (last Sunday of March)."""
+        before = datetime(2026, 3, 28, 1, 0, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(before)
+        assert (boundary, session) == (datetime(2026, 3, 28, 8, 0, tzinfo=timezone.utc), "london")
+
+        after = datetime(2026, 3, 30, 1, 0, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(after)
+        assert (boundary, session) == (datetime(2026, 3, 30, 7, 0, tzinfo=timezone.utc), "london")
+
+
+# ---------------------------------------------------------------------------
+# Session bias carry-over: Asia/London (research-only) passes' Decision/
+# Reasoning get recorded and read back into the New York (trading) pass's
+# prompt instead of being thrown away.
+# ---------------------------------------------------------------------------
+
+
+class TestParseDecisionReasoning:
+    def test_parses_well_formed_report(self) -> None:
+        text = "Decision: long, momentum favors EURUSD\nReasoning: broke resistance on volume\nConfidence: high"
+        assert cr._parse_decision_reasoning(text) == ("long, momentum favors EURUSD", "broke resistance on volume")
+
+    def test_missing_decision_returns_none(self) -> None:
+        assert cr._parse_decision_reasoning("Reasoning: because\nConfidence: high") is None
+
+    def test_missing_reasoning_returns_none(self) -> None:
+        assert cr._parse_decision_reasoning("Decision: wait\nConfidence: high") is None
+
+    def test_garbage_text_returns_none(self) -> None:
+        assert cr._parse_decision_reasoning("the committee had an error") is None
+
+
+class TestSessionBiasReadWrite:
+    def test_record_then_fact_round_trip(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        cr._record_session_bias("EURUSDm", "asia", "Decision: long\nReasoning: broke resistance")
+
+        fact = cr._session_bias_fact("EURUSDm")
+
+        assert "Asia session read on EURUSDm today" in fact
+        assert "long" in fact and "broke resistance" in fact
+
+    def test_both_sessions_appear_when_both_recorded(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        cr._record_session_bias("EURUSDm", "asia", "Decision: long\nReasoning: asia reason")
+        cr._record_session_bias("EURUSDm", "london", "Decision: short\nReasoning: london reason")
+
+        fact = cr._session_bias_fact("EURUSDm")
+
+        assert "Asia session read" in fact and "asia reason" in fact
+        assert "London session read" in fact and "london reason" in fact
+
+    def test_no_entries_returns_empty_string(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        assert cr._session_bias_fact("EURUSDm") == ""
+
+    def test_stale_prior_day_entry_is_ignored(self, tmp_path, monkeypatch) -> None:
+        path = tmp_path / "session_bias.json"
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", path)
+        path.write_text(
+            json.dumps({"EURUSDm": {"asia": {"date": "2020-01-01", "decision": "long", "reasoning": "old"}}}),
+            encoding="utf-8",
+        )
+        assert cr._session_bias_fact("EURUSDm") == ""
+
+    def test_unparseable_report_text_records_nothing(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        cr._record_session_bias("EURUSDm", "asia", "the committee had an error, no structured report")
+        assert cr._session_bias_fact("EURUSDm") == ""
+
+    def test_different_symbol_does_not_leak(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        cr._record_session_bias("EURUSDm", "asia", "Decision: long\nReasoning: eur reason")
+        assert cr._session_bias_fact("AUDUSDm") == ""
+
+
+# ---------------------------------------------------------------------------
+# run_once session gating (2026-09-21): only "new_york" trades; "asia"/
+# "london" force trade=None on every TARGETS spec and record the bias.
+# ---------------------------------------------------------------------------
+
+
+class TestRunOnceSessionGating:
+    def _patch(self, monkeypatch, *, report_text: str = "Decision: long\nReasoning: because") -> list[dict]:
+        calls: list[dict] = []
+        monkeypatch.setattr(cr, "_check_trade_drought", lambda: None)
+        monkeypatch.setattr(cr, "_check_cap_fit_alert", lambda: None)
+        monkeypatch.setattr(cr, "_check_llm_balance_alert", lambda: None)
+        monkeypatch.setattr(cr, "_log_cap_gap", lambda: None)
+        monkeypatch.setattr(cr, "is_reportable", lambda result: False)
+        monkeypatch.setattr(
+            cr, "TARGETS",
+            [{
+                "committee": "investment_committee", "target": "EURUSD", "market": "forex",
+                "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
+            }],
+        )
+
+        def _fake_run_committee(**kwargs):
+            calls.append(kwargs)
+            return cr.CommitteeResult(
+                committee=kwargs["committee"], target=kwargs["target"], market=kwargs["market"],
+                status="success", run_id="r1", report_text=report_text, traded=False,
+            )
+
+        monkeypatch.setattr(cr, "run_committee", _fake_run_committee)
+        return calls
+
+    def test_asia_session_strips_trade_and_records_bias(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        recorded = []
+        monkeypatch.setattr(cr, "_record_session_bias", lambda symbol, session, text: recorded.append((symbol, session, text)))
+
+        cr.run_once("asia")
+
+        assert calls[0]["trade"] is None
+        assert recorded == [("EURUSDm", "asia", "Decision: long\nReasoning: because")]
+
+    def test_london_session_strips_trade(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        monkeypatch.setattr(cr, "_record_session_bias", lambda *a: None)
+
+        cr.run_once("london")
+
+        assert calls[0]["trade"] is None
+
+    def test_new_york_session_keeps_trade_and_does_not_record_bias(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        recorded = []
+        monkeypatch.setattr(cr, "_record_session_bias", lambda *a: recorded.append(a))
+
+        cr.run_once("new_york")
+
+        assert calls[0]["trade"] == {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+        assert recorded == []
+
+    def test_targets_list_itself_is_never_mutated(self, monkeypatch) -> None:
+        self._patch(monkeypatch)
+        monkeypatch.setattr(cr, "_record_session_bias", lambda *a: None)
+        original_trade = cr.TARGETS[0]["trade"]
+
+        cr.run_once("asia")
+
+        assert cr.TARGETS[0]["trade"] is original_trade
+
+
+# ---------------------------------------------------------------------------
 # _read_journal / _write_journal
 # ---------------------------------------------------------------------------
 
@@ -654,23 +862,26 @@ class TestStatusLogSummary:
         monkeypatch.setattr(cr, "REPORTER_LOG_PATH", tmp_path / "nope.log")
         assert cr._status_log_summary() == {}
 
-    def test_parses_interval_last_start_and_last_emailed(self, tmp_path, monkeypatch) -> None:
+    def test_parses_last_start_and_last_emailed(self, tmp_path, monkeypatch) -> None:
         log = tmp_path / "reporter.log"
         log.write_text(
-            "2026-09-07 19:17:45,724 INFO starting loop mode, interval=7200s (profit protection checked every 300s)\n"
+            "2026-09-07 19:17:45,724 INFO starting loop mode, session-gated scheduling\n"
             "2026-09-07 19:17:46,606 INFO running investment_committee on EURUSD (forex) [trade-enabled]\n"
-            "2026-09-07 19:31:12,000 INFO emailed report: [Vibe-Trading] investment_committee — EURUSD (OK)\n",
+            "2026-09-07 19:31:12,000 INFO emailed report: [Vibe-Trading] new_york: investment_committee — EURUSD (OK)\n",
             encoding="utf-8",
         )
         monkeypatch.setattr(cr, "REPORTER_LOG_PATH", log)
 
         result = cr._status_log_summary()
 
-        assert result["interval"] == 7200
         assert result["last_start_ts"] == "2026-09-07 19:17:46"
         assert result["last_result_ts"] == "2026-09-07 19:31:12"
         assert result["last_result_tag"] == "OK"
-        assert result["next_due"] == "2026-09-07 21:31:12"
+        # next_due is no longer derived from the log (see _status_log_summary's
+        # docstring) -- _next_pass_due_text computes it straight from the
+        # session schedule, tested separately below.
+        assert "next_due" not in result
+        assert "interval" not in result
 
     def test_no_next_due_without_interval(self, tmp_path, monkeypatch) -> None:
         log = tmp_path / "reporter.log"

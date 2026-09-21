@@ -44,6 +44,7 @@ from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT_DIR = REPO_ROOT / "agent"
@@ -442,6 +443,14 @@ REPORTER_LOG_PATH = REPO_ROOT / "logs" / "reporter.log"
 # independently derived more than once.
 WEEKEND_CUTOFF_UTC_HOUR = 20
 WEEKEND_STATE_PATH = REPO_ROOT / "logs" / "weekend_state.json"
+
+# Session-gated trading (2026-09-21): the loop deliberates 3x/day, anchored
+# to session opens, but only the New York pass (highest-liquidity window --
+# London/NY overlap) is allowed to trade; Asia/London passes are research-
+# only. See _next_session_boundary's own docstring for the schedule and
+# _build_prompt for how a same-day Asia/London read gets carried into the
+# NY pass instead of being thrown away.
+SESSION_BIAS_STATE_PATH = REPO_ROOT / "logs" / "session_bias_state.json"
 
 # Breakeven-stop management ("dual take-profit, Option A"): 0.01 lots is
 # XAUUSDm's broker-enforced minimum AND step size (confirmed live via
@@ -1324,6 +1333,121 @@ def _in_weekend_window(now: datetime) -> bool:
     return now.weekday() == 4 and now.hour >= WEEKEND_CUTOFF_UTC_HOUR  # Fri evening
 
 
+def _next_session_boundary(now: datetime) -> tuple[datetime, str]:
+    """Return the next (UTC datetime, session label) boundary strictly after now.
+
+    Three deliberation passes/day, anchored to session opens -- only the
+    "new_york" pass ever trades (see run_once's session param and
+    SESSION_BIAS_STATE_PATH's comment); "asia"/"london" are research-only:
+      - "asia": 00:00 UTC. Tokyo has no DST (always UTC+9), so this is a
+        fixed constant -- no ZoneInfo needed.
+      - "london": 08:00 Europe/London local time (07:00 UTC in BST / 08:00
+        UTC in GMT).
+      - "new_york": 08:00 America/New_York local time (12:00 UTC in EDT /
+        13:00 UTC in EST) -- the FX "New York session" convention (catches
+        the London/NY overlap), not the 9:30am ET NYSE cash-equities open.
+
+    Both DST-observing boundaries are computed fresh from `now`'s own date
+    via zoneinfo (same pattern as fundednext_state.py's _SERVER_TZ), never
+    a hardcoded UTC offset -- so this stays correct across DST transitions
+    without needing its own twice-a-year fix.
+    """
+    day = now.date()
+    asia = datetime(day.year, day.month, day.day, 0, 0, tzinfo=timezone.utc)
+    london = datetime(day.year, day.month, day.day, 8, 0, tzinfo=ZoneInfo("Europe/London")).astimezone(timezone.utc)
+    new_york = datetime(day.year, day.month, day.day, 8, 0, tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+
+    for boundary, label in sorted([(asia, "asia"), (london, "london"), (new_york, "new_york")]):
+        if boundary > now:
+            return boundary, label
+
+    # Every boundary today has already passed -- roll to tomorrow's Asia open.
+    tomorrow = day + timedelta(days=1)
+    return datetime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, tzinfo=timezone.utc), "asia"
+
+
+def _next_pass_due_text(now: datetime) -> str:
+    """Human-readable 'next scheduled pass' string, straight from the schedule
+    (not derived from log arithmetic -- see _status_log_summary's comment for
+    why the old interval-based computation was retired)."""
+    boundary, session = _next_session_boundary(now)
+    return f"{boundary.strftime('%Y-%m-%d %H:%M:%S')} UTC ({session})"
+
+
+_DECISION_LINE_RE = re.compile(r"^Decision:\s*(.+)$", re.MULTILINE)
+_REASONING_LINE_RE = re.compile(r"^Reasoning:\s*(.+)$", re.MULTILINE)
+
+
+def _parse_decision_reasoning(report_text: str) -> tuple[str, str] | None:
+    """Extract the Decision/Reasoning lines from a research-only pass's report.
+
+    Matches _REPORT_FORMAT_NO_TRADE's fixed structure -- returns None (not
+    an exception) on anything that doesn't parse, since a missed carry-over
+    note is a minor quality loss, never worth crashing the loop over.
+    """
+    decision_match = _DECISION_LINE_RE.search(report_text)
+    reasoning_match = _REASONING_LINE_RE.search(report_text)
+    if not decision_match or not reasoning_match:
+        return None
+    return decision_match.group(1).strip(), reasoning_match.group(1).strip()
+
+
+def _read_session_bias() -> dict:
+    try:
+        return json.loads(SESSION_BIAS_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _write_session_bias(data: dict) -> None:
+    SESSION_BIAS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SESSION_BIAS_STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _record_session_bias(symbol: str, session: str, report_text: str) -> None:
+    """Save a research-only pass's Decision/Reasoning for the NY pass to read back.
+
+    Keyed by symbol -> session ("asia"/"london") -> {date, decision,
+    reasoning}, so _session_bias_fact can filter to only today's entries --
+    a restart mid-day loses nothing (the next research pass just re-records
+    today's read), and a stale prior day's entry is never accidentally
+    carried forward.
+    """
+    parsed = _parse_decision_reasoning(report_text)
+    if parsed is None:
+        return
+    decision, reasoning = parsed
+    data = _read_session_bias()
+    data.setdefault(symbol, {})[session] = {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "decision": decision,
+        "reasoning": reasoning,
+    }
+    _write_session_bias(data)
+
+
+def _session_bias_fact(symbol: str) -> str:
+    """Build a prompt fact block from today's Asia/London reads for symbol, or "" if none."""
+    entries = _read_session_bias().get(symbol, {})
+    today = datetime.now(timezone.utc).date().isoformat()
+    lines = []
+    for session in ("asia", "london"):
+        entry = entries.get(session)
+        if not isinstance(entry, dict) or entry.get("date") != today:
+            continue
+        lines.append(
+            f"Your {session.capitalize()} session read on {symbol} today: {entry.get('decision', '')} "
+            f"— {entry.get('reasoning', '')}"
+        )
+    if not lines:
+        return ""
+    return (
+        "Earlier session reads today (research-only passes, no trade was placed on "
+        "either — this is context for your decision now, not a commitment to follow it):\n"
+        + "\n".join(lines)
+    )
+
+
 def _read_weekend_state() -> dict:
     try:
         return json.loads(WEEKEND_STATE_PATH.read_text(encoding="utf-8"))
@@ -1810,6 +1934,9 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
     journal_fact = _journal_summary_text(symbol)
     journal_block = f"{journal_fact}\n\n" if journal_fact else ""
 
+    session_bias_fact = _session_bias_fact(symbol)
+    session_bias_block = f"{session_bias_fact}\n\n" if session_bias_fact else ""
+
     return (
         f'Run the {committee} swarm with target="{target}" ({market}) to produce its full debate '
         f"and final decision, including concrete stop-loss and take-profit price levels — every "
@@ -1819,6 +1946,7 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
         f"{volatility_block}"
         f"{signal_block}"
         f"{journal_block}"
+        f"{session_bias_block}"
         f"{_DAY_TRADE_FRAMING}"
         f"Then, based ONLY on the portfolio manager's final decision:\n"
         + (
@@ -2492,8 +2620,7 @@ def _status_report_html() -> str:
         parts.append(f'<p style="margin:2px 0;">Last pass started: {_esc(log["last_start_ts"])} (in progress)</p>')
     else:
         parts.append('<p style="margin:2px 0;color:#555;">Last pass: no reporter.log data found</p>')
-    if log.get("next_due"):
-        parts.append(f'<p style="margin:2px 0;">Next pass due: ~{_esc(log["next_due"])} (interval {log.get("interval")}s)</p>')
+    parts.append(f'<p style="margin:2px 0;">Next pass due: ~{_esc(_next_pass_due_text(datetime.now(timezone.utc)))}</p>')
 
     sys.path.insert(0, str(AGENT_DIR))
     from src.live.halt import halt_flag_set
@@ -2977,7 +3104,16 @@ def _status_header_html() -> str:
         return ""
 
 
-def run_once() -> None:
+def run_once(session: str = "new_york") -> None:
+    """Run one pass over TARGETS for the given session.
+
+    Only "new_york" trades (see _next_session_boundary's docstring for the
+    schedule) -- "asia"/"london" run every spec with its trade dict forced
+    to None regardless of what TARGETS itself configures, so the pass is
+    research-only, and its Decision/Reasoning gets carried forward via
+    _record_session_bias for the NY pass to read back (_session_bias_fact,
+    wired into _build_prompt).
+    """
     # Disabled 2026-09-02 at the user's request: equity crossed the $100
     # milestone on 2026-09-01, and the user already decided (with silver
     # deliberately deferred ~1 month) to hold off adding it -- this alert
@@ -2991,10 +3127,14 @@ def run_once() -> None:
     _check_cap_fit_alert()
     _check_llm_balance_alert()
     _log_cap_gap()
+    trade_enabled = session == "new_york"
     for spec in TARGETS:
         target = spec.get("target", "?")
+        # Never mutate the module-level TARGETS list -- a fresh dict per
+        # pass, trade forced to None on research-only sessions.
+        effective_spec = spec if trade_enabled else {**spec, "trade": None}
         try:
-            result = run_committee(**spec)
+            result = run_committee(**effective_spec)
         except Exception:
             # A bug in run_committee (or anything it calls) must not take the
             # whole unattended loop down with it — one target's crash should
@@ -3017,11 +3157,23 @@ def run_once() -> None:
                 logger.exception("also failed to send the crash notification email")
             continue
 
+        if not trade_enabled and result.status == "success":
+            trade_spec = spec.get("trade")
+            symbol = trade_spec.get("symbol") if isinstance(trade_spec, dict) else None
+            if symbol:
+                try:
+                    _record_session_bias(symbol, session, result.report_text)
+                except Exception:
+                    logger.exception("failed to record session bias for %s (%s)", symbol, session)
+
         if not is_reportable(result):
             logger.info("%s on %s: not reportable, skipping email", result.committee, result.target)
             continue
         tag = "TRADED" if result.traded else ("OK" if result.status == "success" else result.status.upper())
-        subject = f"[Vibe-Trading] {result.committee} — {result.target} ({tag})"
+        # session kept OUTSIDE the trailing (tag) parens on purpose --
+        # _LOG_EMAILED_RE parses "... (\w+)$" for last_result_tag, and a
+        # comma/space in there would silently break that match.
+        subject = f"[Vibe-Trading] {session}: {result.committee} — {result.target} ({tag})"
         try:
             html = _wrap_email_html(_status_header_html() + _format_body_html(result, tag))
             send_email(subject, _status_header() + _format_body(result), html_body=html)
@@ -3037,7 +3189,6 @@ def run_once() -> None:
 
 _LOG_RUN_START_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO running (.+)$")
 _LOG_EMAILED_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO emailed report: \[Vibe-Trading\] (.+?) \((\w+)\)")
-_LOG_INTERVAL_RE = re.compile(r"starting loop mode, interval=(\d+)s")
 
 
 def _status_lock_state() -> tuple[bool, int | None]:
@@ -3050,7 +3201,14 @@ def _status_lock_state() -> tuple[bool, int | None]:
 
 
 def _status_log_summary() -> dict:
-    """Parse the tail of reporter.log for the interval and the last pass's timing/outcome.
+    """Parse the tail of reporter.log for the last pass's timing/outcome.
+
+    "next_due" used to be derived here (last emailed timestamp + a fixed
+    --interval), but the loop no longer runs on a fixed interval (see
+    _next_session_boundary) -- --interval is accepted for CLI backward
+    compatibility only and no longer drives scheduling, so that arithmetic
+    would be silently wrong. _next_pass_due_text computes it directly from
+    the session schedule instead; see its call sites.
 
     Best-effort: returns an empty dict (never raises) if the log is missing
     or unreadable — --status must degrade gracefully, not crash, when e.g.
@@ -3061,13 +3219,9 @@ def _status_log_summary() -> dict:
     except OSError:
         return {}
 
-    interval = None
     last_start = None
     last_emailed = None
     for line in lines[-500:]:
-        m = _LOG_INTERVAL_RE.search(line)
-        if m:
-            interval = int(m.group(1))
         m = _LOG_RUN_START_RE.match(line)
         if m:
             last_start = (m.group(1), m.group(2))
@@ -3075,7 +3229,7 @@ def _status_log_summary() -> dict:
         if m:
             last_emailed = (m.group(1), m.group(2), m.group(3))
 
-    result: dict = {"interval": interval}
+    result: dict = {}
     if last_start:
         result["last_start_ts"], result["last_start_desc"] = last_start
     if last_emailed:
@@ -3083,12 +3237,6 @@ def _status_log_summary() -> dict:
         result["last_result_ts"] = ts_str
         result["last_result_desc"] = desc
         result["last_result_tag"] = tag
-        if interval:
-            try:
-                completed = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                result["next_due"] = (completed + timedelta(seconds=interval)).strftime("%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                pass
     return result
 
 
@@ -3110,8 +3258,7 @@ def _build_status_report() -> str:
         lines.append(f"Last pass started: {log['last_start_ts']} (still in progress or result not yet logged)")
     else:
         lines.append("Last pass: no reporter.log data found")
-    if log.get("next_due"):
-        lines.append(f"Next pass due: ~{log['next_due']} (interval {log.get('interval')}s)")
+    lines.append(f"Next pass due: ~{_next_pass_due_text(datetime.now(timezone.utc))}")
 
     sys.path.insert(0, str(AGENT_DIR))
     from src.live.halt import halt_flag_set
@@ -3205,8 +3352,17 @@ def print_status() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="Run one pass over TARGETS, then exit (default)")
-    parser.add_argument("--loop", action="store_true", help="Keep running, repeating every --interval seconds")
-    parser.add_argument("--interval", type=int, default=3600, help="Seconds between passes in --loop mode")
+    parser.add_argument("--loop", action="store_true", help="Keep running, one pass at each session boundary (see _next_session_boundary)")
+    parser.add_argument(
+        "--interval", type=int, default=3600,
+        help="Deprecated / no longer used for pass scheduling (kept for CLI backward compatibility only -- "
+        "--loop now fires at session boundaries, see --session)",
+    )
+    parser.add_argument(
+        "--session", choices=["asia", "london", "new_york"], default="new_york",
+        help="Session for a --once pass (only 'new_york' trades; others are research-only). Ignored in --loop mode, "
+        "which determines the session live from the schedule.",
+    )
     parser.add_argument("--status", action="store_true", help="Print a consolidated status report and exit (read-only, no lock)")
     args = parser.parse_args()
 
@@ -3239,23 +3395,29 @@ def main() -> int:
         return 1
 
     if args.loop:
+        next_boundary, next_session = _next_session_boundary(datetime.now(timezone.utc))
         logger.info(
-            "starting loop mode, interval=%ss (profit protection checked every %ss)",
-            args.interval, BREAKEVEN_POLL_SECONDS,
+            "starting loop mode, session-gated scheduling (only new_york trades; profit "
+            "protection checked every %ss) — next scheduled pass: %s (%s)",
+            BREAKEVEN_POLL_SECONDS, next_boundary.isoformat(), next_session,
         )
         # Two independent cadences share this one loop: the expensive,
-        # LLM-costly committee pass on args.interval, and the free,
-        # code-only profit protection check (breakeven + early-profit trail)
-        # on the much shorter BREAKEVEN_POLL_SECONDS -- see
-        # BREAKEVEN_POLL_SECONDS's comment for why waiting for the slow
-        # cadence to react would be wrong. A full
-        # pass fires immediately on the first tick (last_full_pass starts
-        # "due"), matching the loop's original always-run-on-start behavior.
-        last_full_pass = time.monotonic() - args.interval
+        # LLM-costly committee pass at each session boundary
+        # (_next_session_boundary), and the free, code-only profit
+        # protection check (breakeven + early-profit trail) on the much
+        # shorter BREAKEVEN_POLL_SECONDS -- see BREAKEVEN_POLL_SECONDS's
+        # comment for why waiting for the slow cadence to react would be
+        # wrong. Unlike the old fixed-interval loop, a fresh start does
+        # NOT fire an immediate pass -- deliberately: an ad-hoc pass at
+        # whatever moment the process happens to start (e.g. after a
+        # restart for a code fix) is exactly the kind of off-schedule
+        # execution this feature exists to avoid. Use `--once --session
+        # <s>` for a manual one-off pass instead.
         while True:
-            now = time.monotonic()
-            if now - last_full_pass >= args.interval:
-                last_full_pass = now
+            now_utc = datetime.now(timezone.utc)
+            if now_utc >= next_boundary:
+                session = next_session
+                next_boundary, next_session = _next_session_boundary(now_utc)
                 # XAUUSDm (and forex generally) is closed roughly Fri evening
                 # through Sun evening -- a pass during that window pays the
                 # full 4-agent committee cost for a trade that cannot
@@ -3263,20 +3425,21 @@ def main() -> int:
                 # opportunity. Checked every cycle (not slept-through-to-
                 # Monday) so it self-corrects cleanly across restarts/DST
                 # without extra scheduling logic.
-                if _in_weekend_window(datetime.now(timezone.utc)):
+                if _in_weekend_window(now_utc):
                     logger.info("weekend (UTC) — market closed, skipping this pass")
                     try:
                         _weekend_flatten_and_notify()
                     except Exception:
-                        logger.exception("weekend flatten/notify crashed; continuing after the normal interval")
+                        logger.exception("weekend flatten/notify crashed; continuing to the next scheduled pass")
                 else:
                     try:
-                        run_once()
+                        run_once(session)
                     except Exception:
                         # Defense in depth on top of run_once()'s own per-target
                         # try/except: nothing here should ever be able to kill an
                         # unattended loop that nobody is watching in real time.
-                        logger.exception("run_once() crashed; continuing after the normal interval")
+                        logger.exception("run_once() crashed; continuing to the next scheduled pass")
+                logger.info("next scheduled pass: %s (%s)", next_boundary.isoformat(), next_session)
             else:
                 try:
                     _profit_protection_check()
@@ -3284,7 +3447,7 @@ def main() -> int:
                     logger.exception("profit protection check crashed; continuing")
             time.sleep(BREAKEVEN_POLL_SECONDS)
     else:
-        run_once()
+        run_once(args.session)
     return 0
 
 

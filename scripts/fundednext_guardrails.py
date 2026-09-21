@@ -13,8 +13,7 @@ self-imposed, tighter than what FundedNext itself allows, to leave margin for
 slippage/spread/swap before the account actually breaches FundedNext's own
 rule.
 
-OPEN ITEMS — verify before relying on this at real money (see
-``C:\\Users\\Hp\\.claude\\plans\\calm-wondering-snail.md``):
+OPEN ITEMS — verify before relying on this at real money:
   1. RESOLVED 2026-09-18: server-day timezone assumed GMT+3 DST / GMT+2
      standard (Europe/Bucharest). Briefly "corrected" 2026-09-17 to plain
      UTC based on a flawed check (D1 bar timestamps compared only to

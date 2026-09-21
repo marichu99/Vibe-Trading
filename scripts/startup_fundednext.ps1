@@ -7,8 +7,7 @@
     Meant to run on its OWN machine/VPS, signed into the FundedNext MT5
     terminal (mt5fn-live-trade profile) -- NOT the same box as the Exness
     live account's startup.ps1/committee_reporter.py. See
-    scripts/fundednext_reporter.py's own docstring and
-    C:\Users\Hp\.claude\plans\calm-wondering-snail.md for the full design.
+    scripts/fundednext_reporter.py's own docstring for the full design.
 
     Before running this for the first time on a fresh VPS:
       1. Install Python 3.11 x64 and MetaTrader 5 (the desktop terminal),
@@ -71,15 +70,13 @@ if ((Test-Path $HistoryLog) -and (Get-Item $HistoryLog).Length -gt $MaxHistoryBy
     Write-StartupLog "rotated fundednext_reporter.history.log (exceeded ${MaxHistoryBytes} bytes)"
 }
 
-# WIDENED 2026-09-18 from 2h to 4h at the user's request, to cut LLM spend
-# -- deepseek-v4-pro cost $11.67 in a single day (684 requests) on an
-# account that was still flat, and this challenge has no time limit, so
-# there's no reason to run at the same cadence as the live Exness account.
-# Halving pass frequency roughly halves the frequency-driven share of
-# cost. Revisit if trade opportunities are being missed, not just to save
-# more money -- see startup.ps1's comment for why a SHORT interval is the
-# actual risk (overlapping runs), which widening only helps.
-$ReporterIntervalSeconds = 4 * 60 * 60   # 4 hours
+# DEPRECATED as a scheduling control 2026-09-21: fundednext_reporter.py's
+# --loop now fires at session boundaries (Asia/London/New York opens; only
+# the New York pass trades -- see _next_session_boundary in that file), not
+# on a fixed interval -- see startup.ps1's identical comment for the full
+# rationale (mirrored here). --interval is still accepted by the CLI
+# (backward compatibility) but otherwise ignored for scheduling.
+$ReporterIntervalSeconds = 4 * 60 * 60   # 4 hours (vestigial, see above)
 
 Start-Process -FilePath (Join-Path $Venv "python.exe") `
     -ArgumentList @(
@@ -91,6 +88,6 @@ Start-Process -FilePath (Join-Path $Venv "python.exe") `
     -WindowStyle Hidden `
     -RedirectStandardOutput (Join-Path $LogDir "fundednext_reporter.log") `
     -RedirectStandardError (Join-Path $LogDir "fundednext_reporter.err.log")
-Write-StartupLog "launched fundednext_reporter.py --loop (every ${ReporterIntervalSeconds}s)"
+Write-StartupLog "launched fundednext_reporter.py --loop (session-gated: Asia/London/New York opens, only New York trades)"
 
 Write-StartupLog "startup_fundednext.ps1 finished"
