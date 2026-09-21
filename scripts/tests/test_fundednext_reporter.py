@@ -375,3 +375,29 @@ class TestResolveFillPrice:
 
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": []})
         assert fr._resolve_fill_price(self.TRADE, {"fill_price": 0.0, "symbol": "EURUSD"}) is None
+
+    def test_matches_by_ticket_among_multiple_stacked_positions(self, monkeypatch) -> None:
+        """Real bug found by /code-review: with more than one open position on
+        this symbol, matching by symbol+magic alone returned whichever
+        position get_positions() listed first -- which can be an OLDER
+        position, not the one that was just filled. Must prefer the new
+        order's own ticket (order_id)."""
+        import src.trading.service as service
+
+        positions = [
+            {"ticket": "111", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1000},  # older
+            {"ticket": "222", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1500},  # the new fill
+        ]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        order = {"fill_price": 0.0, "symbol": "EURUSD", "order_id": "222"}
+        assert fr._resolve_fill_price(self.TRADE, order) == 1.1500
+
+    def test_falls_back_to_first_match_when_ticket_absent(self, monkeypatch) -> None:
+        """No order_id to match on -- preserves the pre-existing "first
+        same-symbol/magic match" behavior rather than returning None."""
+        import src.trading.service as service
+
+        positions = [{"ticket": "111", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1000}]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        order = {"fill_price": 0.0, "symbol": "EURUSD"}
+        assert fr._resolve_fill_price(self.TRADE, order) == 1.1000
