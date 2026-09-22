@@ -221,6 +221,29 @@ def test_unreadable_positions_fail_closed() -> None:
     assert breach.limit == "max_total_exposure_usd"
 
 
+def test_cfd_sell_does_not_bypass_exposure_cap() -> None:
+    """Real bug: gross exposure (from positions) is always >= 0, but the
+    total-exposure check used to subtract a sell's notional from it
+    unconditionally ("a sell reduces exposure"). That's only true when a
+    sell can only close an existing long (equities/spot). For margin/CFD
+    instruments (MT5) a sell routinely OPENS a new short instead, which
+    adds exposure exactly like a buy -- treating it as a reduction let a
+    short of ANY size silently bypass max_total_exposure_usd, since the
+    resulting negative post_exposure never trips the ">" comparison."""
+    intent = _intent(side="sell", notional_usd=500_000.0, instrument_type=InstrumentType.CFD)
+    mandate = _mandate(
+        allowed_instruments=(InstrumentType.CFD,),
+        account_funding_usd=1_000_000.0,
+        max_order_notional_usd=1_000_000.0,
+        max_total_exposure_usd=5000.0,
+        max_leverage=1.0,
+    )
+    breach = _check(intent, mandate)
+    assert breach is not None
+    assert breach.limit == "max_total_exposure_usd"
+    assert breach.kind == BREACH_KIND_QUANTITATIVE
+
+
 def test_universe_market_cap_floor_denies_when_below(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(enforcement, "market_cap_usd", lambda s, ac: 1.0e8)
     mandate = _mandate()

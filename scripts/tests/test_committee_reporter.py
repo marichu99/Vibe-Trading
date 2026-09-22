@@ -1562,6 +1562,34 @@ class TestResolveFillPrice:
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": []})
         assert cr._resolve_fill_price(self.TRADE, {"fill_price": 0.0, "symbol": "EURUSDm"}) is None
 
+    def test_matches_by_ticket_when_multiple_positions_share_symbol(self, monkeypatch) -> None:
+        """Real bug: with more than one OUR_MAGIC position open on this
+        symbol (e.g. max_stack > 1), a plain symbol+magic scan could return
+        an unrelated older position's price_open instead of the new fill's
+        own entry -- must match the new order's own ticket (order_id), the
+        same fix already applied to _post_trade_spec_check/
+        _post_trade_reward_risk_check."""
+        import src.trading.service as service
+
+        positions = [
+            {"ticket": "111", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.2000},  # unrelated, older
+            {"ticket": "222", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.1500},  # the new fill
+        ]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        placed_order = {"fill_price": 0.0, "symbol": "EURUSDm", "order_id": "222"}
+        assert cr._resolve_fill_price(self.TRADE, placed_order) == 1.1500
+
+    def test_returns_none_when_ticket_does_not_match_any_position(self, monkeypatch) -> None:
+        """If the new order's own ticket isn't visible yet (broker
+        propagation lag) but an unrelated position on the same symbol is,
+        this must not silently substitute the unrelated position's price."""
+        import src.trading.service as service
+
+        positions = [{"ticket": "111", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.2000}]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        placed_order = {"fill_price": 0.0, "symbol": "EURUSDm", "order_id": "222"}
+        assert cr._resolve_fill_price(self.TRADE, placed_order) is None
+
 
 class TestPostTradeRewardRiskCheck:
     """Ported 2026-09-18 -- see MIN_REWARD_RISK_RATIO's own comment for the

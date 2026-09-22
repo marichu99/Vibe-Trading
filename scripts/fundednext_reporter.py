@@ -1568,14 +1568,25 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
     except Exception:
         return None
     symbol = placed_order.get("symbol") or trade["symbol"]
+    # Match by the NEW order's own ticket (order_id) when we have one -- same
+    # bug class /code-review already fixed in _post_trade_spec_check and
+    # _post_trade_reward_risk_check (both of which call this function for
+    # "entry"): with more than one OUR_MAGIC position open on this symbol, a
+    # plain symbol+magic scan can return an UNRELATED older position's
+    # price_open as if it were this fill's price. Falls back to the old
+    # symbol+magic-only match when order_id is missing.
+    target_ticket = str(placed_order.get("order_id") or "").strip()
     for pos in positions:
-        if pos.get("symbol") == symbol and pos.get("magic") == OUR_MAGIC:
-            try:
-                open_price = float(pos.get("price_open"))
-            except (TypeError, ValueError):
-                continue
-            if open_price > 0:
-                return open_price
+        if pos.get("symbol") != symbol or pos.get("magic") != OUR_MAGIC:
+            continue
+        if target_ticket and str(pos.get("ticket")) != target_ticket:
+            continue
+        try:
+            open_price = float(pos.get("price_open"))
+        except (TypeError, ValueError):
+            continue
+        if open_price > 0:
+            return open_price
     return None
 
 
@@ -2189,10 +2200,6 @@ def main() -> int:
                 next_boundary, next_session = _next_session_boundary(now_utc)
                 if _in_weekend_window(now_utc):
                     logger.info("weekend (UTC) — market closed, skipping this pass")
-                    try:
-                        _weekend_flatten_and_notify()
-                    except Exception:
-                        logger.exception("weekend flatten/notify crashed; continuing to the next scheduled pass")
                 else:
                     try:
                         run_once(session)
@@ -2204,6 +2211,17 @@ def main() -> int:
                     _profit_protection_check()
                 except Exception:
                     logger.exception("profit protection check crashed; continuing")
+            # Checked every tick, not just at a session boundary -- see
+            # committee_reporter.py's identical loop for the full rationale
+            # (mirrored here): once every boundary for today has passed, the
+            # next one can be many hours away, leaving this call uninvoked
+            # well past WEEKEND_CUTOFF_UTC_HOUR and past when the market
+            # itself closes for the weekend. Cheap and idempotent.
+            if _in_weekend_window(now_utc):
+                try:
+                    _weekend_flatten_and_notify()
+                except Exception:
+                    logger.exception("weekend flatten/notify crashed; continuing")
             time.sleep(BREAKEVEN_POLL_SECONDS)
     else:
         run_once(args.session)

@@ -508,7 +508,13 @@ def check_mandate(
             )
 
     # 5–6. Exposure + leverage need observable positions; fail-closed on any
-    #      unparseable position. A sell reduces gross exposure (signed by side).
+    #      unparseable position. A sell reduces gross exposure (signed by
+    #      side) for instruments where a sell can only close an existing long
+    #      (equities/spot crypto). For margin/CFD instruments (MT5) a sell
+    #      routinely OPENS a new short instead -- that adds exposure exactly
+    #      like a buy does, so it must never be subtracted there, or a short
+    #      of any size silently bypasses this cap entirely (post_exposure
+    #      goes negative, which the ">" comparison below never catches).
     current_exposure = _positions_market_value(positions)
     if current_exposure is None:
         return _breach(
@@ -517,8 +523,11 @@ def check_mandate(
             limit_value=caps.max_total_exposure_usd, attempted_value=0.0,
             detail="current positions could not be read (fail-closed)",
         )
-    signed = notional if intent.side == "buy" else -notional
-    post_exposure = current_exposure + signed
+    if intent.instrument_type == InstrumentType.CFD:
+        post_exposure = current_exposure + notional
+    else:
+        signed = notional if intent.side == "buy" else -notional
+        post_exposure = current_exposure + signed
     if post_exposure > caps.max_total_exposure_usd:
         return _breach(
             broker=broker, remote_tool=remote_tool, intent=intent,

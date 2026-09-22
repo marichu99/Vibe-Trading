@@ -628,3 +628,29 @@ class TestResolveFillPrice:
 
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": []})
         assert fr._resolve_fill_price(self.TRADE, {"fill_price": 0.0, "symbol": "EURUSD"}) is None
+
+    def test_matches_by_ticket_when_multiple_positions_share_symbol(self, monkeypatch) -> None:
+        """Real bug: with more than one OUR_MAGIC position open on this
+        symbol, a plain symbol+magic scan could return an unrelated older
+        position's price_open instead of the new fill's own entry -- must
+        match the new order's own ticket (order_id)."""
+        import src.trading.service as service
+
+        positions = [
+            {"ticket": "111", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.2000},  # unrelated, older
+            {"ticket": "222", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1500},  # the new fill
+        ]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        placed_order = {"fill_price": 0.0, "symbol": "EURUSD", "order_id": "222"}
+        assert fr._resolve_fill_price(self.TRADE, placed_order) == 1.1500
+
+    def test_returns_none_when_ticket_does_not_match_any_position(self, monkeypatch) -> None:
+        """If the new order's own ticket isn't visible yet (broker
+        propagation lag) but an unrelated position on the same symbol is,
+        this must not silently substitute the unrelated position's price."""
+        import src.trading.service as service
+
+        positions = [{"ticket": "111", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.2000}]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        placed_order = {"fill_price": 0.0, "symbol": "EURUSD", "order_id": "222"}
+        assert fr._resolve_fill_price(self.TRADE, placed_order) is None
