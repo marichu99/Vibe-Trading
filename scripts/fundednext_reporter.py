@@ -2131,6 +2131,44 @@ def print_status() -> None:
     print(_build_status_report())
 
 
+@dataclass
+class _LoopTick:
+    action: str  # "weekend", "run", or "poll"
+    session: str | None
+    next_boundary: datetime
+    next_session: str
+    boundary_reached: bool
+
+
+def _compute_loop_tick(now_utc: datetime, next_boundary: datetime, next_session: str) -> _LoopTick:
+    """Decide what one --loop iteration should do at `now_utc`.
+
+    Mirrored from committee_reporter.py's identical fix: the weekend check
+    used to be nested inside `if now_utc >= next_boundary`, so it only ran
+    3x/day at session-boundary clock times, which have nothing to do with
+    WEEKEND_CUTOFF_UTC_HOUR (Fri 20:00 UTC) -- leaving a multi-hour Friday-
+    evening gap (last NY-session boundary ~13:00 UTC to the next boundary,
+    Sat 00:00 UTC Asia) where a live position could sit unflattened right
+    through the actual weekend market close. See the call site in main().
+    """
+    boundary_reached = now_utc >= next_boundary
+    session = next_session if boundary_reached else None
+    if boundary_reached:
+        next_boundary, next_session = _next_session_boundary(now_utc)
+
+    if _in_weekend_window(now_utc):
+        action = "weekend"
+    elif boundary_reached:
+        action = "run"
+    else:
+        action = "poll"
+
+    return _LoopTick(
+        action=action, session=session, next_boundary=next_boundary,
+        next_session=next_session, boundary_reached=boundary_reached,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="Run one pass over TARGETS, then exit (default)")
@@ -2184,20 +2222,22 @@ def main() -> int:
         # use `--once --session <s>` for a manual one-off pass instead.
         while True:
             now_utc = datetime.now(timezone.utc)
-            if now_utc >= next_boundary:
-                session = next_session
-                next_boundary, next_session = _next_session_boundary(now_utc)
-                if _in_weekend_window(now_utc):
+            tick = _compute_loop_tick(now_utc, next_boundary, next_session)
+            next_boundary, next_session = tick.next_boundary, tick.next_session
+
+            if tick.action == "weekend":
+                try:
+                    _weekend_flatten_and_notify()
+                except Exception:
+                    logger.exception("weekend flatten/notify crashed; continuing to the next scheduled pass")
+                if tick.boundary_reached:
                     logger.info("weekend (UTC) — market closed, skipping this pass")
-                    try:
-                        _weekend_flatten_and_notify()
-                    except Exception:
-                        logger.exception("weekend flatten/notify crashed; continuing to the next scheduled pass")
-                else:
-                    try:
-                        run_once(session)
-                    except Exception:
-                        logger.exception("run_once() crashed; continuing to the next scheduled pass")
+                    logger.info("next scheduled pass: %s (%s)", next_boundary.isoformat(), next_session)
+            elif tick.action == "run":
+                try:
+                    run_once(tick.session)
+                except Exception:
+                    logger.exception("run_once() crashed; continuing to the next scheduled pass")
                 logger.info("next scheduled pass: %s (%s)", next_boundary.isoformat(), next_session)
             else:
                 try:

@@ -1768,6 +1768,42 @@ def _profit_protection_check() -> None:
                 )
 
 
+def _live_circuit_breaker_poll() -> None:
+    """Check the equity-drawdown circuit breaker on its own fast cadence.
+
+    _live_circuit_breaker_check was originally invoked once per committee
+    pass, which used to be frequent enough (a pass roughly every couple of
+    hours) to act as the intended intraday drawdown backstop. Session-gated
+    trading (2026-09-21) cut that to a single trade-enabled (new_york) pass
+    per day -- run_committee only calls the breaker when `trade` is set,
+    and run_once only passes a real `trade` on that one daily pass. A
+    drawdown happening any time after that morning check (e.g. later the
+    same day) would go undetected until the NEXT day's check, which resets
+    the baseline to whatever equity is then and so never sees the drop that
+    already happened -- silently defeating the whole backstop. This runs
+    on the same BREAKEVEN_POLL_SECONDS cadence as _profit_protection_check
+    (pure API reads, no LLM cost) so a same-day drawdown is still caught
+    and flattened well before the next scheduled committee pass.
+    """
+    connections = {
+        spec["trade"]["connection"]
+        for spec in TARGETS
+        if spec.get("trade") and spec["trade"]["connection"] in LIVE_CONNECTIONS
+    }
+    for connection in connections:
+        try:
+            note = _live_circuit_breaker_check({"connection": connection})
+        except Exception:
+            logger.exception("circuit breaker poll crashed for %s", connection)
+            continue
+        if note and "TRIPPED" in note:
+            logger.error("live circuit breaker tripped outside a committee pass: %s", note)
+            try:
+                send_email(f"[Vibe-Trading] LIVE CIRCUIT BREAKER TRIPPED — {connection}", _status_header() + note)
+            except Exception:
+                logger.exception("failed to send circuit breaker trip email")
+
+
 @dataclass
 class CommitteeResult:
     committee: str
@@ -3365,6 +3401,48 @@ def print_status() -> None:
     print(_build_status_report())
 
 
+@dataclass
+class _LoopTick:
+    action: str  # "weekend", "run", or "poll"
+    session: str | None
+    next_boundary: datetime
+    next_session: str
+    boundary_reached: bool
+
+
+def _compute_loop_tick(now_utc: datetime, next_boundary: datetime, next_session: str) -> _LoopTick:
+    """Decide what one --loop iteration should do at `now_utc`.
+
+    Pulled out of main()'s while-True loop so the scheduling decision itself
+    is unit-testable without driving the real infinite loop (sleep, live
+    reads, etc). Two things are checked independently, not one gated behind
+    the other: whether a session boundary was just crossed (drives run_once
+    scheduling) and whether we're in the weekend window (drives the flatten-
+    before-weekend safety check) -- these used to be nested (weekend only
+    checked when a boundary was also reached), which left a multi-hour gap
+    every Friday evening between the last NY-session boundary and the next
+    (Sat 00:00 Asia) boundary where a live position could sit unflattened
+    right through the actual weekend market close. See the call site in
+    main() for the historical incident this guards against.
+    """
+    boundary_reached = now_utc >= next_boundary
+    session = next_session if boundary_reached else None
+    if boundary_reached:
+        next_boundary, next_session = _next_session_boundary(now_utc)
+
+    if _in_weekend_window(now_utc):
+        action = "weekend"
+    elif boundary_reached:
+        action = "run"
+    else:
+        action = "poll"
+
+    return _LoopTick(
+        action=action, session=session, next_boundary=next_boundary,
+        next_session=next_session, boundary_reached=boundary_reached,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="Run one pass over TARGETS, then exit (default)")
@@ -3431,30 +3509,33 @@ def main() -> int:
         # <s>` for a manual one-off pass instead.
         while True:
             now_utc = datetime.now(timezone.utc)
-            if now_utc >= next_boundary:
-                session = next_session
-                next_boundary, next_session = _next_session_boundary(now_utc)
-                # XAUUSDm (and forex generally) is closed roughly Fri evening
-                # through Sun evening -- a pass during that window pays the
-                # full 4-agent committee cost for a trade that cannot
-                # execute, with no offsetting chance of a missed
-                # opportunity. Checked every cycle (not slept-through-to-
-                # Monday) so it self-corrects cleanly across restarts/DST
-                # without extra scheduling logic.
-                if _in_weekend_window(now_utc):
+            tick = _compute_loop_tick(now_utc, next_boundary, next_session)
+            next_boundary, next_session = tick.next_boundary, tick.next_session
+
+            # Runs every tick, independent of tick.action -- see its own
+            # docstring for why a same-day drawdown must not wait for the
+            # next scheduled (once-a-day) trade-enabled pass to be caught.
+            try:
+                _live_circuit_breaker_poll()
+            except Exception:
+                logger.exception("live circuit breaker poll crashed; continuing")
+
+            if tick.action == "weekend":
+                try:
+                    _weekend_flatten_and_notify()
+                except Exception:
+                    logger.exception("weekend flatten/notify crashed; continuing to the next scheduled pass")
+                if tick.boundary_reached:
                     logger.info("weekend (UTC) — market closed, skipping this pass")
-                    try:
-                        _weekend_flatten_and_notify()
-                    except Exception:
-                        logger.exception("weekend flatten/notify crashed; continuing to the next scheduled pass")
-                else:
-                    try:
-                        run_once(session)
-                    except Exception:
-                        # Defense in depth on top of run_once()'s own per-target
-                        # try/except: nothing here should ever be able to kill an
-                        # unattended loop that nobody is watching in real time.
-                        logger.exception("run_once() crashed; continuing to the next scheduled pass")
+                    logger.info("next scheduled pass: %s (%s)", next_boundary.isoformat(), next_session)
+            elif tick.action == "run":
+                try:
+                    run_once(tick.session)
+                except Exception:
+                    # Defense in depth on top of run_once()'s own per-target
+                    # try/except: nothing here should ever be able to kill an
+                    # unattended loop that nobody is watching in real time.
+                    logger.exception("run_once() crashed; continuing to the next scheduled pass")
                 logger.info("next scheduled pass: %s (%s)", next_boundary.isoformat(), next_session)
             else:
                 try:

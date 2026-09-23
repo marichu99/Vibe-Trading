@@ -106,6 +106,48 @@ class TestNextSessionBoundary:
         assert (boundary, session) == (datetime(2026, 3, 30, 7, 0, tzinfo=timezone.utc), "london")
 
 
+# ---------------------------------------------------------------------------
+# _compute_loop_tick -- mirrored from committee_reporter.py's identical
+# regression test: the weekend flatten used to be nested inside `if
+# boundary_reached`, so it only ran 3x/day at session-boundary clock times,
+# unrelated to WEEKEND_CUTOFF_UTC_HOUR (Fri 20:00 UTC). That left a
+# multi-hour Friday-evening gap where a live FundedNext position could sit
+# unflattened right through the actual weekend market close.
+# ---------------------------------------------------------------------------
+
+
+class TestComputeLoopTick:
+    def test_friday_evening_weekend_start_with_no_boundary_reached_still_flattens(self) -> None:
+        now = datetime(2026, 9, 4, 20, 5, tzinfo=timezone.utc)
+        next_boundary = datetime(2026, 9, 5, 0, 0, tzinfo=timezone.utc)
+        tick = fr._compute_loop_tick(now, next_boundary, "asia")
+        assert tick.action == "weekend"
+        assert tick.boundary_reached is False
+        assert (tick.next_boundary, tick.next_session) == (next_boundary, "asia")
+
+    def test_weekend_and_boundary_reached_still_flattens_not_runs(self) -> None:
+        now = datetime(2026, 9, 5, 0, 0, 0, tzinfo=timezone.utc)
+        tick = fr._compute_loop_tick(now, now, "asia")
+        assert tick.action == "weekend"
+        assert tick.boundary_reached is True
+        assert tick.next_session != "asia"
+
+    def test_weekday_boundary_reached_runs(self) -> None:
+        now = datetime(2026, 9, 8, 12, 0, 1, tzinfo=timezone.utc)
+        tick = fr._compute_loop_tick(now, datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc), "new_york")
+        assert tick.action == "run"
+        assert tick.session == "new_york"
+        assert tick.boundary_reached is True
+
+    def test_weekday_boundary_not_reached_polls(self) -> None:
+        now = datetime(2026, 9, 8, 5, 0, tzinfo=timezone.utc)
+        next_boundary = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        tick = fr._compute_loop_tick(now, next_boundary, "new_york")
+        assert tick.action == "poll"
+        assert tick.session is None
+        assert (tick.next_boundary, tick.next_session) == (next_boundary, "new_york")
+
+
 class TestParseDecisionReasoning:
     def test_parses_well_formed_report(self) -> None:
         text = "Decision: long, momentum favors EURUSD\nReasoning: broke resistance on volume\nConfidence: high"

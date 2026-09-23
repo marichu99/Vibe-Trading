@@ -221,6 +221,33 @@ def test_unreadable_positions_fail_closed() -> None:
     assert breach.limit == "max_total_exposure_usd"
 
 
+def test_cfd_sell_adds_to_exposure_instead_of_reducing_it() -> None:
+    # On a leveraged CFD (MT5 forex/commodity), a "sell" opens a NEW short
+    # position -- it does not close/reduce an existing long the way a
+    # cash-equity sell does. $70 already open + an $80 CFD sell must be
+    # treated as $150 total exposure (over the $100 cap), not netted down
+    # to -$10 as if the sell were closing out the existing position.
+    mandate = _mandate(allowed_instruments=(InstrumentType.CFD,), max_total_exposure_usd=100.0)
+    mandate = Mandate(
+        schema_version=mandate.schema_version,
+        hard_caps=mandate.hard_caps,
+        universe=UniverseConstraint(
+            asset_classes=(AssetClass.FOREX,),
+            min_market_cap_usd=None,
+            min_avg_daily_volume_usd=None,
+            exclude_symbols=(),
+        ),
+        consent=mandate.consent,
+    )
+    intent = _intent(
+        symbol="EURUSD", side="sell", notional_usd=80.0,
+        instrument_type=InstrumentType.CFD, asset_class=AssetClass.FOREX,
+    )
+    breach = _check(intent, mandate, positions=[{"market_value": 70.0}])
+    assert breach is not None
+    assert breach.limit == "max_total_exposure_usd"
+
+
 def test_universe_market_cap_floor_denies_when_below(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(enforcement, "market_cap_usd", lambda s, ac: 1.0e8)
     mandate = _mandate()
