@@ -130,6 +130,52 @@ class TestNextSessionBoundary:
 
 
 # ---------------------------------------------------------------------------
+# _compute_loop_tick -- regression: weekend flatten used to be nested inside
+# `if boundary_reached`, so it only ran 3x/day at session-boundary clock
+# times, which have nothing to do with WEEKEND_CUTOFF_UTC_HOUR (Fri 20:00
+# UTC). That left a multi-hour Friday-evening gap (last NY boundary ~13:00
+# UTC to the next boundary, Sat 00:00 UTC) where a live position would sit
+# unflattened right through the actual weekend market close.
+# ---------------------------------------------------------------------------
+
+
+class TestComputeLoopTick:
+    def test_friday_evening_weekend_start_with_no_boundary_reached_still_flattens(self) -> None:
+        # Friday 20:05 UTC: just past WEEKEND_CUTOFF_UTC_HOUR, but nowhere
+        # near the next session boundary (Sat 00:00 Asia open) -- this is
+        # exactly the gap the old nested check missed.
+        now = datetime(2026, 9, 4, 20, 5, tzinfo=timezone.utc)
+        next_boundary = datetime(2026, 9, 5, 0, 0, tzinfo=timezone.utc)
+        tick = cr._compute_loop_tick(now, next_boundary, "asia")
+        assert tick.action == "weekend"
+        assert tick.boundary_reached is False
+        # Not reached yet -- the schedule tracker must be left untouched.
+        assert (tick.next_boundary, tick.next_session) == (next_boundary, "asia")
+
+    def test_weekend_and_boundary_reached_still_flattens_not_runs(self) -> None:
+        now = datetime(2026, 9, 5, 0, 0, 0, tzinfo=timezone.utc)  # Sat 00:00, Asia boundary
+        tick = cr._compute_loop_tick(now, now, "asia")
+        assert tick.action == "weekend"
+        assert tick.boundary_reached is True
+        assert tick.next_session != "asia"  # rolled forward, not repeated
+
+    def test_weekday_boundary_reached_runs(self) -> None:
+        now = datetime(2026, 9, 8, 12, 0, 1, tzinfo=timezone.utc)  # Tue, just past NY open
+        tick = cr._compute_loop_tick(now, datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc), "new_york")
+        assert tick.action == "run"
+        assert tick.session == "new_york"
+        assert tick.boundary_reached is True
+
+    def test_weekday_boundary_not_reached_polls(self) -> None:
+        now = datetime(2026, 9, 8, 5, 0, tzinfo=timezone.utc)  # Tue, between london/new_york
+        next_boundary = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        tick = cr._compute_loop_tick(now, next_boundary, "new_york")
+        assert tick.action == "poll"
+        assert tick.session is None
+        assert (tick.next_boundary, tick.next_session) == (next_boundary, "new_york")
+
+
+# ---------------------------------------------------------------------------
 # Session bias carry-over: Asia/London (research-only) passes' Decision/
 # Reasoning get recorded and read back into the New York (trading) pass's
 # prompt instead of being thrown away.
@@ -1446,6 +1492,73 @@ class TestLiveCircuitBreakerCheck:
         assert calls["trip"] == []
         saved = json.loads((tmp_path / "live_baseline.json").read_text(encoding="utf-8"))
         assert saved["equity"] == 100.0
+
+
+class TestLiveCircuitBreakerPoll:
+    """Regression: session-gated trading now runs the committee (and thus
+    _live_circuit_breaker_check, previously the only caller) only ~once/day
+    on the new_york pass, so a same-day drawdown after that check would go
+    undetected until the next day's check resets the baseline and loses it.
+    _live_circuit_breaker_poll runs the same breaker on the fast
+    BREAKEVEN_POLL_SECONDS cadence independent of the committee schedule."""
+
+    def test_checks_each_unique_live_connection_once_and_skips_demo(self, monkeypatch) -> None:
+        targets = [
+            {"committee": "x", "target": "EURUSD", "market": "forex",
+             "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade"}},
+            {"committee": "x", "target": "AUDUSD", "market": "forex",
+             "trade": {"symbol": "AUDUSDm", "connection": "mt5-live-trade"}},
+            {"committee": "x", "target": "DEMO", "market": "forex",
+             "trade": {"symbol": "EURUSDm", "connection": "mt5-demo-trade"}},
+        ]
+        monkeypatch.setattr(cr, "TARGETS", targets)
+        checked = []
+        monkeypatch.setattr(cr, "_live_circuit_breaker_check", lambda trade: checked.append(trade["connection"]) or None)
+        monkeypatch.setattr(cr, "send_email", lambda *a, **k: pytest.fail("should not email when nothing tripped"))
+
+        cr._live_circuit_breaker_poll()
+
+        assert checked == ["mt5-live-trade"]  # one call, demo connection never checked
+
+    def test_emails_on_a_fresh_trip(self, monkeypatch) -> None:
+        targets = [{"committee": "x", "target": "EURUSD", "market": "forex",
+                    "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade"}}]
+        monkeypatch.setattr(cr, "TARGETS", targets)
+        monkeypatch.setattr(
+            cr, "_live_circuit_breaker_check",
+            lambda trade: "[LIVE CIRCUIT BREAKER TRIPPED] daily equity drawdown 75%",
+        )
+        emails = []
+        monkeypatch.setattr(cr, "send_email", lambda subject, body, **kwargs: emails.append((subject, body)))
+
+        cr._live_circuit_breaker_poll()
+
+        assert len(emails) == 1
+        assert "TRIPPED" in emails[0][0]
+
+    def test_does_not_email_for_an_already_halted_no_op(self, monkeypatch) -> None:
+        targets = [{"committee": "x", "target": "EURUSD", "market": "forex",
+                    "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade"}}]
+        monkeypatch.setattr(cr, "TARGETS", targets)
+        monkeypatch.setattr(
+            cr, "_live_circuit_breaker_check",
+            lambda trade: "[LIVE CIRCUIT BREAKER] mt5 live trading is currently HALTED (kill switch already tripped)",
+        )
+        monkeypatch.setattr(cr, "send_email", lambda *a, **k: pytest.fail("should not email for an already-halted no-op"))
+
+        cr._live_circuit_breaker_poll()  # must not raise, must not email
+
+    def test_a_crashing_check_does_not_propagate(self, monkeypatch) -> None:
+        targets = [{"committee": "x", "target": "EURUSD", "market": "forex",
+                    "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade"}}]
+        monkeypatch.setattr(cr, "TARGETS", targets)
+
+        def _boom(trade):
+            raise RuntimeError("broker read failed")
+
+        monkeypatch.setattr(cr, "_live_circuit_breaker_check", _boom)
+
+        cr._live_circuit_breaker_poll()  # must not raise
 
 
 class TestPostTradeSpecCheck:
