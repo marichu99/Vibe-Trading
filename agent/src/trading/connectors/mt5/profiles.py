@@ -74,7 +74,18 @@ MT5_PROFILES: tuple[TradingProfile, ...] = (
         transport="broker_sdk",
         capabilities=READ_CAPABILITIES + ("orders.place",),
         readonly=False,
-        config={"profile": "live-trade"},
+        config={
+            "profile": "live-trade",
+            # Pinned 2026-09-24: with no terminal_path, MetaTrader5.initialize()
+            # attaches to whichever terminal the library picks by default, and
+            # once the FundedNext terminal (mt5fn-live-trade below) was running
+            # on the same machine, that became the FundedNext one after a
+            # reboot -- this profile read FundedNext's account (login 14243509)
+            # and wrote its $5,947 equity into logs/live_baseline.json as the
+            # Exness baseline. Pinning the Exness install makes the routing
+            # explicit on both sides.
+            "terminal_path": r"C:\Program Files\ExnessKE MT5 Terminal\terminal64.exe",
+        },
         notes=(
             "Places REAL orders against whatever account is signed into your local "
             "MT5 terminal. Refuses to trade if that account is a demo account. "
