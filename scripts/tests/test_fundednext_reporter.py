@@ -723,3 +723,51 @@ class TestExclusiveGroupConflict:
         assert [t["trade"]["symbol"] for t in fr.TARGETS] == ["EURUSD", "GBPUSD"]
         gbp = next(t["trade"] for t in fr.TARGETS if t["trade"]["symbol"] == "GBPUSD")
         assert gbp["lots"] == 0.30 and gbp["max_stack"] == 1
+
+
+class TestRunOnceSkipsOnCorrelationConflict:
+    def _patch(self, monkeypatch, open_by_symbol: dict):
+        calls, sent = [], []
+        monkeypatch.setattr(
+            fr, "TARGETS",
+            [
+                {"committee": "investment_committee", "target": "EURUSD", "market": "forex",
+                 "trade": {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}},
+                {"committee": "investment_committee", "target": "GBPUSD", "market": "forex",
+                 "trade": {"symbol": "GBPUSD", "connection": "mt5fn-live-trade", "lots": 0.30, "max_stack": 1}},
+            ],
+        )
+        monkeypatch.setattr(
+            fr, "_symbol_position_summary",
+            lambda symbol, connection: open_by_symbol.get(symbol, {"count": 0, "side": None}),
+        )
+        monkeypatch.setattr(fr, "is_reportable", lambda result: False)
+        monkeypatch.setattr(fr, "_status_header", lambda: "")
+        monkeypatch.setattr(fr, "send_email", lambda subject, text, **kw: sent.append((subject, text)))
+
+        def _fake_run_committee(**kwargs):
+            calls.append(kwargs["target"])
+            return fr.CommitteeResult(
+                committee=kwargs["committee"], target=kwargs["target"], market=kwargs["market"],
+                status="success", run_id="r1", report_text="", traded=False,
+            )
+
+        monkeypatch.setattr(fr, "run_committee", _fake_run_committee)
+        return calls, sent
+
+    def test_gbpusd_committee_skipped_while_eurusd_open(self, monkeypatch) -> None:
+        calls, sent = self._patch(monkeypatch, {"EURUSD": {"count": 1, "side": "sell"}})
+
+        fr.run_once("new_york")
+
+        assert calls == ["EURUSD"]
+        assert len(sent) == 1 and sent[0][0].endswith("GBPUSD (SKIPPED)")
+        assert "EURUSD" in sent[0][1]
+
+    def test_both_run_when_nothing_open(self, monkeypatch) -> None:
+        calls, sent = self._patch(monkeypatch, {})
+
+        fr.run_once("new_york")
+
+        assert calls == ["EURUSD", "GBPUSD"]
+        assert sent == []

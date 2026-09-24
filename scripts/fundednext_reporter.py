@@ -1842,7 +1842,7 @@ def _format_body(result: CommitteeResult) -> str:
     )
 
 
-_TAG_COLORS = {"TRADED": "#2e7d32", "OK": "#555555", "ERROR": "#c62828", "TIMEOUT": "#c62828", "CRASHED": "#c62828"}
+_TAG_COLORS = {"TRADED": "#2e7d32", "OK": "#555555", "SKIPPED": "#888888", "ERROR": "#c62828", "TIMEOUT": "#c62828", "CRASHED": "#c62828"}
 _EMAIL_FONT = "font-family:Arial,Helvetica,sans-serif;"
 
 
@@ -1947,6 +1947,25 @@ def run_once(session: str = "new_york") -> None:
     for spec in TARGETS:
         target = spec.get("target", "?")
         effective_spec = spec if trade_enabled else {**spec, "trade": None}
+        # Skip the committee outright (not research-only) while a correlated
+        # EXCLUSIVE_SYMBOL_GROUP partner is open (2026-09-24, user's call):
+        # the pass couldn't trade anyway, and a research-only report on it
+        # feeds nothing downstream (NY reports aren't recorded as session
+        # bias), so it was ~$0.80 for an email only. A one-line email keeps
+        # the day's report from going silent. run_committee's own
+        # _exclusive_group_conflict check stays as defense in depth.
+        if trade_enabled and spec.get("trade"):
+            conflict = _exclusive_group_conflict(spec["trade"])
+            if conflict:
+                logger.info("skipping %s committee: %s", target, conflict)
+                try:
+                    send_email(
+                        f"[FundedNext] {session}: {spec.get('committee', '?')} — {target} (SKIPPED)",
+                        _status_header() + conflict + " Committee not run (no LLM cost).",
+                    )
+                except Exception:
+                    logger.exception("failed to send skip notice for %s", target)
+                continue
         try:
             result = run_committee(**effective_spec)
         except Exception:
