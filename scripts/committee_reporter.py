@@ -119,35 +119,42 @@ TARGETS: list[dict[str, object]] = [
             "early_profit_trigger_usd": 1.00,
         },
     },
-    {
-        # LIVE — added 2026-09-04 at the user's request, as a genuine
-        # diversifier alongside EURUSD rather than a third same-bet pair.
-        # Checked real 60-day daily-return correlation against EURUSDm before
-        # adding: AUDUSD 0.61 (best of the USD-quoted candidates) vs. GBPUSD
-        # 0.83 and NZDUSD 0.76 (too correlated — mostly doubling the same
-        # EUR-bloc-vs-USD bet, not real diversification). USDCAD/USDJPY were
-        # more negatively correlated (-0.69 / -0.52) but were NOT added: MT5
-        # contract_size() returns raw units, so _max_stop_distance's
-        # MAX_LOSS_PER_ORDER_USD / (contract_size * lots) formula is only
-        # correct in USD terms when the QUOTE currency is USD (true for
-        # AUDUSD/EURUSD/GBPUSD, false for USDCAD/USDJPY where the quote
-        # currency is CAD/JPY) — using those today would silently mis-price
-        # the dollar risk cap without an added currency-conversion step.
-        # Verified read-only before enabling: AUDUSDm contract_size=100000,
-        # 15m-ATR stop floor ~$0.54 at 0.01 lots — comfortably inside the $4
-        # cap (see MAX_LOSS_PER_ORDER_USD above). max_stack=1: same
-        # no-pyramiding policy as the other live targets.
-        #
-        # early_profit_trigger_usd: same 2026-09-09 fix as EURUSDm above,
-        # same reasoning — $0.75 is ~1.4x this pair's own $0.54 ATR-floor
-        # figure verified above (the module default's ~80-pip requirement is
-        # unreachable at 0.01 lots).
-        "committee": "investment_committee", "target": "AUDUSD", "market": "forex",
-        "trade": {
-            "symbol": "AUDUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
-            "early_profit_trigger_usd": 0.75,
-        },
-    },
+    # PAUSED 2026-09-24 at the user's request, purely to halve LLM spend:
+    # each committee pass (lead + bull/bear/risk-officer sub-agents) costs
+    # ~$0.80 on OpenRouter, ~$3.20/NY day across both bots' two pairs, vs.
+    # this account's total trading P&L of +$2.41 to date. Kept EURUSD
+    # because it is where all of this account's profit came from (15 trades,
+    # +$11.33, 12W/3L) while AUDUSD was net negative (13 trades, -$1.69).
+    # No mandate change needed to re-enable -- just uncomment this block.
+    # {
+    #     # LIVE — added 2026-09-04 at the user's request, as a genuine
+    #     # diversifier alongside EURUSD rather than a third same-bet pair.
+    #     # Checked real 60-day daily-return correlation against EURUSDm before
+    #     # adding: AUDUSD 0.61 (best of the USD-quoted candidates) vs. GBPUSD
+    #     # 0.83 and NZDUSD 0.76 (too correlated — mostly doubling the same
+    #     # EUR-bloc-vs-USD bet, not real diversification). USDCAD/USDJPY were
+    #     # more negatively correlated (-0.69 / -0.52) but were NOT added: MT5
+    #     # contract_size() returns raw units, so _max_stop_distance's
+    #     # MAX_LOSS_PER_ORDER_USD / (contract_size * lots) formula is only
+    #     # correct in USD terms when the QUOTE currency is USD (true for
+    #     # AUDUSD/EURUSD/GBPUSD, false for USDCAD/USDJPY where the quote
+    #     # currency is CAD/JPY) — using those today would silently mis-price
+    #     # the dollar risk cap without an added currency-conversion step.
+    #     # Verified read-only before enabling: AUDUSDm contract_size=100000,
+    #     # 15m-ATR stop floor ~$0.54 at 0.01 lots — comfortably inside the $4
+    #     # cap (see MAX_LOSS_PER_ORDER_USD above). max_stack=1: same
+    #     # no-pyramiding policy as the other live targets.
+    #     #
+    #     # early_profit_trigger_usd: same 2026-09-09 fix as EURUSDm above,
+    #     # same reasoning — $0.75 is ~1.4x this pair's own $0.54 ATR-floor
+    #     # figure verified above (the module default's ~80-pip requirement is
+    #     # unreachable at 0.01 lots).
+    #     "committee": "investment_committee", "target": "AUDUSD", "market": "forex",
+    #     "trade": {
+    #         "symbol": "AUDUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
+    #         "early_profit_trigger_usd": 0.75,
+    #     },
+    # },
     # Re-enabled 2026-09-08, at the user's request — the milestone reminder
     # (_check_silver_milestone) had been firing every pass since equity first
     # crossed $100, and the original 2026-09-01 pause rationale (a clean,

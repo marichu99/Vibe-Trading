@@ -126,13 +126,20 @@ TARGETS: list[dict[str, object]] = [
             "early_profit_trigger_usd": 24.00,
         },
     },
-    {
-        "committee": "investment_committee", "target": "AUDUSD", "market": "forex",
-        "trade": {
-            "symbol": "AUDUSD", "connection": "mt5fn-live-trade", "lots": 0.33, "max_stack": 1,
-            "early_profit_trigger_usd": 24.75,
-        },
-    },
+    # PAUSED 2026-09-24 at the user's request, purely to halve LLM spend --
+    # mirrored from committee_reporter.py's identical pause (see its comment).
+    # Note this account's OWN history does not favor EURUSD the way the
+    # Exness account's does (EURUSD -$33.36 over 3 trades, AUDUSD -$2.23
+    # over 1 as of the pause) -- far too few trades to pick a pair on, so
+    # the pair choice here follows the Exness evidence, not this account's.
+    # Just uncomment this block to re-enable.
+    # {
+    #     "committee": "investment_committee", "target": "AUDUSD", "market": "forex",
+    #     "trade": {
+    #         "symbol": "AUDUSD", "connection": "mt5fn-live-trade", "lots": 0.33, "max_stack": 1,
+    #         "early_profit_trigger_usd": 24.75,
+    #     },
+    # },
     # PAUSED 2026-09-18 at the user's request, purely to cut LLM spend while
     # EURUSD/AUDUSD alone prove out today's fixes (terminal-routing,
     # reward:risk enforcement, spec-check, fill-price fallback) -- NOT
