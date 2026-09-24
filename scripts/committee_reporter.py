@@ -119,6 +119,25 @@ TARGETS: list[dict[str, object]] = [
             "early_profit_trigger_usd": 1.00,
         },
     },
+    {
+        # LIVE — added 2026-09-24 at the user's request, mirroring the
+        # FundedNext bot's EURUSD/GBPUSD setup: paired with EURUSDm in
+        # EXCLUSIVE_SYMBOL_GROUP below, so at most one of the two is ever
+        # open (0.84 correlation -- both open is one doubled USD bet).
+        # Live-verified before enabling: USD-quoted (so _max_stop_distance's
+        # USD math holds), contract_size 100,000, 15m-ATR stop floor ~0.00076
+        # -> ~$0.76 risk at 0.01 lots vs. the $4 cap; ~$1,320 notional vs.
+        # the mandate's $6,000 -- no mandate change needed ("forex" already
+        # authorized). Note Exness's GBPUSDm spread (~1 pip) is ~13% of that
+        # stop floor vs. ~7% for EURUSDm -- tradable, but a real cost gap.
+        # early_profit_trigger_usd $1.00 = 10 pips at 0.01 lots, the same
+        # arming distance as EURUSDm's.
+        "committee": "investment_committee", "target": "GBPUSD", "market": "forex",
+        "trade": {
+            "symbol": "GBPUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
+            "early_profit_trigger_usd": 1.00,
+        },
+    },
     # PAUSED 2026-09-24 at the user's request, purely to halve LLM spend:
     # each committee pass (lead + bull/bear/risk-officer sub-agents) costs
     # ~$0.80 on OpenRouter, ~$3.20/NY day across both bots' two pairs, vs.
@@ -216,6 +235,13 @@ TARGETS: list[dict[str, object]] = [
     # },
     # {"committee": "risk_committee", "target": "XAUUSD", "market": "commodity/forex"},
 ]
+
+# Symbols of which at most one may hold an open position at a time
+# (2026-09-24, added with GBPUSDm; mirrors fundednext_reporter.py's
+# EXCLUSIVE_SYMBOL_GROUP). While one is open, run_once skips the other's
+# committee entirely (no LLM cost) and sends a one-line (SKIPPED) email;
+# run_committee also falls back to research-only as defense in depth.
+EXCLUSIVE_SYMBOL_GROUP = frozenset({"EURUSDm", "GBPUSDm"})
 
 # This caps the WRAPPING agent's own loop (run_swarm once, check positions,
 # maybe place an order, write the report) — a handful of iterations is
@@ -2031,6 +2057,32 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
     )
 
 
+def _exclusive_group_conflict(trade: dict) -> str | None:
+    """Return a skip/research-only note if another EXCLUSIVE_SYMBOL_GROUP symbol is open, else None.
+
+    Fails closed: if positions can't be read, the pass does not trade
+    rather than risk opening a second correlated position blind.
+    """
+    symbol = trade["symbol"]
+    if symbol not in EXCLUSIVE_SYMBOL_GROUP:
+        return None
+    for other in sorted(EXCLUSIVE_SYMBOL_GROUP - {symbol}):
+        try:
+            summary = _symbol_position_summary(other, trade["connection"])
+        except Exception as exc:
+            return (
+                f"[CORRELATION LIMIT] {symbol} not traded this pass: could not read open "
+                f"{other} positions ({exc}), and {symbol}/{other} may not both be open."
+            )
+        if summary["count"] > 0:
+            return (
+                f"[CORRELATION LIMIT] {symbol} not traded this pass: a {summary['side']} {other} "
+                f"position is already open, and {symbol}/{other} (highly correlated) may not "
+                f"both be open at once."
+            )
+    return None
+
+
 def run_committee(committee: str, target: str, market: str, trade: dict | None = None) -> CommitteeResult:
     """Run one committee preset against one target as an isolated subprocess.
 
@@ -2044,6 +2096,13 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         if breaker_note:
             logger.warning("live circuit breaker for %s: %s", target, breaker_note)
             trade = None  # fall back to a research-only run this pass
+
+    if trade:
+        conflict = _exclusive_group_conflict(trade)
+        if conflict:
+            breaker_note = conflict
+            logger.warning("correlation limit for %s: %s", target, conflict)
+            trade = None
 
     prompt = _build_prompt(committee, target, market, trade)
     logger.info("running %s on %s (%s)%s", committee, target, market, " [trade-enabled]" if trade else "")
@@ -2562,7 +2621,7 @@ def _format_body(result: CommitteeResult) -> str:
 # output is untrusted content, never allowed to inject markup into the email.
 # --------------------------------------------------------------------------- #
 
-_TAG_COLORS = {"TRADED": "#2e7d32", "OK": "#555555", "ERROR": "#c62828", "TIMEOUT": "#c62828", "CRASHED": "#c62828"}
+_TAG_COLORS = {"TRADED": "#2e7d32", "OK": "#555555", "SKIPPED": "#888888", "ERROR": "#c62828", "TIMEOUT": "#c62828", "CRASHED": "#c62828"}
 _EMAIL_FONT = "font-family:Arial,Helvetica,sans-serif;"
 
 
@@ -3206,6 +3265,23 @@ def run_once(session: str = "new_york") -> None:
         # Never mutate the module-level TARGETS list -- a fresh dict per
         # pass, trade forced to None on research-only sessions.
         effective_spec = spec if trade_enabled else {**spec, "trade": None}
+        # Skip the committee outright while a correlated EXCLUSIVE_SYMBOL_GROUP
+        # partner is open (2026-09-24, user's call) -- the pass couldn't
+        # trade anyway and its report feeds nothing downstream, so running
+        # it was ~$0.80 for an email. A one-line email keeps the day's
+        # report from going silent.
+        if trade_enabled and spec.get("trade"):
+            conflict = _exclusive_group_conflict(spec["trade"])
+            if conflict:
+                logger.info("skipping %s committee: %s", target, conflict)
+                try:
+                    send_email(
+                        f"[Vibe-Trading] {session}: {spec.get('committee', '?')} — {target} (SKIPPED)",
+                        _status_header() + conflict + " Committee not run (no LLM cost).",
+                    )
+                except Exception:
+                    logger.exception("failed to send skip notice for %s", target)
+                continue
         try:
             result = run_committee(**effective_spec)
         except Exception:

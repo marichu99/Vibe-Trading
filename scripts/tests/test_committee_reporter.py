@@ -212,6 +212,7 @@ class TestRunOnceSessionGating:
         monkeypatch.setattr(cr, "_check_llm_balance_alert", lambda: None)
         monkeypatch.setattr(cr, "_log_cap_gap", lambda: None)
         monkeypatch.setattr(cr, "is_reportable", lambda result: False)
+        monkeypatch.setattr(cr, "_symbol_position_summary", lambda symbol, connection: {"count": 0, "side": None})
         monkeypatch.setattr(
             cr, "TARGETS",
             [{
@@ -1747,3 +1748,77 @@ class TestLlmBalanceAlert:
         monkeypatch.setattr(cr, "_fetch_json_or_none", lambda url, key: None)
 
         assert cr._openrouter_balance_usd() is None
+
+
+class TestExclusiveGroup:
+    def _patch(self, monkeypatch, open_by_symbol: dict):
+        calls, sent = [], []
+        for name in ("_check_trade_drought", "_check_cap_fit_alert", "_check_llm_balance_alert", "_log_cap_gap"):
+            monkeypatch.setattr(cr, name, lambda: None)
+        monkeypatch.setattr(
+            cr, "TARGETS",
+            [
+                {"committee": "investment_committee", "target": "EURUSD", "market": "forex",
+                 "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}},
+                {"committee": "investment_committee", "target": "GBPUSD", "market": "forex",
+                 "trade": {"symbol": "GBPUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}},
+            ],
+        )
+        monkeypatch.setattr(
+            cr, "_symbol_position_summary",
+            lambda symbol, connection: open_by_symbol.get(symbol, {"count": 0, "side": None}),
+        )
+        monkeypatch.setattr(cr, "is_reportable", lambda result: False)
+        monkeypatch.setattr(cr, "_status_header", lambda: "")
+        monkeypatch.setattr(cr, "send_email", lambda subject, text, **kw: sent.append((subject, text)))
+
+        def _fake_run_committee(**kwargs):
+            calls.append(kwargs["target"])
+            return cr.CommitteeResult(
+                committee=kwargs["committee"], target=kwargs["target"], market=kwargs["market"],
+                status="success", run_id="r1", report_text="", traded=False,
+            )
+
+        monkeypatch.setattr(cr, "run_committee", _fake_run_committee)
+        return calls, sent
+
+    def test_gbpusd_skipped_while_eurusd_open(self, monkeypatch) -> None:
+        calls, sent = self._patch(monkeypatch, {"EURUSDm": {"count": 1, "side": "buy"}})
+
+        cr.run_once("new_york")
+
+        assert calls == ["EURUSD"]
+        assert len(sent) == 1 and sent[0][0].endswith("GBPUSD (SKIPPED)") and "EURUSDm" in sent[0][1]
+
+    def test_eurusd_skipped_while_gbpusd_open(self, monkeypatch) -> None:
+        calls, sent = self._patch(monkeypatch, {"GBPUSDm": {"count": 1, "side": "sell"}})
+
+        cr.run_once("new_york")
+
+        assert calls == ["GBPUSD"]
+        assert sent[0][0].endswith("EURUSD (SKIPPED)")
+
+    def test_both_run_when_nothing_open(self, monkeypatch) -> None:
+        calls, sent = self._patch(monkeypatch, {})
+
+        cr.run_once("new_york")
+
+        assert calls == ["EURUSD", "GBPUSD"]
+        assert sent == []
+
+    def test_fails_closed_when_positions_unreadable(self, monkeypatch) -> None:
+        def _boom(symbol, connection):
+            raise RuntimeError("terminal not connected")
+        monkeypatch.setattr(cr, "_symbol_position_summary", _boom)
+
+        note = cr._exclusive_group_conflict({"symbol": "GBPUSDm", "connection": "mt5-live-trade"})
+
+        assert note is not None and "could not read" in note
+
+    def test_symbol_outside_group_is_never_blocked(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_symbol_position_summary", lambda symbol, connection: {"count": 1, "side": "buy"})
+
+        assert cr._exclusive_group_conflict({"symbol": "XAUUSDm", "connection": "mt5-live-trade"}) is None
+
+    def test_live_targets_are_eurusd_and_gbpusd(self) -> None:
+        assert [t["trade"]["symbol"] for t in cr.TARGETS] == ["EURUSDm", "GBPUSDm"]
