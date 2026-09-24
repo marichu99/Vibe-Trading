@@ -452,6 +452,17 @@ WEEKEND_STATE_PATH = REPO_ROOT / "logs" / "weekend_state.json"
 # NY pass instead of being thrown away.
 SESSION_BIAS_STATE_PATH = REPO_ROOT / "logs" / "session_bias_state.json"
 
+# Research-only (Asia/London) passes switched off 2026-09-24 to cut LLM cost:
+# they ran the full paid committee 2x/day per symbol but can never trade, and
+# their carry-over into the NY prompt (_record_session_bias) had never
+# actually produced a session_bias_state.json since the feature shipped on
+# 2026-09-21 -- so they were pure spend (~2/3 of all LLM calls) against a
+# live account whose total trading P&L to date (+$2.41) was a fraction of
+# the ~$20 LLM bill. run_once still fires at those boundaries so the
+# drought/cap-fit/balance alerts keep their 3x/day cadence; it just returns
+# before any committee runs. Flip to True to bring them back.
+RESEARCH_PASSES_ENABLED = False
+
 # Breakeven-stop management ("dual take-profit, Option A"): 0.01 lots is
 # XAUUSDm's broker-enforced minimum AND step size (confirmed live via
 # symbol_info — volume_min = volume_step = 0.01), so a position at that size
@@ -2886,38 +2897,69 @@ def _deepseek_balance_usd() -> float | None:
     """Read the DeepSeek platform account's USD balance, or None if unavailable.
 
     Direct call to DeepSeek's own billing endpoint (not the OpenAI-compatible
-    chat completions API) — stdlib ``urllib`` only, no new dependency. A
-    no-op for any other provider (LANGCHAIN_PROVIDER != "deepseek"). Fails
+    chat completions API) — stdlib ``urllib`` only, no new dependency. Fails
     open (returns None) on any network/parse error — this is purely an
     advisory alert and must never block or slow down a pass.
     """
-    if os.environ.get("LANGCHAIN_PROVIDER", "").strip().lower() != "deepseek":
-        return None
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         return None
-
-    import urllib.error
-    import urllib.request
-
-    req = urllib.request.Request(
-        "https://api.deepseek.com/user/balance",
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError):
+    payload = _fetch_json_or_none("https://api.deepseek.com/user/balance", api_key)
+    if payload is None:
         return None
-
     try:
         usd_info = next(
             (b for b in (payload.get("balance_infos") or []) if b.get("currency") == "USD"),
             None,
         )
         return float(usd_info["total_balance"]) if usd_info else None
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return None
+
+
+def _openrouter_balance_usd() -> float | None:
+    """Read the OpenRouter account's remaining USD credit, or None if unavailable.
+
+    Added 2026-09-24 after a real incident: both bots moved from DeepSeek to
+    OpenRouter on 2026-09-18, but this alert still only checked DeepSeek --
+    so OpenRouter ran down to $0.11 and every pass from 2026-09-23 10:03
+    failed with 402 "requires more credits" with no warning. /credits
+    returns account-wide totals (purchased minus used), which is what
+    actually runs out; a per-key "limit" is not set on this account.
+    Fails open exactly like _deepseek_balance_usd.
+    """
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return None
+    payload = _fetch_json_or_none("https://openrouter.ai/api/v1/credits", api_key)
+    if payload is None:
+        return None
+    try:
+        data = payload["data"]
+        return float(data["total_credits"]) - float(data["total_usage"])
     except (TypeError, ValueError, KeyError):
         return None
+
+
+def _fetch_json_or_none(url: str, api_key: str) -> dict | None:
+    """GET url with a bearer token and return the decoded JSON, or None on any failure."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError):
+        return None
+
+
+# Provider name (as set in LANGCHAIN_PROVIDER) -> (display name, balance reader).
+# Any provider not listed here is simply not monitored.
+_LLM_BALANCE_READERS = {
+    "deepseek": ("DeepSeek", _deepseek_balance_usd),
+    "openrouter": ("OpenRouter", _openrouter_balance_usd),
+}
 
 
 def _check_llm_balance_alert() -> None:
@@ -2929,34 +2971,39 @@ def _check_llm_balance_alert() -> None:
     _check_cap_fit_alert: fires once on the pass balance first drops below
     LLM_BALANCE_ALERT_THRESHOLD_USD, clears once it recovers above it, so a
     top-up followed by another dip alerts again rather than firing only
-    once ever. Pure read-only balance check; fails open (skips silently) if
-    the balance can't be read.
+    once ever. The "alerted" flag is tied to the provider it was set for, so
+    switching providers re-arms it instead of inheriting a stale flag (the
+    DeepSeek-era {"alerted": true} would otherwise have muted OpenRouter's
+    first alert). Pure read-only balance check; fails open (skips silently)
+    if the balance can't be read.
     """
-    balance = _deepseek_balance_usd()
+    provider = os.environ.get("LANGCHAIN_PROVIDER", "").strip().lower()
+    reader = _LLM_BALANCE_READERS.get(provider)
+    if reader is None:
+        return
+    display_name, read_balance = reader
+    balance = read_balance()
     if balance is None:
         return
 
     state = _read_llm_balance_alert_state()
-    already_alerted = state.get("alerted") is True
+    already_alerted = state.get("alerted") is True and state.get("provider") == provider
     below = balance < LLM_BALANCE_ALERT_THRESHOLD_USD
 
     if below and not already_alerted:
         try:
             text = (
-                f"DeepSeek account balance is ${balance:.2f}, below the "
-                f"${LLM_BALANCE_ALERT_THRESHOLD_USD:.2f} alert threshold. Once it hits $0, every "
-                f"committee pass fails outright (402 Insufficient Balance) with no trade decision "
-                f"made and no position monitoring for that pass — top up soon to avoid a silent "
-                f"gap in live coverage."
+                f"{display_name} account balance is ${balance:.2f}, below the "
+                f"${LLM_BALANCE_ALERT_THRESHOLD_USD:.2f} alert threshold. Once it runs out, every "
+                f"committee pass on BOTH bots fails outright (402) with no trade decision "
+                f"made — top up soon to avoid a silent gap in live coverage."
             )
-            send_email(f"[Vibe-Trading] LOW BALANCE — DeepSeek ${balance:.2f}", text)
-            state["alerted"] = True
-            _write_llm_balance_alert_state(state)
+            send_email(f"[Vibe-Trading] LOW BALANCE — {display_name} ${balance:.2f}", text)
+            _write_llm_balance_alert_state({"alerted": True, "provider": provider})
         except Exception:
             logger.exception("failed to send LLM balance alert email")
-    elif not below and already_alerted:
-        state["alerted"] = False
-        _write_llm_balance_alert_state(state)
+    elif not below and state.get("alerted") is True:
+        _write_llm_balance_alert_state({"alerted": False, "provider": provider})
 
 
 def _read_cap_fit_alert_state() -> dict:
@@ -3144,6 +3191,9 @@ def run_once(session: str = "new_york") -> None:
     _check_llm_balance_alert()
     _log_cap_gap()
     trade_enabled = session == "new_york"
+    if not trade_enabled and not RESEARCH_PASSES_ENABLED:
+        logger.info("%s pass is research-only and RESEARCH_PASSES_ENABLED is off -- skipping committee runs", session)
+        return
     for spec in TARGETS:
         target = spec.get("target", "?")
         # Never mutate the module-level TARGETS list -- a fresh dict per

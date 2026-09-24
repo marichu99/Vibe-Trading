@@ -207,6 +207,12 @@ WEEKEND_STATE_PATH = REPO_ROOT / "logs" / "fundednext_weekend_state.json"
 # identical feature, see that file's own comment for the full rationale.
 SESSION_BIAS_STATE_PATH = REPO_ROOT / "logs" / "fundednext_session_bias_state.json"
 
+# Research-only (Asia/London) passes switched off 2026-09-24 -- mirrored from
+# committee_reporter.py's RESEARCH_PASSES_ENABLED, see that comment for the
+# rationale (both bots share one OpenRouter account). Flip to True to bring
+# them back.
+RESEARCH_PASSES_ENABLED = False
+
 BREAKEVEN_POLL_SECONDS = 300
 BREAKEVEN_TRIGGER_FRACTION = 0.5
 BREAKEVEN_BUFFER_POINTS = 20
@@ -1860,6 +1866,9 @@ def run_once(session: str = "new_york") -> None:
     the NY pass to read back (_session_bias_fact, wired into _build_prompt).
     """
     trade_enabled = session == "new_york"
+    if not trade_enabled and not RESEARCH_PASSES_ENABLED:
+        logger.info("%s pass is research-only and RESEARCH_PASSES_ENABLED is off -- skipping committee runs", session)
+        return
     for spec in TARGETS:
         target = spec.get("target", "?")
         effective_spec = spec if trade_enabled else {**spec, "trade": None}

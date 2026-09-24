@@ -204,6 +204,9 @@ class TestSessionBiasReadWrite:
 class TestRunOnceSessionGating:
     def _patch(self, monkeypatch, *, report_text: str = "Decision: long\nReasoning: because") -> list[dict]:
         calls: list[dict] = []
+        # Existing tests cover the research-pass path itself; the kill
+        # switch (off in production) is covered by the tests below.
+        monkeypatch.setattr(cr, "RESEARCH_PASSES_ENABLED", True)
         monkeypatch.setattr(cr, "_check_trade_drought", lambda: None)
         monkeypatch.setattr(cr, "_check_cap_fit_alert", lambda: None)
         monkeypatch.setattr(cr, "_check_llm_balance_alert", lambda: None)
@@ -254,6 +257,39 @@ class TestRunOnceSessionGating:
 
         assert calls[0]["trade"] == {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
         assert recorded == []
+
+    def test_research_passes_disabled_skips_committee_on_asia_and_london(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        monkeypatch.setattr(cr, "RESEARCH_PASSES_ENABLED", False)
+        recorded = []
+        monkeypatch.setattr(cr, "_record_session_bias", lambda *a: recorded.append(a))
+
+        cr.run_once("asia")
+        cr.run_once("london")
+
+        assert calls == []
+        assert recorded == []
+
+    def test_research_passes_disabled_still_runs_new_york(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        monkeypatch.setattr(cr, "RESEARCH_PASSES_ENABLED", False)
+        monkeypatch.setattr(cr, "_record_session_bias", lambda *a: None)
+
+        cr.run_once("new_york")
+
+        assert len(calls) == 1
+        assert calls[0]["trade"] is not None
+
+    def test_research_passes_disabled_still_runs_alerts(self, monkeypatch) -> None:
+        self._patch(monkeypatch)
+        monkeypatch.setattr(cr, "RESEARCH_PASSES_ENABLED", False)
+        fired = []
+        monkeypatch.setattr(cr, "_check_llm_balance_alert", lambda: fired.append("balance"))
+        monkeypatch.setattr(cr, "_check_trade_drought", lambda: fired.append("drought"))
+
+        cr.run_once("london")
+
+        assert fired == ["drought", "balance"]
 
     def test_targets_list_itself_is_never_mutated(self, monkeypatch) -> None:
         self._patch(monkeypatch)
@@ -1656,3 +1692,58 @@ class TestPostTradeRewardRiskCheck:
         calls = self._patch(monkeypatch)
         assert cr._post_trade_reward_risk_check(self.TRADE, {"side": "buy", "fill_price": 1.1}) == ""
         assert calls == {}
+
+
+class TestLlmBalanceAlert:
+    def _patch(self, monkeypatch, tmp_path, *, provider: str, balance):
+        monkeypatch.setenv("LANGCHAIN_PROVIDER", provider)
+        monkeypatch.setattr(cr, "LLM_BALANCE_ALERT_STATE_PATH", tmp_path / "state.json")
+        monkeypatch.setitem(cr._LLM_BALANCE_READERS, "openrouter", ("OpenRouter", lambda: balance))
+        monkeypatch.setitem(cr._LLM_BALANCE_READERS, "deepseek", ("DeepSeek", lambda: balance))
+        sent = []
+        monkeypatch.setattr(cr, "send_email", lambda subject, text, **kw: sent.append(subject))
+        return sent
+
+    def test_openrouter_low_balance_alerts_once(self, monkeypatch, tmp_path) -> None:
+        sent = self._patch(monkeypatch, tmp_path, provider="openrouter", balance=0.11)
+
+        cr._check_llm_balance_alert()
+        cr._check_llm_balance_alert()
+
+        assert sent == ["[Vibe-Trading] LOW BALANCE — OpenRouter $0.11"]
+
+    def test_stale_alert_flag_from_other_provider_does_not_mute(self, monkeypatch, tmp_path) -> None:
+        # The real on-disk state at switch-over was a DeepSeek-era {"alerted": true}
+        # with no provider key -- it must not suppress OpenRouter's first alert.
+        sent = self._patch(monkeypatch, tmp_path, provider="openrouter", balance=0.11)
+        (tmp_path / "state.json").write_text('{"alerted": true}', encoding="utf-8")
+
+        cr._check_llm_balance_alert()
+
+        assert len(sent) == 1
+
+    def test_healthy_balance_does_not_alert(self, monkeypatch, tmp_path) -> None:
+        sent = self._patch(monkeypatch, tmp_path, provider="openrouter", balance=15.0)
+
+        cr._check_llm_balance_alert()
+
+        assert sent == []
+
+    def test_unknown_provider_is_not_checked(self, monkeypatch, tmp_path) -> None:
+        sent = self._patch(monkeypatch, tmp_path, provider="anthropic", balance=0.0)
+
+        cr._check_llm_balance_alert()
+
+        assert sent == []
+
+    def test_openrouter_reader_computes_remaining_credit(self, monkeypatch) -> None:
+        monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+        monkeypatch.setattr(cr, "_fetch_json_or_none", lambda url, key: {"data": {"total_credits": 20, "total_usage": 19.8866347}})
+
+        assert abs(cr._openrouter_balance_usd() - 0.1133653) < 1e-9
+
+    def test_openrouter_reader_fails_open(self, monkeypatch) -> None:
+        monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+        monkeypatch.setattr(cr, "_fetch_json_or_none", lambda url, key: None)
+
+        assert cr._openrouter_balance_usd() is None

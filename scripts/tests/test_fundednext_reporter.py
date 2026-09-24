@@ -145,6 +145,9 @@ class TestSessionBiasReadWrite:
 class TestRunOnceSessionGating:
     def _patch(self, monkeypatch, *, report_text: str = "Decision: long\nReasoning: because") -> list[dict]:
         calls: list[dict] = []
+        # Existing tests cover the research-pass path itself; the kill
+        # switch (off in production) is covered by the tests below.
+        monkeypatch.setattr(fr, "RESEARCH_PASSES_ENABLED", True)
         monkeypatch.setattr(fr, "is_reportable", lambda result: False)
         monkeypatch.setattr(
             fr, "TARGETS",
@@ -183,6 +186,28 @@ class TestRunOnceSessionGating:
 
         assert calls[0]["trade"] == {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
         assert recorded == []
+
+    def test_research_passes_disabled_skips_committee_on_asia_and_london(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        monkeypatch.setattr(fr, "RESEARCH_PASSES_ENABLED", False)
+        recorded = []
+        monkeypatch.setattr(fr, "_record_session_bias", lambda *a: recorded.append(a))
+
+        fr.run_once("asia")
+        fr.run_once("london")
+
+        assert calls == []
+        assert recorded == []
+
+    def test_research_passes_disabled_still_runs_new_york(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        monkeypatch.setattr(fr, "RESEARCH_PASSES_ENABLED", False)
+        monkeypatch.setattr(fr, "_record_session_bias", lambda *a: None)
+
+        fr.run_once("new_york")
+
+        assert len(calls) == 1
+        assert calls[0]["trade"] is not None
 
     def test_targets_list_itself_is_never_mutated(self, monkeypatch) -> None:
         self._patch(monkeypatch)
