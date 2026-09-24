@@ -2817,9 +2817,20 @@ def _check_trade_drought() -> None:
     re-arms itself once a new trade actually happens. Fails open (skips
     silently) on any read error or if a symbol has no trade history yet —
     a missed alert is better than crashing the loop over this.
+
+    Real bug found 2026-09-24: this used to call the generic
+    ``get_open_orders`` (mt5_sdk's own default ``executions_lookback_days=7``,
+    matching the unrelated signal-service-activity feature's window). Once a
+    symbol's last trade aged past that same ~7-day window, the deal proving
+    the drought fell OUTSIDE the fetch window too -- ``executions`` came back
+    empty and this function took that as "never traded, nothing to check,"
+    silently skipping the exact multi-week drought this alert exists to
+    catch. Passing a lookback well past NO_TRADE_ALERT_DAYS fixes this: the
+    deal that would trigger the alert is always still in view.
     """
     sys.path.insert(0, str(AGENT_DIR))
-    from src.trading.service import get_open_orders
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.profiles import profile_by_id
 
     for spec in TARGETS:
         trade = spec.get("trade")
@@ -2827,7 +2838,10 @@ def _check_trade_drought() -> None:
             continue
 
         try:
-            executions = get_open_orders(trade["connection"], include_executions=True).get("executions", [])
+            config = mt5_sdk.build_config(profile_by_id(trade["connection"]).config, {})
+            executions = mt5_sdk.get_open_orders(
+                config, include_executions=True, executions_lookback_days=NO_TRADE_ALERT_DAYS + 90
+            ).get("executions", [])
         except Exception:
             continue
 

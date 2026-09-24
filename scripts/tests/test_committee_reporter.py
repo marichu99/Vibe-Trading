@@ -130,6 +130,75 @@ class TestNextSessionBoundary:
 
 
 # ---------------------------------------------------------------------------
+# _check_trade_drought -- regression: this used to fetch executions via mt5_
+# sdk's own fixed 7-day default lookback, the SAME length as NO_TRADE_ALERT_
+# DAYS itself. Once a symbol's last trade aged past that same ~7-day window,
+# the deal proving the drought fell OUTSIDE the fetch window too --
+# "executions" came back empty, and the function read that as "never traded,
+# nothing to check," silently never alerting on exactly the multi-week
+# droughts this feature exists to catch.
+# ---------------------------------------------------------------------------
+
+
+class TestCheckTradeDrought:
+    SYMBOL = "EURUSDm"
+    CONNECTION = "mt5-live-trade"
+
+    def _patch(self, monkeypatch, tmp_path, *, executions):
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+        import src.trading.profiles as profiles_module
+
+        monkeypatch.setattr(
+            cr, "TARGETS",
+            [{
+                "committee": "x", "target": "x", "market": "forex",
+                "trade": {"symbol": self.SYMBOL, "connection": self.CONNECTION, "lots": 0.01},
+            }],
+        )
+        monkeypatch.setattr(cr, "NO_TRADE_ALERT_STATE_PATH", tmp_path / "no_trade_alert_state.json")
+
+        class _FakeProfile:
+            config: dict = {}
+
+        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: _FakeProfile())
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: "FAKE_CONFIG")
+
+        captured: dict = {}
+
+        def _get_open_orders(config, *, include_executions=False, executions_lookback_days=7):
+            captured["executions_lookback_days"] = executions_lookback_days
+            return {"executions": executions}
+
+        monkeypatch.setattr(mt5_sdk, "get_open_orders", _get_open_orders)
+
+        emailed: list[tuple[str, str]] = []
+        monkeypatch.setattr(cr, "send_email", lambda subject, text: emailed.append((subject, text)))
+        return captured, emailed
+
+    def test_requests_a_lookback_wider_than_the_alert_threshold(self, monkeypatch, tmp_path) -> None:
+        captured, _ = self._patch(monkeypatch, tmp_path, executions=[])
+        cr._check_trade_drought()
+        assert captured["executions_lookback_days"] > cr.NO_TRADE_ALERT_DAYS
+
+    def test_alerts_on_a_drought_older_than_the_old_fixed_7_day_window(self, monkeypatch, tmp_path) -> None:
+        """The real bug: a deal that opened 10 days ago used to fall outside
+        the connector's old fixed 7-day executions window, so this silently
+        never alerted on a drought of exactly the kind NO_TRADE_ALERT_DAYS=7
+        exists to catch."""
+        last_trade_time = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        executions = [{"symbol": self.SYMBOL, "magic": cr.OUR_MAGIC, "entry": 0, "time": last_trade_time}]
+        _, emailed = self._patch(monkeypatch, tmp_path, executions=executions)
+        cr._check_trade_drought()
+        assert len(emailed) == 1
+        assert "No trades in" in emailed[0][0]
+
+    def test_no_trade_history_at_all_does_not_alert(self, monkeypatch, tmp_path) -> None:
+        _, emailed = self._patch(monkeypatch, tmp_path, executions=[])
+        cr._check_trade_drought()
+        assert emailed == []
+
+
+# ---------------------------------------------------------------------------
 # Session bias carry-over: Asia/London (research-only) passes' Decision/
 # Reasoning get recorded and read back into the New York (trading) pass's
 # prompt instead of being thrown away.
