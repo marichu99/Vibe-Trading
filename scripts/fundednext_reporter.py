@@ -164,13 +164,19 @@ TARGETS: list[dict[str, object]] = [
     # early_profit_trigger_usd=$30 is ~1.35x that $22 floor value (same
     # "past ordinary noise, but reachable by a real move" ratio the
     # EURUSD/AUDUSD triggers above use).
-    # {
-    #     "committee": "investment_committee", "target": "XAUUSD", "market": "commodity/forex",
-    #     "trade": {
-    #         "symbol": "XAUUSD", "connection": "mt5fn-live-trade", "lots": 0.02, "max_stack": 1,
-    #         "early_profit_trigger_usd": 30.00,
-    #     },
-    # },
+    #
+    # RE-ENABLED 2026-09-24 at the user's request (FundedNext to focus on
+    # EURUSD + gold only; AUDUSD paused above). Re-checked live before
+    # enabling: 15m-ATR stop floor 12.73 price units -> ~$25.47 risk at 0.02
+    # lots, well inside the ~$59.46 effective per-trade cap. Note this
+    # account's only prior gold trade lost $39.82.
+    {
+        "committee": "investment_committee", "target": "XAUUSD", "market": "commodity/forex",
+        "trade": {
+            "symbol": "XAUUSD", "connection": "mt5fn-live-trade", "lots": 0.02, "max_stack": 1,
+            "early_profit_trigger_usd": 30.00,
+        },
+    },
 ]
 
 MAX_ITER = 15
