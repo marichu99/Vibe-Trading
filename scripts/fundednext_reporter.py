@@ -165,19 +165,47 @@ TARGETS: list[dict[str, object]] = [
     # "past ordinary noise, but reachable by a real move" ratio the
     # EURUSD/AUDUSD triggers above use).
     #
-    # RE-ENABLED 2026-09-24 at the user's request (FundedNext to focus on
-    # EURUSD + gold only; AUDUSD paused above). Re-checked live before
-    # enabling: 15m-ATR stop floor 12.73 price units -> ~$25.47 risk at 0.02
-    # lots, well inside the ~$59.46 effective per-trade cap. Note this
-    # account's only prior gold trade lost $39.82.
+    # Briefly re-enabled 2026-09-24, then PAUSED again the same day at the
+    # user's request in favor of GBPUSD (below). Last live check: 15m-ATR
+    # stop floor 12.73 price units -> ~$25.47 risk at 0.02 lots, inside the
+    # ~$59.46 effective cap -- still valid to re-enable by uncommenting.
+    # {
+    #     "committee": "investment_committee", "target": "XAUUSD", "market": "commodity/forex",
+    #     "trade": {
+    #         "symbol": "XAUUSD", "connection": "mt5fn-live-trade", "lots": 0.02, "max_stack": 1,
+    #         "early_profit_trigger_usd": 30.00,
+    #     },
+    # },
     {
-        "committee": "investment_committee", "target": "XAUUSD", "market": "commodity/forex",
+        # Added 2026-09-24 at the user's request, replacing gold. Chosen over
+        # US oil (USOUSD, -0.06 corr to EURUSD) for cost and predictability:
+        # near-zero spread vs. oil's ~11% of the ATR stop floor, same USD-
+        # macro drivers the committee already reasons about for EURUSD, and
+        # no inventory-report gap risk against the daily-loss limit. Its one
+        # weakness -- 0.84 90-day daily-return correlation with EURUSD, i.e.
+        # holding both is mostly one doubled USD bet -- is neutralized by
+        # EXCLUSIVE_SYMBOL_GROUP below (never both open at once).
+        # Live-verified: USD-quoted (so _max_stop_distance's USD math holds),
+        # contract_size 100,000, 15m-ATR stop floor ~0.00083 -> ~$24.90 risk
+        # at 0.30 lots, same ~$20-25 band as EURUSD and inside the ~$59.46
+        # cap. early_profit_trigger_usd $30 = 10 pips at 0.30 lots ($3/pip),
+        # the same ~10-pip arming distance EURUSD's $24 at 0.24 lots uses.
+        "committee": "investment_committee", "target": "GBPUSD", "market": "forex",
         "trade": {
-            "symbol": "XAUUSD", "connection": "mt5fn-live-trade", "lots": 0.02, "max_stack": 1,
+            "symbol": "GBPUSD", "connection": "mt5fn-live-trade", "lots": 0.30, "max_stack": 1,
             "early_profit_trigger_usd": 30.00,
         },
     },
 ]
+
+# Symbols of which at most one may hold an open position at a time
+# (2026-09-24, added with GBPUSD). EURUSD/GBPUSD move together (0.84
+# correlation), so a position in both is effectively one doubled USD bet --
+# too much concentration against FundedNext's daily-loss limit. While one is
+# open, the other's pass runs research-only (same fallback as the guardrail
+# and news-blackout checks in run_committee). Each symbol's own
+# pyramiding limit is still max_stack.
+EXCLUSIVE_SYMBOL_GROUP = frozenset({"EURUSD", "GBPUSD"})
 
 MAX_ITER = 15
 RUN_TIMEOUT_SECONDS = 3600
@@ -1296,13 +1324,40 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
     )
 
 
+def _exclusive_group_conflict(trade: dict) -> str | None:
+    """Return a research-only note if another EXCLUSIVE_SYMBOL_GROUP symbol is open, else None.
+
+    Fails closed: if positions can't be read, the pass runs research-only
+    rather than risk opening a second correlated position blind.
+    """
+    symbol = trade["symbol"]
+    if symbol not in EXCLUSIVE_SYMBOL_GROUP:
+        return None
+    for other in sorted(EXCLUSIVE_SYMBOL_GROUP - {symbol}):
+        try:
+            summary = _symbol_position_summary(other, trade["connection"])
+        except Exception as exc:
+            return (
+                f"[CORRELATION LIMIT] {symbol} pass run research-only: could not read open "
+                f"{other} positions ({exc}), and {symbol}/{other} may not both be open."
+            )
+        if summary["count"] > 0:
+            return (
+                f"[CORRELATION LIMIT] {symbol} pass run research-only: a {summary['side']} {other} "
+                f"position is already open, and {symbol}/{other} (highly correlated) may not "
+                f"both be open at once."
+            )
+    return None
+
+
 def run_committee(committee: str, target: str, market: str, trade: dict | None = None) -> CommitteeResult:
     """Run one committee preset against one target as an isolated subprocess.
 
-    Two pre-checks run before a trade-enabled pass, either of which can fall
+    Three pre-checks run before a trade-enabled pass, any of which can fall
     back the pass to research-only: fundednext_guardrails.guardrail_check
-    (daily-loss/static-drawdown/trade-count) and, if that clears, a news-
-    blackout check (fundednext_news_calendar) for the symbol's currencies.
+    (daily-loss/static-drawdown/trade-count), then a news-blackout check
+    (fundednext_news_calendar) for the symbol's currencies, then
+    _exclusive_group_conflict (no EURUSD and GBPUSD open at the same time).
     """
     breaker_note = None
     if trade:
@@ -1322,6 +1377,13 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         if in_blackout:
             breaker_note = f"[NEWS BLACKOUT] {trade['symbol']} pass run research-only: {why}."
             logger.warning("news blackout for %s: %s", target, why)
+            trade = None
+
+    if trade:
+        conflict = _exclusive_group_conflict(trade)
+        if conflict:
+            breaker_note = conflict
+            logger.warning("correlation limit for %s: %s", target, conflict)
             trade = None
 
     prompt = _build_prompt(committee, target, market, trade)

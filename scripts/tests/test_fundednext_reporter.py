@@ -653,3 +653,73 @@ class TestResolveFillPrice:
 
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": []})
         assert fr._resolve_fill_price(self.TRADE, {"fill_price": 0.0, "symbol": "EURUSD"}) is None
+
+
+class TestExclusiveGroupConflict:
+    def _patch_positions(self, monkeypatch, open_by_symbol: dict):
+        monkeypatch.setattr(
+            fr, "_symbol_position_summary",
+            lambda symbol, connection: open_by_symbol.get(symbol, {"count": 0, "side": None}),
+        )
+
+    def test_blocks_gbpusd_while_eurusd_open(self, monkeypatch) -> None:
+        self._patch_positions(monkeypatch, {"EURUSD": {"count": 1, "side": "sell"}})
+
+        note = fr._exclusive_group_conflict({"symbol": "GBPUSD", "connection": "mt5fn-live-trade"})
+
+        assert note is not None and "EURUSD" in note
+
+    def test_blocks_eurusd_while_gbpusd_open(self, monkeypatch) -> None:
+        self._patch_positions(monkeypatch, {"GBPUSD": {"count": 1, "side": "buy"}})
+
+        assert fr._exclusive_group_conflict({"symbol": "EURUSD", "connection": "mt5fn-live-trade"}) is not None
+
+    def test_allows_when_partner_flat(self, monkeypatch) -> None:
+        # Its OWN open position is max_stack's job, not this check's.
+        self._patch_positions(monkeypatch, {"GBPUSD": {"count": 1, "side": "buy"}})
+
+        assert fr._exclusive_group_conflict({"symbol": "GBPUSD", "connection": "mt5fn-live-trade"}) is None
+
+    def test_symbol_outside_group_is_never_blocked(self, monkeypatch) -> None:
+        self._patch_positions(monkeypatch, {"EURUSD": {"count": 1, "side": "sell"}})
+
+        assert fr._exclusive_group_conflict({"symbol": "XAUUSD", "connection": "mt5fn-live-trade"}) is None
+
+    def test_fails_closed_when_positions_unreadable(self, monkeypatch) -> None:
+        def _boom(symbol, connection):
+            raise RuntimeError("terminal not connected")
+        monkeypatch.setattr(fr, "_symbol_position_summary", _boom)
+
+        note = fr._exclusive_group_conflict({"symbol": "GBPUSD", "connection": "mt5fn-live-trade"})
+
+        assert note is not None and "could not read" in note
+
+    def test_run_committee_strips_trade_on_conflict(self, monkeypatch) -> None:
+        monkeypatch.setattr(fr.fn_guard, "guardrail_check", lambda *a: None)
+        monkeypatch.setattr(fr.fn_news, "is_news_blackout", lambda *a, **k: (False, ""))
+        self._patch_positions(monkeypatch, {"EURUSD": {"count": 1, "side": "sell"}})
+        seen = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _fake_build_prompt(committee, target, market, trade):
+            seen["trade"] = trade
+            raise _Stop
+
+        monkeypatch.setattr(fr, "_build_prompt", _fake_build_prompt)
+
+        try:
+            fr.run_committee(
+                "investment_committee", "GBPUSD", "forex",
+                trade={"symbol": "GBPUSD", "connection": "mt5fn-live-trade", "lots": 0.30, "max_stack": 1},
+            )
+        except _Stop:
+            pass
+
+        assert seen["trade"] is None
+
+    def test_targets_are_eurusd_and_gbpusd(self) -> None:
+        assert [t["trade"]["symbol"] for t in fr.TARGETS] == ["EURUSD", "GBPUSD"]
+        gbp = next(t["trade"] for t in fr.TARGETS if t["trade"]["symbol"] == "GBPUSD")
+        assert gbp["lots"] == 0.30 and gbp["max_stack"] == 1

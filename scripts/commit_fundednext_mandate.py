@@ -84,7 +84,13 @@ _ensure_dotenv()
 ACCOUNT_REF = os.environ.get("FUNDEDNEXT_ACCOUNT_REF", "")
 
 # Sized for a $6,000 Stellar 1-Step challenge account — see module docstring.
-MAX_ORDER_USD = 35000.0
+# Raised 2026-09-24 from $35,000 to $45,000 when GBPUSD replaced gold at the
+# user's chosen 0.30 lots: 0.30 * 100,000 * ~1.3217 (live quote) ~= $39.7k,
+# over the old cap, so every GBPUSD order would have been denied. $45k leaves
+# room for GBPUSD up to ~1.50. Per-trade LOSS is still capped separately by
+# MAX_LOSS_PER_ORDER_USD below (~$25 actual at 0.30 lots); notional is a
+# secondary guard.
+MAX_ORDER_USD = 45000.0
 # Raised 2026-09-17 from $60,000 to $75,000 when gold was added: EURUSD
 # ($27.5k) + AUDUSD ($23.5k) + XAUUSD 0.02 lots (~$8.7k at the live gold
 # price) = ~$59.7k if all three are open at once, leaving almost no buffer
@@ -98,7 +104,7 @@ ALLOWED_INSTRUMENTS = ["cfd"]
 # "commodity" added 2026-09-17 for XAUUSD (gold) — see fundednext_reporter.py
 # TARGETS for the live symbol-availability/cost comparison that picked gold
 # over silver/platinum.
-ASSET_CLASSES = ["forex", "commodity"]  # EURUSD, AUDUSD, XAUUSD — see fundednext_reporter.py TARGETS
+ASSET_CLASSES = ["forex", "commodity"]  # EURUSD, GBPUSD live; "commodity" kept so paused gold can be re-enabled without a re-commit
 
 # 1% of the $6,000 starting balance — re-derive and re-commit as balance
 # grows (see module docstring).
@@ -121,7 +127,7 @@ def _build_proposal() -> dict:
         "exclude_symbols": [],
         "flatten_on_halt": FLATTEN_ON_HALT,
         "max_loss_per_order_usd": MAX_LOSS_PER_ORDER_USD,
-        "notes": "FundedNext Stellar 1-Step challenge mandate ($6,000 account), forex + gold (EURUSD/AUDUSD/XAUUSD).",
+        "notes": "FundedNext Stellar 1-Step challenge mandate ($6,000 account), forex (EURUSD/GBPUSD, max one open at a time); commodity kept for paused XAUUSD.",
     }
     ceilings = {
         "account_funding_usd": MAX_TOTAL_EXPOSURE_USD,
