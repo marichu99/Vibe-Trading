@@ -724,6 +724,17 @@ def _in_weekend_window(now: datetime) -> bool:
     return now.weekday() == 4 and now.hour >= WEEKEND_CUTOFF_UTC_HOUR
 
 
+def _between_passes_check(now: datetime) -> None:
+    """Mirrored from committee_reporter.py's identical function: Friday from
+    WEEKEND_CUTOFF_UTC_HOUR on, the poll runs the weekend flatten (no session
+    boundary lands in that window, so otherwise it only ran Saturday 00:00
+    UTC, after the market had closed); otherwise profit protection."""
+    if now.weekday() == 4 and _in_weekend_window(now):
+        _weekend_flatten_and_notify()
+    else:
+        _profit_protection_check()
+
+
 def _next_session_boundary(now: datetime) -> tuple[datetime, str]:
     """Return the next (UTC datetime, session label) boundary strictly after now.
 
@@ -2304,9 +2315,9 @@ def main() -> int:
                 logger.info("next scheduled pass: %s (%s)", next_boundary.isoformat(), next_session)
             else:
                 try:
-                    _profit_protection_check()
+                    _between_passes_check(now_utc)
                 except Exception:
-                    logger.exception("profit protection check crashed; continuing")
+                    logger.exception("between-passes check crashed; continuing")
             time.sleep(BREAKEVEN_POLL_SECONDS)
     else:
         run_once(args.session)
