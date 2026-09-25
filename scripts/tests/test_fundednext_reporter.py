@@ -45,6 +45,26 @@ class TestInWeekendWindow:
         assert not fr._in_weekend_window(datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
 
 
+class TestBetweenPassesCheck:
+    """Mirrors committee_reporter's test: Friday's pre-close window must flatten."""
+
+    def _calls(self, monkeypatch) -> list[str]:
+        calls: list[str] = []
+        monkeypatch.setattr(fr, "_weekend_flatten_and_notify", lambda: calls.append("flatten"))
+        monkeypatch.setattr(fr, "_profit_protection_check", lambda: calls.append("protect"))
+        return calls
+
+    def test_friday_after_cutoff_flattens(self, monkeypatch) -> None:
+        calls = self._calls(monkeypatch)
+        fr._between_passes_check(datetime(2026, 9, 4, 20, 5, tzinfo=timezone.utc))
+        assert calls == ["flatten"]
+
+    def test_friday_before_cutoff_protects(self, monkeypatch) -> None:
+        calls = self._calls(monkeypatch)
+        fr._between_passes_check(datetime(2026, 9, 4, 19, 55, tzinfo=timezone.utc))
+        assert calls == ["protect"]
+
+
 # ---------------------------------------------------------------------------
 # _next_session_boundary -- mirrored from committee_reporter.py's identical
 # feature/tests (2026-09-21). See that file's test class for the full

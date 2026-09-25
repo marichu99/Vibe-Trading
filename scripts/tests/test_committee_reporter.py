@@ -57,6 +57,32 @@ class TestInWeekendWindow:
         assert not cr._in_weekend_window(datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
 
 
+class TestBetweenPassesCheck:
+    """No session boundary falls in Friday's pre-close window, so the poll
+    must run the weekend flatten there or it only runs after the market shut."""
+
+    def _calls(self, monkeypatch) -> list[str]:
+        calls: list[str] = []
+        monkeypatch.setattr(cr, "_weekend_flatten_and_notify", lambda: calls.append("flatten"))
+        monkeypatch.setattr(cr, "_profit_protection_check", lambda: calls.append("protect"))
+        return calls
+
+    def test_friday_after_cutoff_flattens(self, monkeypatch) -> None:
+        calls = self._calls(monkeypatch)
+        cr._between_passes_check(datetime(2026, 9, 4, 20, 5, tzinfo=timezone.utc))
+        assert calls == ["flatten"]
+
+    def test_friday_before_cutoff_protects(self, monkeypatch) -> None:
+        calls = self._calls(monkeypatch)
+        cr._between_passes_check(datetime(2026, 9, 4, 19, 55, tzinfo=timezone.utc))
+        assert calls == ["protect"]
+
+    def test_weekday_protects(self, monkeypatch) -> None:
+        calls = self._calls(monkeypatch)
+        cr._between_passes_check(datetime(2026, 9, 7, 21, 0, tzinfo=timezone.utc))
+        assert calls == ["protect"]
+
+
 # ---------------------------------------------------------------------------
 # _next_session_boundary -- session-gated trading (2026-09-21): 3 passes/
 # day anchored to session opens, only "new_york" trades. Must stay correct
