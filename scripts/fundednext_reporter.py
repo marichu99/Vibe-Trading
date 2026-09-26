@@ -887,7 +887,10 @@ def _weekend_flatten_and_notify() -> None:
                 closed_lines.append(f"FAILED to close ticket {ticket} on {trade['symbol']}: {result.get('error')}")
                 logger.error("weekend flatten: close_position failed for ticket %s: %s", ticket, result.get("error"))
 
-    if already_notified and not closed_lines:
+    # Only a successful close is new information worth an extra email --
+    # a close that keeps failing (e.g. market already shut) retries every
+    # tick all weekend and must not email every BREAKEVEN_POLL_SECONDS.
+    if already_notified and not any(line.startswith("Closed ") for line in closed_lines):
         return
 
     body_lines = ["Market closed for the weekend — no FundedNext committee runs until Monday (UTC)."]
@@ -904,6 +907,32 @@ def _weekend_flatten_and_notify() -> None:
         logger.exception("failed to send weekend status email")
 
     _write_weekend_state({"week": week_key})
+
+
+def _between_passes_tick(now_utc: datetime) -> None:
+    """One BREAKEVEN_POLL_SECONDS tick between scheduled committee passes.
+
+    Inside the weekend window this runs the weekend flatten instead of
+    profit protection. Added 2026-09-26 after a real miss: the flatten used
+    to run ONLY at session boundaries, and the first boundary after Friday's
+    NY pass is Saturday 00:00 UTC -- after the market had already closed --
+    so the Friday WEEKEND_CUTOFF_UTC_HOUR flatten never actually got a
+    chance to run. An EURUSDm buy opened Fri 2026-09-25 was carried into the
+    weekend, and every Saturday close attempt was rejected (retcode 10018,
+    market closed). Checking every tick means the flatten fires within one
+    poll interval of the cutoff, while the market is still open, and
+    retries each tick if a close fails.
+    """
+    if _in_weekend_window(now_utc):
+        try:
+            _weekend_flatten_and_notify()
+        except Exception:
+            logger.exception("weekend flatten/notify crashed; retrying next tick")
+        return
+    try:
+        _profit_protection_check()
+    except Exception:
+        logger.exception("profit protection check crashed; continuing")
 
 
 def _profit_protection_check() -> None:
@@ -2303,10 +2332,7 @@ def main() -> int:
                         logger.exception("run_once() crashed; continuing to the next scheduled pass")
                 logger.info("next scheduled pass: %s (%s)", next_boundary.isoformat(), next_session)
             else:
-                try:
-                    _profit_protection_check()
-                except Exception:
-                    logger.exception("profit protection check crashed; continuing")
+                _between_passes_tick(now_utc)
             time.sleep(BREAKEVEN_POLL_SECONDS)
     else:
         run_once(args.session)

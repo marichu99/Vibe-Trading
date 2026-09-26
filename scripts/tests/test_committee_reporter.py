@@ -1822,3 +1822,68 @@ class TestExclusiveGroup:
 
     def test_live_targets_are_eurusd_and_gbpusd(self) -> None:
         assert [t["trade"]["symbol"] for t in cr.TARGETS] == ["EURUSDm", "GBPUSDm"]
+
+
+class TestWeekendFlattenTiming:
+    def test_friday_after_cutoff_flattens_between_passes(self, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(cr, "_weekend_flatten_and_notify", lambda: calls.append("flatten"))
+        monkeypatch.setattr(cr, "_profit_protection_check", lambda: calls.append("protect"))
+
+        # Fri 2026-09-25 20:05 UTC -- the gap the old boundary-only check missed.
+        cr._between_passes_tick(datetime(2026, 9, 25, 20, 5, tzinfo=timezone.utc))
+
+        assert calls == ["flatten"]
+
+    def test_weekday_runs_profit_protection(self, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(cr, "_weekend_flatten_and_notify", lambda: calls.append("flatten"))
+        monkeypatch.setattr(cr, "_profit_protection_check", lambda: calls.append("protect"))
+
+        cr._between_passes_tick(datetime(2026, 9, 25, 19, 55, tzinfo=timezone.utc))
+
+        assert calls == ["protect"]
+
+    def test_flatten_crash_does_not_propagate(self, monkeypatch) -> None:
+        def _boom():
+            raise RuntimeError("terminal gone")
+        monkeypatch.setattr(cr, "_weekend_flatten_and_notify", _boom)
+
+        cr._between_passes_tick(datetime(2026, 9, 26, 3, 0, tzinfo=timezone.utc))
+
+    def _patch_flatten(self, monkeypatch, tmp_path, close_result):
+        import types
+        monkeypatch.setattr(cr, "WEEKEND_STATE_PATH", tmp_path / "weekend.json")
+        monkeypatch.setattr(
+            cr, "TARGETS",
+            [{"committee": "investment_committee", "target": "EURUSD", "market": "forex",
+              "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}}],
+        )
+        pos = {"ticket": 1, "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "side": "buy", "volume": 0.01, "profit": -1.0}
+        import src.trading.service as service
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+        import src.trading.profiles as profiles
+        monkeypatch.setattr(service, "get_positions", lambda connection: {"positions": [pos]})
+        monkeypatch.setattr(profiles, "profile_by_id", lambda cid: types.SimpleNamespace(config={}))
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda a, b: {})
+        monkeypatch.setattr(mt5_sdk, "close_position", lambda config, ticket: close_result)
+        monkeypatch.setattr(cr, "_status_header", lambda: "")
+        sent = []
+        monkeypatch.setattr(cr, "send_email", lambda subject, text, **kw: sent.append(text))
+        return sent
+
+    def test_repeated_failed_close_emails_once_per_week(self, monkeypatch, tmp_path) -> None:
+        sent = self._patch_flatten(monkeypatch, tmp_path, {"status": "error", "error": "retcode=10018 Market closed"})
+
+        for _ in range(3):
+            cr._weekend_flatten_and_notify()
+
+        assert len(sent) == 1 and "FAILED to close" in sent[0]
+
+    def test_successful_close_always_emails(self, monkeypatch, tmp_path) -> None:
+        sent = self._patch_flatten(monkeypatch, tmp_path, {"status": "ok", "closed_volume": 0.01, "fill_price": 1.139})
+
+        cr._weekend_flatten_and_notify()
+        cr._weekend_flatten_and_notify()
+
+        assert len(sent) == 2 and all("Closed BUY" in text for text in sent)
