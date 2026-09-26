@@ -2285,6 +2285,17 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
     to the live position's own price_open (a fresh get_positions() read,
     same source --status uses) whenever fill_price is missing OR
     non-positive.
+
+    Matches by the new order's own ticket (order_id) first, same fix
+    _post_trade_spec_check already applies to its own position lookup and
+    for the same reason: with an opposite-direction position already open
+    on this symbol (the "no opposite-direction position" rule is prompt-
+    level only, not code-enforced), a plain symbol+magic filter can match
+    the OLD position instead of the one that just filled, silently feeding
+    a wrong entry price into the reward:risk correction and the trade
+    journal. Falls back to the broader symbol+magic match (prior behavior)
+    when no ticket match is found, so a missing/mismatched order_id still
+    fails open rather than returning None.
     """
     price = placed_order.get("fill_price")
     try:
@@ -2301,14 +2312,19 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
     except Exception:
         return None
     symbol = placed_order.get("symbol") or trade["symbol"]
-    for pos in positions:
-        if pos.get("symbol") == symbol and pos.get("magic") == OUR_MAGIC:
-            try:
-                open_price = float(pos.get("price_open"))
-            except (TypeError, ValueError):
-                continue
-            if open_price > 0:
-                return open_price
+    candidates = [pos for pos in positions if pos.get("symbol") == symbol and pos.get("magic") == OUR_MAGIC]
+    target_ticket = str(placed_order.get("order_id") or "").strip()
+    if target_ticket:
+        ticket_matches = [pos for pos in candidates if str(pos.get("ticket")) == target_ticket]
+        if ticket_matches:
+            candidates = ticket_matches
+    for pos in candidates:
+        try:
+            open_price = float(pos.get("price_open"))
+        except (TypeError, ValueError):
+            continue
+        if open_price > 0:
+            return open_price
     return None
 
 
