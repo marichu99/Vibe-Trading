@@ -345,6 +345,16 @@ def _position_market_value(row: dict) -> float | None:
     Prefers an explicit ``market_value`` field; otherwise derives it from
     ``quantity`` × (``price`` | ``last_price`` | ``mark_price``). Returns
     ``None`` if neither is parseable.
+
+    MT5 positions are a separate case (``volume`` lots × ``price_current``,
+    not raw units × price) — see ``src.live.sdk_order_gate._enrich_positions``,
+    which pre-computes a lot-size-aware ``market_value`` for those rows using
+    the connector's own ``contract_size`` before they ever reach this
+    function. This function deliberately does NOT recognize ``volume``/
+    ``price_open``/``price_current`` itself: doing so here would compute
+    ``volume * price`` with no contract-size multiplier (e.g. missing the
+    100,000-units-per-lot factor on a standard FX lot), silently understating
+    real notional by orders of magnitude instead of failing closed.
     """
     for key in ("market_value", "marketValue", "value_usd", "value"):
         if key in row:

@@ -47,13 +47,13 @@ class _FakeConnector:
         return {"status": "ok", "symbol": symbol, "quote": {"last": self._quote_last}}
 
 
-def _mandate(*, max_order=1_000_000.0, assets=(AssetClass.US_EQUITY,), instruments=(InstrumentType.EQUITY,), max_loss=None):
+def _mandate(*, max_order=1_000_000.0, max_exposure=1_000_000.0, assets=(AssetClass.US_EQUITY,), instruments=(InstrumentType.EQUITY,), max_loss=None):
     return Mandate(
         schema_version=1,
         hard_caps=HardCaps(
             account_funding_usd=1_000_000.0,
             max_order_notional_usd=max_order,
-            max_total_exposure_usd=1_000_000.0,
+            max_total_exposure_usd=max_exposure,
             max_leverage=2.0,
             allowed_instruments=tuple(instruments),
             max_trades_per_day=100,
@@ -178,9 +178,10 @@ def _mt5_gold_intent(qty: float, stop_loss: float | None = None) -> OrderIntent:
     )
 
 
-def _mt5_gold_mandate(max_order: float, max_loss: float | None = None) -> Mandate:
+def _mt5_gold_mandate(max_order: float, max_loss: float | None = None, max_exposure: float = 1_000_000.0) -> Mandate:
     return _mandate(
-        max_order=max_order, assets=(AssetClass.COMMODITY,), instruments=(InstrumentType.CFD,), max_loss=max_loss,
+        max_order=max_order, max_exposure=max_exposure,
+        assets=(AssetClass.COMMODITY,), instruments=(InstrumentType.CFD,), max_loss=max_loss,
     )
 
 
@@ -232,6 +233,64 @@ def test_gate_lot_based_notional_fails_closed_when_contract_size_unreadable(monk
         place_kwargs={"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01},
     )
     assert out["status"] == "blocked"
+    assert conn.placed == []
+
+
+def test_gate_lot_based_existing_position_enriched_for_exposure(monkeypatch) -> None:
+    """Regression: check_mandate's generic position parser recognizes neither
+    MT5's ``volume``/``price_current`` field names, so an existing MT5
+    position used to be entirely unparseable — which made the exposure check
+    fail-closed DENY every subsequent order outright ("current positions
+    could not be read"), regardless of real exposure. An existing 0.01-lot
+    XAUUSDm position (contract-size-adjusted notional ~$4,651) plus a new
+    same-size order must be correctly parsed and allowed when comfortably
+    under the exposure cap, not denied over an unparseable read.
+    """
+    conn = _FakeConnector(
+        quote_last=4651.0,
+        positions={
+            "status": "ok",
+            "positions": [
+                {"symbol": "XAUUSDm", "volume": 0.01, "price_current": 4651.0, "side": "buy", "magic": 1},
+            ],
+        },
+    )
+    conn.contract_size = lambda symbol, *, config=None: 100.0
+    _patch_gate(monkeypatch, mandate=_mt5_gold_mandate(max_order=6000.0, max_exposure=10_000.0))
+    out = gate.execute_live_order(
+        broker="mt5", connector_module=conn, config=object(),
+        intent=_mt5_gold_intent(qty=0.01),
+        place_kwargs={"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01},
+    )
+    # existing ~$4,651 + new ~$4,651 = ~$9,302, under the $10,000 cap -> allowed.
+    assert out["status"] == "ok"
+    assert conn.placed == [{"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01}]
+
+
+def test_gate_lot_based_existing_position_exposure_denies_when_over_cap(monkeypatch) -> None:
+    """The contract-size-adjusted existing position must actually count
+    toward the exposure cap (not merely stop being misread as unparseable) —
+    an unadjusted volume*price ($46) would trivially clear any real cap and
+    silently under-enforce it."""
+    conn = _FakeConnector(
+        quote_last=4651.0,
+        positions={
+            "status": "ok",
+            "positions": [
+                {"symbol": "XAUUSDm", "volume": 0.01, "price_current": 4651.0, "side": "buy", "magic": 1},
+            ],
+        },
+    )
+    conn.contract_size = lambda symbol, *, config=None: 100.0
+    _patch_gate(monkeypatch, mandate=_mt5_gold_mandate(max_order=6000.0, max_exposure=5000.0))
+    out = gate.execute_live_order(
+        broker="mt5", connector_module=conn, config=object(),
+        intent=_mt5_gold_intent(qty=0.01),
+        place_kwargs={"symbol": "XAUUSDm", "side": "buy", "quantity": 0.01},
+    )
+    # existing ~$4,651 + new ~$4,651 = ~$9,302, over the $5,000 cap -> denied.
+    assert out["status"] == "blocked"
+    assert out["breach"]["limit"] == "max_total_exposure_usd"
     assert conn.placed == []
 
 

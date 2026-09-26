@@ -1516,7 +1516,7 @@ def _post_trade_spec_check(trade: dict, placed_order: dict) -> str:
     sys.path.insert(0, str(AGENT_DIR))
     from src.live.halt import trip_halt
     from src.trading.connectors.mt5 import sdk as mt5_sdk
-    from src.trading.service import get_positions
+    from src.trading.service import get_open_orders, get_positions
 
     # Match by the NEW order's own ticket (order_id), not fn_guard's
     # _flatten_positions(symbol+magic) -- real bug found by /code-review
@@ -1550,7 +1550,31 @@ def _post_trade_spec_check(trade: dict, placed_order: dict) -> str:
                 "refusing to blindly close other positions on this symbol; close manually"
             )
         else:
-            closed.append(f"no open position found with ticket {target_ticket} (already closed/never opened?)")
+            # Real gap found by /code-review: this function's own docstring
+            # cites a LIMIT order (staged price levels) as the motivating
+            # spec violation, but a resting limit order never appears in
+            # get_positions() until/unless it fills -- only checking
+            # positions left it live on the broker (able to fill later,
+            # even after the halt below, since the kill switch only blocks
+            # the NEXT scheduled pass, not an already-resting order) while
+            # this function still reported "closed immediately" below.
+            order_matches = [
+                o for o in get_open_orders(trade["connection"]).get("open_orders", [])
+                if o.get("symbol") == (actual_symbol or trade["symbol"])
+                and o.get("magic") == OUR_MAGIC
+                and str(o.get("order_id")) == target_ticket
+            ]
+            if order_matches:
+                config = _mt5_config_for(trade["connection"])
+                for order in order_matches:  # should be exactly one; loop defensively
+                    order_id = str(order.get("order_id"))
+                    result = mt5_sdk.cancel_order(config, order_id=order_id, symbol=order.get("symbol"))
+                    closed.append(f"{order.get('symbol')} pending order {order_id}: cancel {result.get('status')}")
+            else:
+                closed.append(
+                    f"no open position or pending order found with ticket {target_ticket} "
+                    "(already closed/cancelled/never opened?)"
+                )
     except Exception as exc:
         closed.append(f"flatten attempt raised: {exc}")
 
@@ -1559,14 +1583,15 @@ def _post_trade_spec_check(trade: dict, placed_order: dict) -> str:
         reason=f"post-trade spec violation on {trade['symbol']}: {reason}",
         broker=fn_guard.BROKER,
     )
-    closed_note = "; ".join(closed) if closed else "no position found to close (already flat?)"
+    closed_note = "; ".join(closed) if closed else "no position or pending order found to close/cancel (already flat?)"
     return (
         f"\n\n[CRITICAL — SPEC VIOLATION, AUTO-CLOSED] The filled order did NOT match TARGETS' "
-        f"fixed spec: {reason}. This position has been closed immediately and {fn_guard.BROKER} "
+        f"fixed spec: {reason}. An immediate close/cancel was attempted (see below — verify it "
+        f"actually succeeded, do not assume it did from this message alone) and {fn_guard.BROKER} "
         f"trading is now HALTED (kill switch) until manually cleared "
         f"(src.live.halt.clear_halt) — the committee did not follow the prompt's hardcoded "
         f"order parameters, and this needs human review before further automated trading. "
-        f"Close attempt: {closed_note}."
+        f"Close/cancel attempt: {closed_note}."
     )
 
 
@@ -1633,6 +1658,17 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
     the chance to. Falls back to the live position's own price_open (a
     fresh get_positions() read, same source --status uses) whenever
     fill_price is missing OR non-positive.
+
+    Matches by the new order's own ticket (order_id) first, same fix
+    _post_trade_spec_check already applies to its own position lookup and
+    for the same reason: with an opposite-direction position already open
+    on this symbol (the "no opposite-direction position" rule is prompt-
+    level only, not code-enforced -- see _post_trade_cap_check), a plain
+    symbol+magic filter can match the OLD position instead of the one that
+    just filled, silently feeding a wrong entry price into the reward:risk
+    correction and the trade journal. Falls back to the broader symbol+
+    magic match (prior behavior) when no ticket match is found, so a
+    missing/mismatched order_id still fails open rather than returning None.
     """
     price = placed_order.get("fill_price")
     try:
@@ -1649,14 +1685,19 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
     except Exception:
         return None
     symbol = placed_order.get("symbol") or trade["symbol"]
-    for pos in positions:
-        if pos.get("symbol") == symbol and pos.get("magic") == OUR_MAGIC:
-            try:
-                open_price = float(pos.get("price_open"))
-            except (TypeError, ValueError):
-                continue
-            if open_price > 0:
-                return open_price
+    candidates = [pos for pos in positions if pos.get("symbol") == symbol and pos.get("magic") == OUR_MAGIC]
+    target_ticket = str(placed_order.get("order_id") or "").strip()
+    if target_ticket:
+        ticket_matches = [pos for pos in candidates if str(pos.get("ticket")) == target_ticket]
+        if ticket_matches:
+            candidates = ticket_matches
+    for pos in candidates:
+        try:
+            open_price = float(pos.get("price_open"))
+        except (TypeError, ValueError):
+            continue
+        if open_price > 0:
+            return open_price
     return None
 
 

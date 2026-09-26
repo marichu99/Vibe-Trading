@@ -413,33 +413,40 @@ class TestPostTradeSpecCheck:
     TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.01, "max_stack": 1}
     NEW_TICKET = "999"
 
-    def _patch(self, monkeypatch, *, positions=None):
+    def _patch(self, monkeypatch, *, positions=None, open_orders=None):
         import src.live.halt as halt
         import src.trading.connectors.mt5.sdk as mt5_sdk
         import src.trading.service as service
 
         tripped: dict = {}
         closed_tickets: list = []
+        cancelled_order_ids: list = []
         monkeypatch.setattr(halt, "trip_halt", lambda by, reason, broker: tripped.update(by=by, reason=reason, broker=broker))
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions if positions is not None else []})
+        monkeypatch.setattr(service, "get_open_orders", lambda conn: {"open_orders": open_orders if open_orders is not None else []})
         monkeypatch.setattr(fr, "_mt5_config_for", lambda connection: {})
 
         def _close(config, ticket):
             closed_tickets.append(ticket)
             return {"status": "ok"}
 
+        def _cancel(config, order_id, *, symbol=None):
+            cancelled_order_ids.append(order_id)
+            return {"status": "ok"}
+
         monkeypatch.setattr(mt5_sdk, "close_position", _close)
-        return tripped, closed_tickets
+        monkeypatch.setattr(mt5_sdk, "cancel_order", _cancel)
+        return tripped, closed_tickets, cancelled_order_ids
 
     def test_matching_order_is_a_no_op(self, monkeypatch) -> None:
-        tripped, closed_tickets = self._patch(monkeypatch)
+        tripped, closed_tickets, cancelled_order_ids = self._patch(monkeypatch)
         order = {"symbol": "EURUSD", "quantity": 0.01, "order_type": "market", "order_id": self.NEW_TICKET}
         assert fr._post_trade_spec_check(self.TRADE, order) == ""
-        assert tripped == {} and closed_tickets == []
+        assert tripped == {} and closed_tickets == [] and cancelled_order_ids == []
 
     def test_wrong_symbol_closes_and_halts(self, monkeypatch) -> None:
         positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSDm", "magic": fr.OUR_MAGIC}]
-        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        tripped, closed_tickets, _ = self._patch(monkeypatch, positions=positions)
         order = {"symbol": "EURUSDm", "quantity": 0.01, "order_type": "market", "order_id": self.NEW_TICKET}
         note = fr._post_trade_spec_check(self.TRADE, order)
         assert "CRITICAL" in note and "AUTO-CLOSED" in note and "EURUSDm" in note
@@ -448,7 +455,7 @@ class TestPostTradeSpecCheck:
 
     def test_wrong_quantity_closes_and_halts(self, monkeypatch) -> None:
         positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSD", "magic": fr.OUR_MAGIC}]
-        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        tripped, closed_tickets, _ = self._patch(monkeypatch, positions=positions)
         order = {"symbol": "EURUSD", "quantity": 0.25, "order_type": "market", "order_id": self.NEW_TICKET}
         note = fr._post_trade_spec_check(self.TRADE, order)
         assert "CRITICAL" in note and "0.25" in note
@@ -457,7 +464,7 @@ class TestPostTradeSpecCheck:
 
     def test_limit_order_closes_and_halts(self, monkeypatch) -> None:
         positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSD", "magic": fr.OUR_MAGIC}]
-        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        tripped, closed_tickets, _ = self._patch(monkeypatch, positions=positions)
         order = {"symbol": "EURUSD", "quantity": 0.01, "order_type": "limit", "order_id": self.NEW_TICKET}
         note = fr._post_trade_spec_check(self.TRADE, order)
         assert "CRITICAL" in note and "not a market order" in note
@@ -465,12 +472,13 @@ class TestPostTradeSpecCheck:
         assert closed_tickets == [self.NEW_TICKET]
 
     def test_multiple_mismatches_all_reported_in_one_pass(self, monkeypatch) -> None:
-        tripped, closed_tickets = self._patch(monkeypatch, positions=[])
+        tripped, closed_tickets, cancelled_order_ids = self._patch(monkeypatch, positions=[])
         order = {"symbol": "EURUSDm", "quantity": 0.25, "order_type": "limit", "order_id": self.NEW_TICKET}
         note = fr._post_trade_spec_check(self.TRADE, order)
         assert "EURUSDm" in note and "0.25" in note and "not a market order" in note
-        assert "no open position found with ticket" in note
+        assert "no open position or pending order found with ticket" in note
         assert tripped.get("broker") == fn_guard.BROKER
+        assert closed_tickets == [] and cancelled_order_ids == []
 
     def test_does_not_close_other_legitimate_stacked_positions(self, monkeypatch) -> None:
         """Real bug found by /code-review: fn_guard._flatten_positions
@@ -482,7 +490,7 @@ class TestPostTradeSpecCheck:
             {"ticket": "222", "symbol": "EURUSD", "magic": fr.OUR_MAGIC},  # pre-existing, healthy
             {"ticket": self.NEW_TICKET, "symbol": "EURUSD", "magic": fr.OUR_MAGIC},  # the new, bad one
         ]
-        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        tripped, closed_tickets, _ = self._patch(monkeypatch, positions=positions)
         order = {"symbol": "EURUSD", "quantity": 0.25, "order_type": "market", "order_id": self.NEW_TICKET}
         note = fr._post_trade_spec_check(self.TRADE, order)
         assert "CRITICAL" in note
@@ -490,11 +498,27 @@ class TestPostTradeSpecCheck:
 
     def test_missing_order_id_refuses_to_close_anything(self, monkeypatch) -> None:
         positions = [{"ticket": "111", "symbol": "EURUSD", "magic": fr.OUR_MAGIC}]
-        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        tripped, closed_tickets, cancelled_order_ids = self._patch(monkeypatch, positions=positions)
         order = {"symbol": "EURUSD", "quantity": 0.25, "order_type": "market"}  # no order_id
         note = fr._post_trade_spec_check(self.TRADE, order)
         assert "CRITICAL" in note and "refusing to blindly close" in note
+        assert closed_tickets == [] and cancelled_order_ids == []
+
+    def test_pending_limit_order_is_cancelled_not_missed(self, monkeypatch) -> None:
+        """Real gap found by /code-review: this function's own motivating
+        incident is a LIMIT order with staged price levels, but a resting
+        limit order never appears in get_positions() until/unless it fills
+        -- only checking positions left it live on the broker (able to fill
+        later) while the report claimed it had been "closed immediately"."""
+        open_orders = [{"order_id": self.NEW_TICKET, "symbol": "EURUSD", "magic": fr.OUR_MAGIC}]
+        tripped, closed_tickets, cancelled_order_ids = self._patch(monkeypatch, positions=[], open_orders=open_orders)
+        order = {"symbol": "EURUSD", "quantity": 0.01, "order_type": "limit", "order_id": self.NEW_TICKET}
+        note = fr._post_trade_spec_check(self.TRADE, order)
+        assert "CRITICAL" in note and "not a market order" in note
+        assert tripped.get("broker") == fn_guard.BROKER
         assert closed_tickets == []
+        assert cancelled_order_ids == [self.NEW_TICKET]
+        assert f"pending order {self.NEW_TICKET}: cancel ok" in note
 
 
 class TestPostTradeRewardRiskCheck:
