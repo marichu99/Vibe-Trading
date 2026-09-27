@@ -654,6 +654,29 @@ class TestResolveFillPrice:
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": []})
         assert fr._resolve_fill_price(self.TRADE, {"fill_price": 0.0, "symbol": "EURUSD"}) is None
 
+    def test_matches_new_ticket_not_older_stacked_position(self, monkeypatch) -> None:
+        """Real bug: with more than one same-symbol position open (this
+        module's own default cap is 4), matching by symbol+magic alone
+        could silently return an OLDER position's entry price instead of
+        the new fill's -- must match by the new order's own ticket."""
+        import src.trading.service as service
+
+        positions = [
+            {"ticket": "111", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1000},  # older, unrelated
+            {"ticket": "999", "symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1050},  # the new fill
+        ]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        order = {"fill_price": 0.0, "symbol": "EURUSD", "order_id": "999"}
+        assert fr._resolve_fill_price(self.TRADE, order) == 1.1050
+
+    def test_falls_back_to_broad_match_when_order_has_no_ticket(self, monkeypatch) -> None:
+        import src.trading.service as service
+
+        positions = [{"symbol": "EURUSD", "magic": fr.OUR_MAGIC, "price_open": 1.1500}]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        order = {"fill_price": 0.0, "symbol": "EURUSD"}  # no order_id
+        assert fr._resolve_fill_price(self.TRADE, order) == 1.1500
+
 
 class TestExclusiveGroupConflict:
     def _patch_positions(self, monkeypatch, open_by_symbol: dict):
