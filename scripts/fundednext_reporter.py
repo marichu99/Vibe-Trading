@@ -1768,6 +1768,17 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
     the chance to. Falls back to the live position's own price_open (a
     fresh get_positions() read, same source --status uses) whenever
     fill_price is missing OR non-positive.
+
+    Matches by the NEW order's own ticket (order_id) first, same fix as
+    _post_trade_spec_check/_post_trade_reward_risk_check (found by
+    /code-review): with MAX_SAME_DIRECTION_POSITIONS (or a target's own
+    max_stack) > 1, this symbol can legitimately have several already-open
+    positions, and get_positions() order is not guaranteed to put the new
+    one last. Matching on symbol+magic alone could silently return an
+    OLDER position's entry price instead of the new fill's, feeding a wrong
+    entry into the reward:risk correction (mis-pricing a live stop) and the
+    permanent trade-journal entry_price. Falls back to the old broad
+    symbol+magic match only when the order carries no ticket at all.
     """
     price = placed_order.get("fill_price")
     try:
@@ -1784,14 +1795,19 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
     except Exception:
         return None
     symbol = placed_order.get("symbol") or trade["symbol"]
-    for pos in positions:
-        if pos.get("symbol") == symbol and pos.get("magic") == OUR_MAGIC:
-            try:
-                open_price = float(pos.get("price_open"))
-            except (TypeError, ValueError):
-                continue
-            if open_price > 0:
-                return open_price
+    target_ticket = str(placed_order.get("order_id") or "").strip()
+    candidates = [
+        pos for pos in positions
+        if pos.get("symbol") == symbol and pos.get("magic") == OUR_MAGIC
+        and (not target_ticket or str(pos.get("ticket")) == target_ticket)
+    ]
+    for pos in candidates:
+        try:
+            open_price = float(pos.get("price_open"))
+        except (TypeError, ValueError):
+            continue
+        if open_price > 0:
+            return open_price
     return None
 
 

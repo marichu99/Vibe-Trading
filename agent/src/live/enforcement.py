@@ -508,7 +508,14 @@ def check_mandate(
             )
 
     # 5–6. Exposure + leverage need observable positions; fail-closed on any
-    #      unparseable position. A sell reduces gross exposure (signed by side).
+    #      unparseable position. On a leveraged CFD instrument (MT5 forex/
+    #      commodity/index), "sell" opens a new short position that carries
+    #      the same real exposure as a buy -- it does not close/reduce an
+    #      existing long the way a cash-equity sell does (MT5 hedging-mode
+    #      closes go through connectors.mt5.sdk.close_position, a distinct
+    #      ticket-based call that never reaches check_mandate). Only for
+    #      long-only instrument types (equity/ETF/crypto) does a sell reduce
+    #      gross exposure (signed by side).
     current_exposure = _positions_market_value(positions)
     if current_exposure is None:
         return _breach(
@@ -517,7 +524,10 @@ def check_mandate(
             limit_value=caps.max_total_exposure_usd, attempted_value=0.0,
             detail="current positions could not be read (fail-closed)",
         )
-    signed = notional if intent.side == "buy" else -notional
+    if intent.instrument_type is InstrumentType.CFD:
+        signed = notional
+    else:
+        signed = notional if intent.side == "buy" else -notional
     post_exposure = current_exposure + signed
     if post_exposure > caps.max_total_exposure_usd:
         return _breach(
@@ -552,9 +562,11 @@ def check_mandate(
             attempted_value=float(attempted_count),
         )
 
-    # 8. Funding (defense-in-depth; broker is the real ceiling). Only a buy can
-    #    push us past funding — never block a sell on this.
-    if intent.side == "buy" and post_exposure > caps.account_funding_usd:
+    # 8. Funding (defense-in-depth; broker is the real ceiling). For long-only
+    #    instruments a sell can only reduce exposure, so only a buy can push
+    #    us past funding; a CFD sell opens new short exposure just like a buy
+    #    (see the exposure-sign note above) and must be checked too.
+    if (intent.side == "buy" or intent.instrument_type is InstrumentType.CFD) and post_exposure > caps.account_funding_usd:
         return _breach(
             broker=broker, remote_tool=remote_tool, intent=intent,
             kind=BREACH_KIND_QUANTITATIVE, limit="account_funding_usd",
