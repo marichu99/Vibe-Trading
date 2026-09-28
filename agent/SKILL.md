@@ -1,7 +1,7 @@
 ---
 name: vibe-trading
 version: 0.1.11
-description: Professional finance research toolkit — backtesting (8 engines + benchmark comparison panel), factor analysis, Alpha Zoo (461 pre-built alphas across qlib158/alpha101/gtja191/academic/fundamental), options pricing, 87 finance skills, 30 multi-agent swarm teams, Trade Journal analyzer, and Shadow Account (extract → backtest → render) across 21 market-data sources (tushare, yfinance, okx, akshare, baostock, tencent, mootdx, ccxt, futu, local, eastmoney, sina, stooq, yahoo, india_broker, qveris, longbridge, plus optional-key finnhub/alphavantage/tiingo/fmp).
+description: Professional finance research toolkit — backtesting (8 engines + benchmark comparison panel), factor analysis, Alpha Zoo (461 pre-built alphas across qlib158/alpha101/gtja191/academic/fundamental), options pricing, 87 finance skills, 31 multi-agent swarm teams, Trade Journal analyzer, and Shadow Account (extract → backtest → render) across 21 market-data sources (tushare, yfinance, okx, akshare, baostock, tencent, mootdx, ccxt, futu, local, eastmoney, sina, stooq, yahoo, india_broker, qveris, longbridge, plus optional-key finnhub/alphavantage/tiingo/fmp).
 dependencies:
   python: ">=3.11"
   pip:
@@ -94,7 +94,7 @@ Example workflow:
 4. Use `backtest()` to run and get metrics (Sharpe, return, drawdown, etc.)
 
 ### Multi-Agent Swarm Teams
-30 pre-built agent teams for complex research:
+31 pre-built agent teams for complex research:
 - **Investment Committee**: bull/bear debate → risk review → PM decision
 - **Global Equities Desk**: A-share + HK/US + crypto → global strategist
 - **Crypto Trading Desk**: funding/basis + liquidation + flow → risk manager
