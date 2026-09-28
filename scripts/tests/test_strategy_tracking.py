@@ -23,6 +23,8 @@ class TestParseDecision:
         ("no decision line at all", "unknown"),
         ("**Direction:** SHORT — H4 and D1 both in confirmed downtrend", "short"),
         ("| **Side** | SELL (SHORT) |", "short"),
+        ("### Committee Decision: **CONDITIONAL LONG (Limit-Only)**", "long"),
+        ("**Verdict:** **HARD DOWNTREND across all timeframes. SHORT (SELL) is the only valid direction.**", "short"),
     ])
     def test_classifies(self, line, expected) -> None:
         assert st.parse_decision(f"blah\n{line}\nReasoning: x") == expected

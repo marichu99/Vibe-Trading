@@ -311,12 +311,22 @@ def swarm_instruction(committee: str, target: str, market: str, pack_path: Path 
     itself (src.tools.swarm_tool._build_variables), so the DATA PACK line
     must be part of that prompt for the sub-agents to see the file path.
     """
+    # Real miss 2026-09-28: a FundedNext pass decided SHORT, then ended with
+    # "Awaiting your confirmation to place the SHORT order" -- no one reads
+    # these runs live, so the trade silently never happened (price then fell
+    # 23 pips).
+    unattended = (
+        "This run is FULLY AUTOMATED AND UNATTENDED: no human will read or answer anything before "
+        "the market moves. Never ask for confirmation or offer options -- either call "
+        "trading_place_order exactly as the rules below allow, or state the specific rule-based "
+        "reason no order was placed.\n\n"
+    )
     if pack_path is None:
-        return (
+        return unattended + (
             f'Call run_swarm with preset_name="{committee}" and a prompt that starts with the line '
             f'"{target} ({market})", followed by your summary of the facts below.\n\n'
         )
-    return (
+    return unattended + (
         f'Call run_swarm with preset_name="{committee}". The prompt you pass must start with these '
         f"two lines, verbatim:\n\n"
         f"DATA PACK FILE: {pack_path.as_posix()}\n"

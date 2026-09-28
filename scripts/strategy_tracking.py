@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 # 2026-09-28's first live report used "**Direction:** SHORT" and a markdown
 # "| **Side** | SELL (SHORT) |" row instead. Tried in this order.
 _DECISION_RES = (
-    re.compile(r"^\W*Decision\W*:\s*(.+)$", re.MULTILINE | re.IGNORECASE),
+    # Also "### Committee Decision: ..." / "**Final Decision:** ..." / "**Verdict:** ..."
+    re.compile(r"^\W*(?:(?:committee|final|pm)\s+)?(?:decision|verdict)\W*:\s*(.+)$", re.MULTILINE | re.IGNORECASE),
     re.compile(r"^\W*Direction\W*:\s*(.+)$", re.MULTILINE | re.IGNORECASE),
     re.compile(r"^\|\W*Side\W*\|\s*([^|]+)\|", re.MULTILINE | re.IGNORECASE),
 )

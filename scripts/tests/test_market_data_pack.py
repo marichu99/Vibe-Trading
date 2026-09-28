@@ -145,3 +145,10 @@ class TestExplicitPresetResolution:
     def test_instruction_forbids_fallback_to_another_preset(self) -> None:
         text = mdp.swarm_instruction("fx_commodity_day_desk", "EURUSD", "forex", Path("C:/a/b.md"))
         assert "do NOT retry without preset_name" in text
+
+
+def test_instruction_says_unattended_never_ask_for_confirmation() -> None:
+    # Regression 2026-09-28: a pass ended "Awaiting your confirmation to place the SHORT order".
+    for pack in (Path("C:/a/b.md"), None):
+        text = mdp.swarm_instruction("fx_commodity_day_desk", "EURUSD", "forex", pack)
+        assert text.startswith("This run is FULLY AUTOMATED AND UNATTENDED") and "Never ask for confirmation" in text
