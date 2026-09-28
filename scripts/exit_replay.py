@@ -134,6 +134,8 @@ def simulate(tr, bars, m15, info, rule):
     return realized + remaining * ((last["close"] - entry) * sgn), "data-end"
 
 
+ENTRY_DELAYS_MIN = (15, 30, 60, 120)
+
 RULES = {
     "static": {},
     "no_usd_trail (BE@50%TP+decay)": {"be_tp_fraction": BE_FRACTION_OF_TP, "decay": True},
@@ -172,6 +174,23 @@ for tr in journal:
     for name, rule in RULES.items():
         move, how = simulate(tr, m5, m15, info, rule)
         row["results"][name] = {"R": move / risk_px, "usd": move * usd_per_px, "exit": how}
+    # Entry-timing variants (added 2026-09-28): same decision and the same
+    # stop/target DISTANCES, but entered at the close of the M5 bar
+    # ENTRY_DELAYS_MIN later (at the ask for a buy, the bid for a sell), with
+    # the static rule now live. The 40h/weekend clock still runs from the
+    # delayed entry.
+    for delay in ENTRY_DELAYS_MIN:
+        t_entry = opened + timedelta(minutes=delay)
+        bar = next((b for b in m5 if bar_utc(b["time"]) + timedelta(minutes=5) >= t_entry), None)
+        if bar is None:
+            continue
+        spr = (bar["spread"] or 0) * info.point
+        new_entry = bar["close"] + (spr if tr["side"] == "buy" else 0)
+        shifted = {**tr, "entry_price": new_entry, "opened_at": (bar_utc(bar["time"]) + timedelta(minutes=5)).isoformat(),
+                   "stop_loss": new_entry + (tr["stop_loss"] - tr["entry_price"]),
+                   "take_profit": new_entry + (tr["take_profit"] - tr["entry_price"])}
+        move, how = simulate(shifted, m5, m15, info, RULES["static"])
+        row["results"][f"static_entry+{delay}m"] = {"R": move / risk_px, "usd": move * usd_per_px, "exit": how}
     rows.append(row)
 
 json.dump(rows, open(out_path, "w"), indent=1, default=float)
