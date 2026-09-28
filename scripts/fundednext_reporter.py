@@ -256,6 +256,19 @@ RESEARCH_PASSES_ENABLED = False
 
 BREAKEVEN_POLL_SECONDS = 300
 BREAKEVEN_TRIGGER_FRACTION = 0.5
+
+# Stop-moving rules OFF (2026-09-24 exit replay, applied 2026-09-28 at the
+# user's request): replaying all 34 closed trades on M5 bars, plain
+# stop+target (plus the MAX_HOLD_HOURS time stop and the weekend flatten)
+# scored -0.97R total vs. -6.47R under the three stop-moving rules below --
+# each layer cut winners short while losers still took the full -1R
+# (Exness avg win 0.47R with them vs. 1.15R without; early-profit trail
+# ~-3.4R, time-decay trail ~-1R, breakeven-at-50%-of-target ~-1.2R).
+# Small sample, but every added layer lowered the total. With this False,
+# _profit_protection_check only enforces the MAX_HOLD_HOURS flatten;
+# breakeven (rule 1), early-profit trail (rule 2) and time-decay (rule 3b)
+# are skipped. Flip to True to restore them.
+STOP_TRAILING_ENABLED = False
 BREAKEVEN_BUFFER_POINTS = 20
 EARLY_PROFIT_TRIGGER_USD = 8.0
 MAX_HOLD_HOURS = 40.0
@@ -1011,6 +1024,9 @@ def _profit_protection_check() -> None:
                         pos.get("ticket"), result.get("error"),
                     )
                 continue
+
+            if not STOP_TRAILING_ENABLED:
+                continue  # plain stop+target -- see STOP_TRAILING_ENABLED
 
             entry, sl, tp, price = pos.get("price_open"), pos.get("stop_loss"), pos.get("take_profit"), pos.get("price_current")
             side = pos.get("side")

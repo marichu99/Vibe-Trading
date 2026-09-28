@@ -331,6 +331,9 @@ class TestProfitProtectionCheckSilentLookupFailures:
         import src.trading.service as service
 
         trade = self._trade(**(trade_overrides or {}))
+        # These tests exercise the stop-moving rules themselves, which are
+        # off in production (STOP_TRAILING_ENABLED) but kept behind the switch.
+        monkeypatch.setattr(fr, "STOP_TRAILING_ENABLED", True)
         monkeypatch.setattr(fr, "TARGETS", [{"committee": "x", "target": "x", "market": "forex", "trade": trade}])
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
 
@@ -836,3 +839,8 @@ class TestWeekendFlattenTiming:
         fr._weekend_flatten_and_notify()
 
         assert len(sent) == 2 and all("Closed BUY" in text for text in sent)
+
+
+class TestStopTrailingDisabled:
+    def test_production_default_is_off(self) -> None:
+        assert fr.STOP_TRAILING_ENABLED is False

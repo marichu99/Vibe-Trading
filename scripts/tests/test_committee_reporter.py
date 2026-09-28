@@ -981,6 +981,9 @@ class TestProfitProtectionCheckTimeDecay:
         import src.trading.profiles as profiles_module
         import src.trading.service as service
 
+        # These tests exercise the stop-moving rules themselves, which are
+        # off in production (STOP_TRAILING_ENABLED) but kept behind the switch.
+        monkeypatch.setattr(cr, "STOP_TRAILING_ENABLED", True)
         monkeypatch.setattr(cr, "TARGETS", [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade()}])
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
 
@@ -1119,6 +1122,7 @@ class TestProfitProtectionCheckTimeDecay:
         import src.trading.profiles as profiles_module
         import src.trading.connectors.mt5.sdk as mt5_sdk
 
+        monkeypatch.setattr(cr, "STOP_TRAILING_ENABLED", True)  # exercises rule 2 itself
         custom_trigger = 1.00  # trigger_distance = 1.00 / (100_000 * 0.01) = 0.001
         # Price has moved 0.0015 above entry -- past the custom trigger_
         # distance (0.001) but nowhere near the module default's 0.008, and
@@ -1207,6 +1211,42 @@ class TestProfitProtectionCheckTimeDecay:
         assert pos["stop_loss"] < new_sl < pos["price_open"]
 
 
+class TestStopTrailingDisabled:
+    """Production setting (STOP_TRAILING_ENABLED=False): plain stop+target."""
+
+    _fixture = TestProfitProtectionCheckTimeDecay()
+
+    def _position(self, **kwargs):
+        return self._fixture._position(**kwargs)
+
+    def _patch_broker(self, monkeypatch, **kwargs):
+        calls = self._fixture._patch_broker(monkeypatch, **kwargs)
+        monkeypatch.setattr(cr, "STOP_TRAILING_ENABLED", False)
+        return calls
+
+    def test_production_default_is_off(self) -> None:
+        assert cr.STOP_TRAILING_ENABLED is False
+
+    def test_never_moves_stop_even_deep_in_profit_and_late(self, monkeypatch) -> None:
+        # Past halfway to target, past the early-profit trigger, and inside
+        # the time-decay window -- all three old rules would have fired.
+        pos = self._position(hours_open=cr.MAX_HOLD_HOURS * 0.9, ticket="T9")
+        pos["price_current"] = pos["take_profit"] - (pos["take_profit"] - pos["price_open"]) * 0.1
+        calls = self._patch_broker(monkeypatch, positions=[pos])
+
+        cr._profit_protection_check()
+
+        assert calls["modify"] == [] and calls["close"] == []
+
+    def test_time_stop_still_flattens(self, monkeypatch) -> None:
+        pos = self._position(hours_open=cr.MAX_HOLD_HOURS + 1, ticket="T10")
+        calls = self._patch_broker(monkeypatch, positions=[pos])
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == [{"ticket": "T10"}]
+
+
 class TestProfitProtectionCheckSilentLookupFailures:
     """2026-09-21: found while investigating two gold reversal trades that
     moved well past every protection trigger and still closed at a near-
@@ -1241,6 +1281,9 @@ class TestProfitProtectionCheckSilentLookupFailures:
         import src.trading.service as service
 
         trade = self._trade(**(trade_overrides or {}))
+        # These tests exercise the stop-moving rules themselves, which are
+        # off in production (STOP_TRAILING_ENABLED) but kept behind the switch.
+        monkeypatch.setattr(cr, "STOP_TRAILING_ENABLED", True)
         monkeypatch.setattr(cr, "TARGETS", [{"committee": "x", "target": "x", "market": "forex", "trade": trade}])
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
 
