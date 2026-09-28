@@ -100,7 +100,7 @@ def _reset_worktree_to_base() -> None:
     starts from a clean, current copy, regardless of whatever a previous
     (possibly interrupted) run left lying around in it.
     """
-    _run(["git", "fetch", "origin", BASE_BRANCH], cwd=WORKTREE_DIR, timeout=60)
+    _run(["git", "fetch", "--prune", "origin"], cwd=WORKTREE_DIR, timeout=60)
     result = _run(
         ["git", "checkout", "-B", SCRATCH_BRANCH, f"origin/{BASE_BRANCH}"],
         cwd=WORKTREE_DIR, timeout=30,
@@ -158,7 +158,61 @@ def _recent_runtime_error_summary(hours: int = 24) -> str:
     return "\n".join(findings)
 
 
-def _build_prompt(runtime_errors: str) -> str:
+def _extract_fixes(commit_body: str) -> str:
+    """The 'Fixes:' section of a repair commit message (up to 'Tests:'), or ''."""
+    lines = commit_body.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Fixes:"):
+            out = [line.strip()]
+            for nxt in lines[i + 1:]:
+                if nxt.strip().startswith(("Tests:", "Co-Authored-By:")):
+                    break
+                if nxt.strip():
+                    out.append(nxt.strip())
+            return "\n".join(out)[:1500]
+    return ""
+
+
+def _already_proposed_summary() -> str:
+    """What earlier runs already proposed (unmerged branches) or landed recently.
+
+    Added 2026-09-28: with nothing reviewed for a week, the agent re-found
+    the same fill-price bug on 5 separate days and the weekend-flatten bug
+    on 3, each time as a fresh branch. This is fed back into the prompt so
+    a still-pending proposal isn't re-proposed.
+    """
+    parts = []
+    branches = _run(["git", "branch", "-r", "--list", "origin/daily-repair/*"], cwd=WORKTREE_DIR, timeout=30)
+    for ref in sorted(b.strip() for b in branches.stdout.splitlines() if b.strip()):
+        body = _run(["git", "log", "-1", "--format=%B", ref], cwd=WORKTREE_DIR, timeout=30).stdout
+        fixes = _extract_fixes(body)
+        if fixes:
+            parts.append(f"[{ref.replace('origin/', '')} -- still UNMERGED, awaiting review]\n{fixes}")
+    recent = _run(
+        ["git", "log", f"origin/{BASE_BRANCH}", "--since=14.days", "--no-merges", "--format=- %s"],
+        cwd=WORKTREE_DIR, timeout=30,
+    ).stdout.strip()
+    if recent:
+        parts.append(f"[Commits that landed on {BASE_BRANCH} in the last 14 days]\n{recent[:4000]}")
+    return "\n\n".join(parts) or "(none)"
+
+
+def _email_summary(subject: str, body: str) -> None:
+    """Email the user via the reporters' own SMTP settings; never raises."""
+    try:
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        sys.path.insert(0, str(REPO_ROOT / "agent"))
+        from src.providers.llm import _ensure_dotenv
+
+        _ensure_dotenv()
+        from committee_reporter import send_email
+
+        send_email(subject, body)
+    except Exception:
+        logger.exception("could not email repair summary")
+
+
+def _build_prompt(runtime_errors: str, already_proposed: str = "(none)") -> str:
     return f"""You are running as an unattended daily maintenance pass over this repo
 (Vibe-Trading: two live MT5 forex trading bots run by LLM committees, real
 money on both accounts). Your ONLY job this run: find and fix genuine
@@ -199,15 +253,23 @@ What to check, in order:
 
 {runtime_errors}
 
-4. For every genuine bug found: fix it with the smallest correct change,
+4. ALREADY PROPOSED OR RECENTLY FIXED -- do NOT fix any of these again.
+   An unmerged branch below is waiting for human review; re-fixing it just
+   creates a duplicate PR. If you believe one of them is still wrong or
+   incomplete on the current code, say so in your summary instead of
+   editing. Only fix bugs that are genuinely NEW relative to this list:
+
+{already_proposed}
+
+5. For every genuine NEW bug found: fix it with the smallest correct change,
    and add or update a test that would have caught it (this repo's test
    convention: monkeypatch every `*_PATH` constant and every external call
    -- zero real network/MT5/subprocess calls in tests; see existing tests
    in scripts/tests/ for the pattern).
-5. Re-run the full test suite (same command as step 1). Every fix must
+6. Re-run the full test suite (same command as step 1). Every fix must
    leave it green. If you can't get a fix to a green, passing state,
    revert that specific fix rather than leaving the suite red.
-6. End your final answer with a structured summary in exactly this form:
+7. End your final answer with a structured summary in exactly this form:
    Files changed: <comma-separated list, or "none">
    Fixes: <one line per fix: file:function -- the concrete failure
    scenario it addresses -- or "none found" if nothing genuine turned up>
@@ -333,7 +395,7 @@ def main() -> int:
 
         _reset_worktree_to_base()
         runtime_errors = _recent_runtime_error_summary()
-        prompt = _build_prompt(runtime_errors)
+        prompt = _build_prompt(runtime_errors, _already_proposed_summary())
 
         try:
             result = _run_claude(prompt)
@@ -358,6 +420,11 @@ def main() -> int:
 
         if not _tests_pass():
             logger.warning("tests failed after the repair pass -- discarding changes, NOT opening a PR")
+            _email_summary(
+                f"[Vibe-Trading] Daily repair {date_str}: fix FAILED tests (discarded)",
+                f"The repair agent changed code but the test suite failed, so nothing was proposed.\n\n"
+                f"{claude_summary}",
+            )
             _run(["git", "checkout", "."], cwd=WORKTREE_DIR, timeout=30)
             _run(["git", "clean", "-fd"], cwd=WORKTREE_DIR, timeout=30)
             return 1
@@ -365,6 +432,12 @@ def main() -> int:
         pr_url = _commit_and_open_pr(date_str, claude_summary)
         if pr_url:
             logger.info("opened PR: %s", pr_url)
+            _email_summary(
+                f"[Vibe-Trading] Daily repair {date_str}: new fix proposed -- please review",
+                f"A new bug fix is waiting for your review: {pr_url}\n\n"
+                f"Unreviewed proposals pile up (a week of them was found on 2026-09-28, several "
+                f"re-finding the same bug), so please merge or close it.\n\n{claude_summary}",
+            )
         else:
             logger.warning("changes existed and tests passed, but PR creation failed -- see log above")
         return 0
