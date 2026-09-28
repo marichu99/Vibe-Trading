@@ -324,6 +324,9 @@ def swarm_instruction(committee: str, target: str, market: str, pack_path: Path 
         f"After those two lines, add your summary of the facts below. Every swarm agent is "
         f"instructed to read_file that data pack first, so keep the DATA PACK FILE line exactly as "
         f"written.\n\n"
+        f'If run_swarm returns an error, do NOT retry without preset_name or with a different preset '
+        f'-- a different committee is not a substitute. Place no order, and report the error text '
+        f"verbatim as the reason no order was placed.\n\n"
     )
 
 

@@ -39,7 +39,14 @@ OUTCOME_HOURS = 8
 
 logger = logging.getLogger(__name__)
 
-_DECISION_RE = re.compile(r"^Decision:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
+# The wrapper is asked for a "Decision:" line but doesn't always comply --
+# 2026-09-28's first live report used "**Direction:** SHORT" and a markdown
+# "| **Side** | SELL (SHORT) |" row instead. Tried in this order.
+_DECISION_RES = (
+    re.compile(r"^\W*Decision\W*:\s*(.+)$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^\W*Direction\W*:\s*(.+)$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^\|\W*Side\W*\|\s*([^|]+)\|", re.MULTILINE | re.IGNORECASE),
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -48,7 +55,7 @@ _DECISION_RE = re.compile(r"^Decision:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
 
 def parse_decision(report_text: str) -> str:
     """Classify the report's 'Decision:' line as long / short / wait / unknown."""
-    match = _DECISION_RE.search(report_text or "")
+    match = next((m for m in (r.search(report_text or "") for r in _DECISION_RES) if m), None)
     if not match:
         return "unknown"
     # The FIRST action word wins: "wait; would go long above 1.1400" is a

@@ -119,3 +119,29 @@ class TestSwarmPlumbing:
         assert all("DATA PACK FILE" in a["system_prompt"] for a in agents)
         head = next(a for a in agents if a["id"] == "head_trader")
         assert "Reward:risk floor" in head["system_prompt"]
+
+
+class TestExplicitPresetResolution:
+    def test_fx_desk_is_accepted_by_name(self) -> None:
+        # Regression 2026-09-28: rejected as "Unknown preset_name", after which the
+        # wrapper retried unnamed and keyword routing picked unrelated desks.
+        from src.tools.swarm_tool import _resolve_preset
+
+        assert _resolve_preset("DATA PACK FILE: x\nEURUSD (forex)", "fx_commodity_day_desk") == ("fx_commodity_day_desk", None)
+
+    def test_every_bundled_yaml_is_a_valid_explicit_name(self) -> None:
+        from pathlib import Path
+        from src.tools.swarm_tool import _PRESET_NAMES
+
+        presets_dir = Path(mdp.AGENT_DIR) / "src" / "swarm" / "presets"
+        assert {p.stem for p in presets_dir.glob("*.yaml")} <= _PRESET_NAMES
+
+    def test_unknown_name_still_rejected(self) -> None:
+        from src.tools.swarm_tool import _resolve_preset
+
+        preset, error = _resolve_preset("x", "not_a_real_desk")
+        assert preset is None and "Unknown preset_name" in error
+
+    def test_instruction_forbids_fallback_to_another_preset(self) -> None:
+        text = mdp.swarm_instruction("fx_commodity_day_desk", "EURUSD", "forex", Path("C:/a/b.md"))
+        assert "do NOT retry without preset_name" in text

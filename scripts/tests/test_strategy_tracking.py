@@ -21,6 +21,8 @@ class TestParseDecision:
         ("Decision: HOLD / no trade this session", "wait"),
         ("Decision: wait; would go long above 1.1400", "wait"),
         ("no decision line at all", "unknown"),
+        ("**Direction:** SHORT — H4 and D1 both in confirmed downtrend", "short"),
+        ("| **Side** | SELL (SHORT) |", "short"),
     ])
     def test_classifies(self, line, expected) -> None:
         assert st.parse_decision(f"blah\n{line}\nReasoning: x") == expected
