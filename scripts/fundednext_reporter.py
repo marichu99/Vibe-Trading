@@ -123,8 +123,13 @@ TARGETS: list[dict[str, object]] = [
     {
         "committee": "fx_commodity_day_desk", "target": "EURUSD", "market": "forex",
         "trade": {
-            "symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1,
-            "early_profit_trigger_usd": 24.00,
+            # HALVED 2026-09-28 (0.24 -> 0.12, ~$16 risk) at the user's request
+            # while the new FX committee + plain stop/target exits prove out:
+            # the account was 0/5 with ~$165 of room left above the 4.8%
+            # MAX_DRAWDOWN_HALT_PCT floor (~5 full losses at 0.24). Scale back
+            # up after ~10 trades if results hold.
+            "symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.12, "max_stack": 1,
+            "early_profit_trigger_usd": 12.00,
         },
     },
     # PAUSED 2026-09-24 at the user's request, purely to halve LLM spend --
@@ -193,8 +198,9 @@ TARGETS: list[dict[str, object]] = [
         # the same ~10-pip arming distance EURUSD's $24 at 0.24 lots uses.
         "committee": "fx_commodity_day_desk", "target": "GBPUSD", "market": "forex",
         "trade": {
-            "symbol": "GBPUSD", "connection": "mt5fn-live-trade", "lots": 0.30, "max_stack": 1,
-            "early_profit_trigger_usd": 30.00,
+            # HALVED 2026-09-28 (0.30 -> 0.15, ~$12-16 risk) with EURUSD above.
+            "symbol": "GBPUSD", "connection": "mt5fn-live-trade", "lots": 0.15, "max_stack": 1,
+            "early_profit_trigger_usd": 15.00,
         },
     },
 ]
@@ -923,6 +929,26 @@ def _weekend_flatten_and_notify() -> None:
     _write_weekend_state({"week": week_key})
 
 
+def _broker_time_to_utc(raw) -> datetime | None:
+    """Convert a position's MT5 "time" to true UTC, or None if unparseable.
+
+    MT5 reports the broker's LOCAL server clock encoded as if it were UTC
+    (same skew fixed in sdk._recent_deals). FundedNext's server runs on
+    fundednext_state._SERVER_TZ (EET/EEST), so the "+00:00" label is
+    dropped and the wall-clock time re-read in that zone. Confirmed live
+    2026-09-24: a position opened 12:11 UTC was reported as 15:11 "UTC".
+    Fixed 2026-09-28 -- before this the MAX_HOLD_HOURS time stop fired
+    ~3h late (~43h instead of 40h).
+    """
+    if not raw:
+        return None
+    try:
+        wall_clock = datetime.fromisoformat(str(raw)).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return None
+    return wall_clock.replace(tzinfo=fn_state._SERVER_TZ).astimezone(timezone.utc)
+
+
 def _between_passes_tick(now_utc: datetime) -> None:
     """One BREAKEVEN_POLL_SECONDS tick between scheduled committee passes.
 
@@ -986,24 +1012,9 @@ def _profit_protection_check() -> None:
         for pos in ours:
             max_hold_hours = trade.get("max_hold_hours", MAX_HOLD_HOURS)
             elapsed_hours = None
-            # Note: pos["time"] is a raw MT5 epoch value -- same broker-
-            # local-time-mislabeled-as-UTC skew found and fixed in
-            # _recent_deals (agent/src/trading/connectors/mt5/sdk.py) can
-            # under-count elapsed_hours here by roughly the broker's UTC
-            # offset (currently ~3h). Lower severity than the journal-
-            # reconciliation miss that fix addressed (this only shifts
-            # MAX_HOLD_HOURS's ~40h window by a few hours, not a hard
-            # correctness failure), so left as a known imprecision rather
-            # than reworked here -- revisit if MAX_HOLD_HOURS is ever
-            # tightened close to that offset's scale.
-            opened_raw = pos.get("time")
-            if opened_raw:
-                try:
-                    elapsed_hours = (
-                        datetime.now(timezone.utc) - datetime.fromisoformat(str(opened_raw))
-                    ).total_seconds() / 3600.0
-                except (TypeError, ValueError):
-                    elapsed_hours = None
+            opened_utc = _broker_time_to_utc(pos.get("time"))
+            if opened_utc is not None:
+                elapsed_hours = (datetime.now(timezone.utc) - opened_utc).total_seconds() / 3600.0
 
             if elapsed_hours is not None and elapsed_hours >= max_hold_hours:
                 try:

@@ -725,7 +725,7 @@ class TestExclusiveGroupConflict:
     def test_targets_are_eurusd_and_gbpusd(self) -> None:
         assert [t["trade"]["symbol"] for t in fr.TARGETS] == ["EURUSD", "GBPUSD"]
         gbp = next(t["trade"] for t in fr.TARGETS if t["trade"]["symbol"] == "GBPUSD")
-        assert gbp["lots"] == 0.30 and gbp["max_stack"] == 1
+        assert gbp["lots"] == 0.15 and gbp["max_stack"] == 1
 
 
 class TestRunOnceSkipsOnCorrelationConflict:
@@ -844,3 +844,19 @@ class TestWeekendFlattenTiming:
 class TestStopTrailingDisabled:
     def test_production_default_is_off(self) -> None:
         assert fr.STOP_TRAILING_ENABLED is False
+
+
+class TestBrokerTimeToUtc:
+    def test_reinterprets_server_wall_clock_as_eest(self) -> None:
+        # Live 2026-09-24: opened 12:11 UTC, MT5 reported "15:11+00:00" (EEST = UTC+3).
+        assert fr._broker_time_to_utc("2026-09-24T15:11:20+00:00") == datetime(2026, 9, 24, 12, 11, 20, tzinfo=timezone.utc)
+
+    def test_winter_offset_is_two_hours(self) -> None:
+        assert fr._broker_time_to_utc("2026-12-01T10:00:00+00:00") == datetime(2026, 12, 1, 8, 0, tzinfo=timezone.utc)
+
+    def test_unparseable_is_none(self) -> None:
+        assert fr._broker_time_to_utc("not a time") is None and fr._broker_time_to_utc(None) is None
+
+    def test_halved_lots(self) -> None:
+        lots = {t["trade"]["symbol"]: t["trade"]["lots"] for t in fr.TARGETS}
+        assert lots == {"EURUSD": 0.12, "GBPUSD": 0.15}
