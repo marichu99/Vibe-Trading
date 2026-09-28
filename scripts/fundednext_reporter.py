@@ -1548,6 +1548,9 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             placed_order["fill_price"] = resolved_price
         spec_note = (_enforce_trend_rule(trade, placed_order, trend_allowed)
                      or _post_trade_spec_check(trade, placed_order))
+        floor_note, floor_closed = ("", False) if spec_note else _post_trade_stop_floor_check(trade, placed_order)
+        if floor_closed:
+            spec_note = floor_note
         if spec_note:
             # A spec violation is CLOSED, not just reported -- see
             # _post_trade_spec_check's docstring for why this is a real
@@ -1555,6 +1558,7 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             report_text = report_text + spec_note
             traded = False
         else:
+            report_text = report_text + floor_note
             report_text = report_text + _post_trade_cap_check(trade)
             report_text = report_text + _post_trade_spread_check(trade, placed_order)
             report_text = report_text + _post_trade_reward_risk_check(trade, placed_order)
@@ -1721,6 +1725,86 @@ def _post_trade_cap_check(trade: dict) -> str:
             f"The agent's own count was wrong somewhere; check manually."
         )
     return ""
+
+
+def _post_trade_stop_floor_check(trade: dict, placed_order: dict) -> tuple[str, bool]:
+    """Hard check: a just-filled stop tighter than the noise floor is widened, or the trade closed.
+
+    Added 2026-09-29 at the user's request, after a 2026-09-28 plan carried a
+    2.3-pip EURUSD stop -- far inside normal noise. The prompt already gives
+    the committee the ATR/spread floor, but nothing enforced it in code.
+    The floor is the larger of _atr_stop_floor and _spread_stop_floor (the
+    same floor _post_trade_reward_risk_check refuses to tighten past):
+      - stop at/outside the floor -> ("", False), nothing to do;
+      - inside the floor, and the floor-distance loss fits the per-trade
+        risk cap -> widen the stop to the floor on the live position and
+        update placed_order["stop_loss"], so the reward:risk check that runs
+        next sees (and if needed widens the target for) the real stop;
+      - inside the floor, but a floor-distance stop would exceed the cap ->
+        close the position: there is no noise-safe stop within budget.
+    Returns (report note, closed). Fails open (no action) if the floor or
+    contract size can't be read -- the loss cap is still enforced upstream.
+    """
+    side = placed_order.get("side")
+    entry = _resolve_fill_price(trade, placed_order)
+    sl = placed_order.get("stop_loss")
+    if side not in ("buy", "sell") or entry is None or sl is None:
+        return "", False
+    entry, sl = float(entry), float(sl)
+    is_buy = side == "buy"
+    stop_distance = (entry - sl) if is_buy else (sl - entry)
+    symbol, connection = trade["symbol"], trade["connection"]
+    quote = _symbol_live_quote(symbol, connection)
+    floor_distance = max(_atr_stop_floor(symbol, connection) or 0.0, _spread_stop_floor(quote) or 0.0)
+    if floor_distance <= 0 or stop_distance >= floor_distance:
+        return "", False
+
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.service import get_positions
+
+    try:
+        size = float(mt5_sdk.contract_size(symbol, config=_mt5_config_for(connection)))
+    except Exception:
+        return "", False
+    floor_loss = floor_distance * size * float(trade["lots"])
+    budget = fn_guard.effective_max_loss_usd(connection)
+    header = (
+        f"{symbol}'s filled stop was only {stop_distance:.5f} from entry {entry:.5f}, inside the "
+        f"{floor_distance:.5f} noise floor (1.5x 15m ATR / spread)"
+    )
+    ticket = str(placed_order.get("order_id") or "").strip()
+    try:
+        pos = next((p for p in get_positions(connection).get("positions", [])
+                    if ticket and str(p.get("ticket")) == ticket and p.get("magic") == OUR_MAGIC), None)
+    except Exception as exc:
+        return f"\n\n[STOP FLOOR] {header}; could not read positions to fix it ({exc}) -- check manually.", False
+    if pos is None:
+        return f"\n\n[STOP FLOOR] {header}; no open position with ticket {ticket or '?'} to fix -- check manually.", False
+    config = _mt5_config_for(connection)
+
+    if floor_loss > budget:
+        result = mt5_sdk.close_position(config, ticket=pos.get("ticket"))
+        logger.warning("stop floor: closed %s ticket %s (floor loss $%.2f > cap $%.2f): %s",
+                       symbol, ticket, floor_loss, budget, result.get("status"))
+        return (
+            f"\n\n[STOP FLOOR -- ORDER CLOSED] {header}. A floor-distance stop would risk "
+            f"${floor_loss:.2f}, over the ${budget:.2f} per-trade cap, so there is no noise-safe stop "
+            f"within budget; position closed ({result.get('status')})."
+        ), True
+
+    new_sl = entry - floor_distance if is_buy else entry + floor_distance
+    result = mt5_sdk.modify_position(config, ticket=pos.get("ticket"), stop_loss=new_sl,
+                                     take_profit=placed_order.get("take_profit"))
+    if result.get("status") != "ok":
+        return (f"\n\n[STOP FLOOR] {header}; widening the stop to {new_sl:.5f} FAILED "
+                f"({result.get('error')}) -- check manually."), False
+    placed_order["stop_loss"] = new_sl
+    logger.info("stop floor: widened %s ticket %s stop %.5f -> %.5f", symbol, ticket, sl, new_sl)
+    return (
+        f"\n\n[STOP FLOOR -- STOP WIDENED] {header}; stop moved to {new_sl:.5f} "
+        f"(risk now ${floor_loss:.2f}, within the ${budget:.2f} cap)."
+    ), False
 
 
 def _post_trade_spread_check(trade: dict, placed_order: dict) -> str:
