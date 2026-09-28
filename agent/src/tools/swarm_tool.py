@@ -668,6 +668,7 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
         "geopolitical_war_room": {"crisis": g, "market": market},
         "pairs_research_lab": {"market": market, "sector": _extract_sector(prompt)},
         "investment_committee": {"target": g, "market": market},
+        "fx_commodity_day_desk": {"target": g, "market": market},
         "value_investing_committee": {"company": g, "market": market},
         "macro_strategy_forum": {"market": market, "horizon": "quarterly"},
         "statistical_arbitrage_desk": {"market": market, "goal": g, "sector": _extract_sector(prompt)},

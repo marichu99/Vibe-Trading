@@ -46,6 +46,8 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import market_data_pack  # same scripts/ directory
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT_DIR = REPO_ROOT / "agent"
 
@@ -113,7 +115,7 @@ TARGETS: list[dict[str, object]] = [
         # own ~0.00076-price-unit (~7.6-pip, ~$0.76) 15m-ATR stop floor
         # verified above — enough headroom past ordinary noise to avoid
         # arming on a whipsaw, but reachable by a real favorable move.
-        "committee": "investment_committee", "target": "EURUSD", "market": "forex",
+        "committee": "fx_commodity_day_desk", "target": "EURUSD", "market": "forex",
         "trade": {
             "symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
             "early_profit_trigger_usd": 1.00,
@@ -132,7 +134,7 @@ TARGETS: list[dict[str, object]] = [
         # stop floor vs. ~7% for EURUSDm -- tradable, but a real cost gap.
         # early_profit_trigger_usd $1.00 = 10 pips at 0.01 lots, the same
         # arming distance as EURUSDm's.
-        "committee": "investment_committee", "target": "GBPUSD", "market": "forex",
+        "committee": "fx_commodity_day_desk", "target": "GBPUSD", "market": "forex",
         "trade": {
             "symbol": "GBPUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
             "early_profit_trigger_usd": 1.00,
@@ -2039,11 +2041,16 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
     journal_fact = _journal_summary_text(symbol)
     journal_block = f"{journal_fact}\n\n" if journal_fact else ""
 
+    # Verified broker data for the swarm agents (see scripts/market_data_pack.py).
+    # Fails soft: a None path just drops the DATA PACK line.
+    pack_path = market_data_pack.write_data_pack(symbol, connection)
+    swarm_intro = market_data_pack.swarm_instruction(committee, target, market, pack_path)
     session_bias_fact = _session_bias_fact(symbol)
     session_bias_block = f"{session_bias_fact}\n\n" if session_bias_fact else ""
 
     return (
-        f'Run the {committee} swarm with target="{target}" ({market}) to produce its full debate '
+        f"{swarm_intro}"
+        f"The swarm must produce its full debate "
         f"and final decision, including concrete stop-loss and take-profit price levels — every "
         f"committee decision must carry these, not just a direction.\n\n"
         f"{quote_fact}\n\n"
@@ -2053,7 +2060,8 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
         f"{journal_block}"
         f"{session_bias_block}"
         f"{_DAY_TRADE_FRAMING}"
-        f"Then, based ONLY on the portfolio manager's final decision:\n"
+        f"Then, based ONLY on the swarm's final decision (made by its final decision-maker -- the "
+        f"head trader on fx_commodity_day_desk; 'PM' below means that final decision-maker):\n"
         + (
             "- Consider the signal-service activity above as one more input to the debate — a second "
             "opinion, not a directive to mirror or fade.\n"

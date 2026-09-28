@@ -191,6 +191,10 @@ class SwarmRun(BaseModel):
     provider: str | None = None
     model: str | None = None
     grounding_data: dict[str, list[dict]] | None = None
+    # Preset-level opt-out (``grounding: false`` in the YAML): skip the
+    # symbol-grounding prefetch entirely for presets whose callers supply
+    # their own verified data (e.g. fx_commodity_day_desk's data pack).
+    grounding_enabled: bool = True
 
 
 class WorkerResult(BaseModel):

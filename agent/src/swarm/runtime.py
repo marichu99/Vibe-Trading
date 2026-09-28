@@ -407,6 +407,8 @@ class SwarmRuntime:
 
     def _prefetch_grounding_data(self, run: SwarmRun) -> None:
         """Fetch run-level grounding data without blocking ``start_run``."""
+        if not run.grounding_enabled:
+            return
         symbols = grounding.extract_symbols_from_user_vars(run.user_vars)
         if not symbols:
             return

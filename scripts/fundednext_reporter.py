@@ -71,6 +71,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 import fundednext_guardrails as fn_guard  # noqa: E402
 import fundednext_news_calendar as fn_news  # noqa: E402
 import fundednext_state as fn_state  # noqa: E402
+import market_data_pack  # noqa: E402
 
 # See committee_reporter.py's own comment for why this is needed on Windows
 # (stdout/stderr default to the system ANSI codepage when redirected to a
@@ -120,7 +121,7 @@ logger = logging.getLogger("fundednext_reporter")
 # size, undermining the reward:risk floor this session also added.
 TARGETS: list[dict[str, object]] = [
     {
-        "committee": "investment_committee", "target": "EURUSD", "market": "forex",
+        "committee": "fx_commodity_day_desk", "target": "EURUSD", "market": "forex",
         "trade": {
             "symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1,
             "early_profit_trigger_usd": 24.00,
@@ -190,7 +191,7 @@ TARGETS: list[dict[str, object]] = [
         # at 0.30 lots, same ~$20-25 band as EURUSD and inside the ~$59.46
         # cap. early_profit_trigger_usd $30 = 10 pips at 0.30 lots ($3/pip),
         # the same ~10-pip arming distance EURUSD's $24 at 0.24 lots uses.
-        "committee": "investment_committee", "target": "GBPUSD", "market": "forex",
+        "committee": "fx_commodity_day_desk", "target": "GBPUSD", "market": "forex",
         "trade": {
             "symbol": "GBPUSD", "connection": "mt5fn-live-trade", "lots": 0.30, "max_stack": 1,
             "early_profit_trigger_usd": 30.00,
@@ -1319,11 +1320,16 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
     journal_fact = _journal_summary_text(symbol)
     journal_block = f"{journal_fact}\n\n" if journal_fact else ""
 
+    # Verified broker data for the swarm agents (see scripts/market_data_pack.py).
+    # Fails soft: a None path just drops the DATA PACK line.
+    pack_path = market_data_pack.write_data_pack(symbol, connection)
+    swarm_intro = market_data_pack.swarm_instruction(committee, target, market, pack_path)
     session_bias_fact = _session_bias_fact(symbol)
     session_bias_block = f"{session_bias_fact}\n\n" if session_bias_fact else ""
 
     return (
-        f'Run the {committee} swarm with target="{target}" ({market}) to produce its full debate '
+        f"{swarm_intro}"
+        f"The swarm must produce its full debate "
         f"and final decision, including concrete stop-loss and take-profit price levels — every "
         f"committee decision must carry these, not just a direction.\n\n"
         f"{quote_fact}\n\n"
@@ -1332,7 +1338,8 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
         f"{journal_block}"
         f"{session_bias_block}"
         f"{_challenge_framing(connection)}"
-        f"Then, based ONLY on the portfolio manager's final decision:\n"
+        f"Then, based ONLY on the swarm's final decision (made by its final decision-maker -- the "
+        f"head trader on fx_commodity_day_desk; 'PM' below means that final decision-maker):\n"
         f"- {position_fact} Still call trading_positions yourself too (for your own report, and as a "
         f"last-moment freshness check) — but use the verified fact above, not just your own count, to "
         f"decide whether to trade.\n\n"
