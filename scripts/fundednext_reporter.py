@@ -72,6 +72,7 @@ import fundednext_guardrails as fn_guard  # noqa: E402
 import fundednext_news_calendar as fn_news  # noqa: E402
 import fundednext_state as fn_state  # noqa: E402
 import market_data_pack  # noqa: E402
+import strategy_tracking  # noqa: E402
 
 # See committee_reporter.py's own comment for why this is needed on Windows
 # (stdout/stderr default to the system ANSI codepage when redirected to a
@@ -276,6 +277,17 @@ BREAKEVEN_TRIGGER_FRACTION = 0.5
 # breakeven (rule 1), early-profit trail (rule 2) and time-decay (rule 3b)
 # are skipped. Flip to True to restore them.
 STOP_TRAILING_ENABLED = False
+
+# Hard trend gate ON (2026-09-28, user's request): when H4 and D1 both trend
+# the same way, only that direction may be traded -- told to the committee
+# up front (strategy_tracking.trend_rule_prompt) and enforced after the fill
+# (_enforce_trend_rule closes a counter-trend order immediately). Motivated
+# by 2026-09-25, when both bots bought EURUSD into a downtrend on every
+# timeframe. Fails open if trend data can't be read. Flip to False to disable.
+TREND_FILTER_ENABLED = True
+
+BOT = "fundednext"
+BROKER_SERVER_TZ = fn_state._SERVER_TZ  # EET/EEST (verified 2026-09-26: UTC+3)
 BREAKEVEN_BUFFER_POINTS = 20
 EARLY_PROFIT_TRIGGER_USD = 8.0
 MAX_HOLD_HOURS = 40.0
@@ -592,6 +604,7 @@ def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
         "take_profit": order.get("take_profit"),
         "opened_at": datetime.now(timezone.utc).isoformat(),
         "status": "open",
+        "strategy_version": strategy_tracking.STRATEGY_VERSION,
     })
     _write_journal(entries)
     fn_state.record_trading_day()
@@ -850,6 +863,15 @@ def _write_weekend_state(data: dict) -> None:
     WEEKEND_STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
 
 
+def _weekly_report_text() -> str:
+    """Strategy-version comparison for the weekly (weekend) email; never raises."""
+    try:
+        return strategy_tracking.weekly_version_report(_read_journal(), BOT)
+    except Exception:
+        logger.exception("weekly version report failed")
+        return "(strategy version report unavailable this week)"
+
+
 def _weekend_flatten_and_notify() -> None:
     """See module docstring: weekend-flatten stays ON for this account even
     though FundedNext itself permits weekend holding — the tighter
@@ -922,7 +944,7 @@ def _weekend_flatten_and_notify() -> None:
         body_lines.append("No open positions of ours to flatten.")
 
     try:
-        send_email("[FundedNext] Weekend status — market closed", _status_header() + "\n".join(body_lines))
+        send_email("[FundedNext] Weekend status — market closed", _status_header() + "\n".join(body_lines + ["", _weekly_report_text()]))
     except Exception:
         logger.exception("failed to send weekend status email")
 
@@ -963,6 +985,10 @@ def _between_passes_tick(now_utc: datetime) -> None:
     poll interval of the cutoff, while the market is still open, and
     retries each tick if a close fails.
     """
+    try:
+        strategy_tracking.fill_decision_outcomes(BOT, BROKER_SERVER_TZ, now_utc)
+    except Exception:
+        logger.exception("decision outcome fill crashed; continuing")
     if _in_weekend_window(now_utc):
         try:
             _weekend_flatten_and_notify()
@@ -1337,6 +1363,7 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
     swarm_intro = market_data_pack.swarm_instruction(committee, target, market, pack_path)
     session_bias_fact = _session_bias_fact(symbol)
     session_bias_block = f"{session_bias_fact}\n\n" if session_bias_fact else ""
+    trend_block = trade.get("trend_rule", "")
 
     return (
         f"{swarm_intro}"
@@ -1348,6 +1375,7 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
         f"{volatility_block}"
         f"{journal_block}"
         f"{session_bias_block}"
+        f"{trend_block}"
         f"{_challenge_framing(connection)}"
         f"Then, based ONLY on the swarm's final decision (made by its final decision-maker -- the "
         f"head trader on fx_commodity_day_desk; 'PM' below means that final decision-maker):\n"
@@ -1449,6 +1477,13 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             logger.warning("correlation limit for %s: %s", target, conflict)
             trade = None
 
+    trend_allowed = None
+    if trade and TREND_FILTER_ENABLED:
+        trend_allowed, trend_reason = strategy_tracking.trend_gate(trade["symbol"], trade["connection"])
+        logger.info("trend gate for %s: %s", target, trend_reason)
+        if trend_allowed:
+            trade = {**trade, "trend_rule": strategy_tracking.trend_rule_prompt(trend_allowed, trend_reason)}
+
     prompt = _build_prompt(committee, target, market, trade)
     logger.info("running %s on %s (%s)%s", committee, target, market, " [trade-enabled]" if trade else "")
     cmd = [
@@ -1511,7 +1546,8 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         resolved_price = _resolve_fill_price(trade, placed_order)
         if resolved_price is not None:
             placed_order["fill_price"] = resolved_price
-        spec_note = _post_trade_spec_check(trade, placed_order)
+        spec_note = (_enforce_trend_rule(trade, placed_order, trend_allowed)
+                     or _post_trade_spec_check(trade, placed_order))
         if spec_note:
             # A spec violation is CLOSED, not just reported -- see
             # _post_trade_spec_check's docstring for why this is a real
@@ -1630,6 +1666,42 @@ def _post_trade_spec_check(trade: dict, placed_order: dict) -> str:
         f"(src.live.halt.clear_halt) — the committee did not follow the prompt's hardcoded "
         f"order parameters, and this needs human review before further automated trading. "
         f"Close attempt: {closed_note}."
+    )
+
+
+def _enforce_trend_rule(trade: dict, placed_order: dict, allowed: set[str] | None) -> str:
+    """Close a just-filled order that breaks the hard trend gate; returns a report note or "".
+
+    Unlike _post_trade_spec_check this does NOT trip the kill switch -- a
+    counter-trend call is a judgment error the gate exists to catch, not a
+    sign the automation itself is broken. Matches the new order's own
+    ticket only, same as _post_trade_spec_check.
+    """
+    side = str(placed_order.get("side") or "").lower()
+    if not allowed or side not in ("buy", "sell") or side in allowed:
+        return ""
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.service import get_positions
+
+    ticket = str(placed_order.get("order_id") or "").strip()
+    outcome = "could not identify the new position's ticket -- close it manually"
+    if ticket:
+        try:
+            for pos in get_positions(trade["connection"]).get("positions", []):
+                if str(pos.get("ticket")) == ticket and pos.get("magic") == OUR_MAGIC:
+                    result = mt5_sdk.close_position(_mt5_config_for(trade["connection"]), ticket=pos.get("ticket"))
+                    outcome = f"close {result.get('status')}"
+                    break
+            else:
+                outcome = "no open position with that ticket (already closed?)"
+        except Exception as exc:
+            outcome = f"close attempt raised: {exc}"
+    logger.warning("trend gate: closed counter-trend %s %s ticket %s: %s", side, trade["symbol"], ticket, outcome)
+    return (
+        f"\n\n[TREND GATE -- ORDER CLOSED] The committee placed a {side.upper()} on {trade['symbol']} "
+        f"against the hard trend rule (allowed: {', '.join(sorted(allowed)).upper()} only). "
+        f"Ticket {ticket or '?'}: {outcome}."
     )
 
 
@@ -2021,6 +2093,10 @@ def run_once(session: str = "new_york") -> None:
             conflict = _exclusive_group_conflict(spec["trade"])
             if conflict:
                 logger.info("skipping %s committee: %s", target, conflict)
+                strategy_tracking.record_decision(
+                    BOT, spec["trade"]["symbol"], spec["trade"]["connection"],
+                    decision="skipped", traded=False, status="skipped", note=conflict,
+                )
                 try:
                     send_email(
                         f"[FundedNext] {session}: {spec.get('committee', '?')} — {target} (SKIPPED)",
@@ -2047,6 +2123,14 @@ def run_once(session: str = "new_york") -> None:
             except Exception:
                 logger.exception("also failed to send the crash notification email")
             continue
+
+        if trade_enabled and spec.get("trade"):
+            strategy_tracking.record_decision(
+                BOT, spec["trade"]["symbol"], spec["trade"]["connection"],
+                decision=(strategy_tracking.parse_decision(result.report_text)
+                          if result.status == "success" else result.status),
+                traded=result.traded, status=result.status, note=result.error or "",
+            )
 
         if not trade_enabled and result.status == "success":
             trade_spec = spec.get("trade")
