@@ -275,6 +275,23 @@ def _order_classification(connector: str, symbol: str):
     return instrument, None
 
 
+def _apply_symbol_suffix(profile: Any, symbol: str) -> str:
+    """Append the profile's broker symbol suffix (e.g. Exness "m") if missing.
+
+    Real miss 2026-09-29: the Exness committee decided to SELL and called
+    trading_place_order with symbol "EURUSD" instead of the prompt's exact
+    "EURUSDm"; the terminal has no "EURUSD", so the mandate gate couldn't
+    price the notional and denied it twice (fail-closed), and the move it
+    missed paid +2.2R on the FundedNext account. Only applies to profiles
+    that set ``config["symbol_suffix"]``.
+    """
+    suffix = str((getattr(profile, "config", None) or {}).get("symbol_suffix") or "")
+    clean = str(symbol or "").strip()
+    if suffix and clean and not clean.endswith(suffix):
+        return clean + suffix
+    return clean
+
+
 def place_order(
     symbol: str,
     profile_id: str | None = None,
@@ -308,6 +325,7 @@ def place_order(
         return _unsupported(profile, "orders.place")
     if profile.readonly:
         return _unsupported(profile, "orders.place")
+    symbol = _apply_symbol_suffix(profile, symbol)
 
     module = _sdk_module(profile.connector)
     config = module.build_config(profile.config, overrides)
