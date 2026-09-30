@@ -544,8 +544,8 @@ class TestPostTradeRewardRiskCheck:
         assert "CORRECTED" in note and "tightened stop-loss" in note
         assert calls["ticket"] == self.NEW_TICKET
         assert calls["take_profit"] == 1.1010  # target left untouched
-        assert calls["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
-        assert order["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
+        assert calls["stop_loss"] == pytest.approx(1.0995)
+        assert order["stop_loss"] == pytest.approx(1.0995)
         assert order["take_profit"] == 1.1010
 
     def test_widens_target_when_tightening_would_violate_floor(self, monkeypatch) -> None:
@@ -558,7 +558,7 @@ class TestPostTradeRewardRiskCheck:
         note = fr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "widened take-profit" in note
         assert calls["stop_loss"] == 1.0990  # stop left untouched
-        assert calls["take_profit"] == pytest.approx(1.1015)
+        assert calls["take_profit"] == pytest.approx(1.10175)  # (0.0010 + s) * 1.5 + s, s = 0.0001
 
     def test_sell_side_mirrors_the_math(self, monkeypatch) -> None:
         # sell: risk 0.0010 (1.1000->1.1010), reward 0.0010 (1.1000->1.0990) = 1:1
@@ -566,7 +566,7 @@ class TestPostTradeRewardRiskCheck:
         order = {"side": "sell", "fill_price": 1.1000, "stop_loss": 1.1010, "take_profit": 1.0990, "order_id": self.NEW_TICKET}
         note = fr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "tightened stop-loss" in note
-        assert calls["stop_loss"] == pytest.approx(1.1000 + 0.0010 / 1.5)
+        assert calls["stop_loss"] == pytest.approx(1.1005)  # net of the 1-pip spread
 
     def test_no_matching_position_reports_without_crashing(self, monkeypatch) -> None:
         calls = self._patch(monkeypatch, positions=[])
@@ -593,7 +593,7 @@ class TestPostTradeRewardRiskCheck:
         order = {"side": "buy", "fill_price": 0.0, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
         note = fr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "tightened stop-loss" in note
-        assert calls["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
+        assert calls["stop_loss"] == pytest.approx(1.0995)
 
     def test_missing_fill_price_and_no_position_is_a_safe_no_op(self, monkeypatch) -> None:
         calls = self._patch(monkeypatch, positions=[])

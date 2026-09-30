@@ -1494,12 +1494,28 @@ class TestLiveCircuitBreakerCheck:
         targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
         calls = self._patch_broker(
             monkeypatch, tmp_path, targets=targets, positions=[],
-            equity=90.0, baseline={"date": today, "equity": 100.0},  # 10% drawdown, under 50%
+            equity=98.5, baseline={"date": today, "equity": 100.0},  # 1.5%: under both the 2% daily stop and 50% halt
         )
 
         result = cr._live_circuit_breaker_check(targets[0]["trade"])
 
         assert result is None
+        assert calls["trip"] == []
+        assert calls["close"] == []
+
+    def test_daily_loss_stop_blocks_without_tripping_kill_switch(self, monkeypatch, tmp_path) -> None:
+        # Rulebook 2026-09-30: 2%+ below today's baseline -> no new trades today,
+        # but the persistent kill switch (50%) is NOT tripped and nothing is flattened.
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
+        calls = self._patch_broker(
+            monkeypatch, tmp_path, targets=targets, positions=[],
+            equity=90.0, baseline={"date": today, "equity": 100.0},
+        )
+
+        result = cr._live_circuit_breaker_check(targets[0]["trade"])
+
+        assert result is not None and "[DAILY LOSS STOP]" in result
         assert calls["trip"] == []
         assert calls["close"] == []
 
@@ -1775,8 +1791,8 @@ class TestPostTradeRewardRiskCheck:
         assert "CORRECTED" in note and "tightened stop-loss" in note
         assert calls["ticket"] == self.NEW_TICKET
         assert calls["take_profit"] == 1.1010
-        assert calls["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
-        assert order["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
+        assert calls["stop_loss"] == pytest.approx(1.0995)
+        assert order["stop_loss"] == pytest.approx(1.0995)
         assert order["take_profit"] == 1.1010
 
     def test_widens_target_when_tightening_would_violate_floor(self, monkeypatch) -> None:
@@ -1785,7 +1801,7 @@ class TestPostTradeRewardRiskCheck:
         note = cr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "widened take-profit" in note
         assert calls["stop_loss"] == 1.0990
-        assert calls["take_profit"] == pytest.approx(1.1015)
+        assert calls["take_profit"] == pytest.approx(1.10175)  # (0.0010 + s) * 1.5 + s, s = 0.0001
 
     def test_zero_fill_price_falls_back_to_live_position(self, monkeypatch) -> None:
         positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.1000}]

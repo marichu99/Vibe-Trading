@@ -79,6 +79,7 @@ def simulate(tr, bars, m15, info, rule):
     remaining = 1.0
     realized = 0.0
     partial_done = False
+    streak, armed = 0, False
     for b in bars:
         t = bar_utc(b["time"])
         if t < opened.replace(second=0, microsecond=0) + timedelta(minutes=5):
@@ -99,6 +100,9 @@ def simulate(tr, bars, m15, info, rule):
                 partial_done = True
                 if rule.get("be_after_partial"):
                     stop = max(stop, entry) if buy else min(stop, entry)
+                if rule.get("stop_after_partial_r") is not None:
+                    lock = entry + sgn * rule["stop_after_partial_r"] * risk
+                    stop = max(stop, lock) if buy else min(stop, lock)
         if (buy and fav_extreme >= tp) or (not buy and fav_extreme <= tp):
             return realized + remaining * (tp - entry) * sgn, "target"
         close_px = b["close"] + (0 if buy else spr)
@@ -106,7 +110,17 @@ def simulate(tr, bars, m15, info, rule):
             return realized + remaining * (close_px - entry) * sgn, "time/weekend"
         # Poll-time stop updates, evaluated at bar close (5-min poll cadence).
         gained = (close_px - entry) * sgn
+        # "In profit for N consecutive bars, then a close back through entry -> exit at market."
+        if rule.get("profit_streak_bars"):
+            streak = streak + 1 if gained > 0 else 0
+            armed = armed or streak >= rule["profit_streak_bars"]
+            if armed and gained < 0:
+                return realized + remaining * (close_px - entry) * sgn, "streak-exit"
         cands = []
+        if rule.get("atr_trail_start_r") and gained >= rule["atr_trail_start_r"] * risk:
+            a = atr_at(tr["symbol"], t + timedelta(minutes=5), m15)
+            if a:
+                cands.append(close_px - sgn * (a / ATR_MULT) * rule["atr_trail_mult"])
         if rule.get("be_tp_fraction") and gained >= abs(tp - entry) * rule["be_tp_fraction"]:
             cands.append(entry - sgn * BE_BUFFER_POINTS * point)
         if rule.get("be_at_r") and gained >= rule["be_at_r"] * risk:
@@ -138,6 +152,14 @@ ENTRY_DELAYS_MIN = (15, 30, 60, 120)
 
 RULES = {
     "static": {},
+    # User-proposed "Rule 1" (2026-09-30): BE at +0.5R; at +1R take 50% and
+    # stop to +0.3R; from +1.5R trail 0.5x ATR; exit if in profit 3 M15 bars
+    # (= 9 M5 bars) then a close back below entry.
+    "rule1_full": {"be_at_r": 0.5, "partial_at_r": 1.0, "stop_after_partial_r": 0.3,
+                   "atr_trail_start_r": 1.5, "atr_trail_mult": 0.5, "profit_streak_bars": 9},
+    "rule1_no_streak": {"be_at_r": 0.5, "partial_at_r": 1.0, "stop_after_partial_r": 0.3,
+                        "atr_trail_start_r": 1.5, "atr_trail_mult": 0.5},
+    "static+streak_exit": {"profit_streak_bars": 9},
     "no_usd_trail (BE@50%TP+decay)": {"be_tp_fraction": BE_FRACTION_OF_TP, "decay": True},
     "static+decay": {"decay": True},
     "BE@75%TP+decay": {"be_tp_fraction": 0.75, "decay": True},

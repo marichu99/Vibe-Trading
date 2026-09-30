@@ -33,9 +33,19 @@ AGENT_DIR = REPO_ROOT / "agent"
 DECISION_LOG_PATH = REPO_ROOT / "logs" / "decision_log.jsonl"
 
 # Bump whenever the committee, data inputs, or exit rules change materially.
-STRATEGY_VERSION = "v2-fxdesk-datapack-plainexit-trendgate"
+# v3 (2026-09-30): the user's prop-firm rulebook (checklist, edge types,
+# strict output, net R:R, max stop, bench, 2h news, 0.75%/2% on FundedNext);
+# exits deliberately still plain stop+target (see exit_replay rule1_full).
+STRATEGY_VERSION = "v3-rulebook-plainexit"
 LEGACY_VERSION = "v1-legacy"
 OUTCOME_HOURS = 8
+
+# Rulebook 2026-09-30 ("Rule 2" / post-trade review).
+BENCH_AFTER_LOSSES = 3
+BENCH_HOURS = 24
+# An exit within this share of the planned risk distance of the stop or the
+# target counts as "exited at the plan's level" (spread/slippage tolerance).
+PLAN_LEVEL_TOLERANCE_R = 0.15
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +232,88 @@ def trend_rule_prompt(allowed: set[str], reason: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Rulebook: post-trade review, symbol bench, repeat-deviation pass
+# --------------------------------------------------------------------------- #
+
+_NEXT_TIME = {
+    "none": "No change: the plan was followed; judge the setup, not the outcome.",
+    "early_exit": "Size the stop/target so the trade can resolve within the 40h hold and before Friday 20:00 UTC.",
+    "stop_adjusted": "Place the stop outside the noise floor (1.5x 15m ATR / spread) at entry.",
+    "unknown_exit": "Check the broker history: the exit could not be matched to the plan.",
+}
+
+
+def review_closed_trade(entry: dict) -> dict:
+    """Deterministic 3-line review of a closed journal entry vs its own plan.
+
+    Deviation is one of: none (exited at the planned stop or target),
+    stop_adjusted (the stop-floor check had to move the committee's stop
+    after the fill), early_exit (closed away from both levels: time stop,
+    weekend flatten, trend gate, manual), unknown_exit (no exit price).
+    """
+    try:
+        e, sl, tp = float(entry["entry_price"]), float(entry["stop_loss"]), float(entry["take_profit"])
+        exit_price = float(entry["exit_price"])
+    except (KeyError, TypeError, ValueError):
+        deviation = "unknown_exit"
+    else:
+        risk = abs(e - sl) or 1e-9
+        tol = PLAN_LEVEL_TOLERANCE_R * risk
+        at_plan = abs(exit_price - sl) <= tol or abs(exit_price - tp) <= tol
+        deviation = "stop_adjusted" if entry.get("stop_adjusted") else ("none" if at_plan else "early_exit")
+    followed = deviation == "none"
+    where = {"none": "none", "stop_adjusted": "stop (moved by the post-fill floor check)",
+             "early_exit": "management (exited before the planned stop/target)",
+             "unknown_exit": "unknown (exit not reconciled)"}[deviation]
+    return {
+        "deviation": deviation,
+        "lines": [f"1. Followed the plan: {'Yes' if followed else 'No'}",
+                  f"2. Deviation: {where}",
+                  f"3. Next time: {_NEXT_TIME[deviation]}"],
+    }
+
+
+def _closed_for(journal: list[dict], symbol: str) -> list[dict]:
+    closed = [t for t in journal if t.get("symbol") == symbol and t.get("status") == "closed"]
+    return sorted(closed, key=lambda t: str(t.get("closed_at") or t.get("opened_at") or ""))
+
+
+def bench_reason(journal: list[dict], symbol: str, now: datetime | None = None) -> str | None:
+    """Rule 2: bench a symbol for BENCH_HOURS after BENCH_AFTER_LOSSES straight losses."""
+    now = now or datetime.now(timezone.utc)
+    last = _closed_for(journal, symbol)[-BENCH_AFTER_LOSSES:]
+    if len(last) < BENCH_AFTER_LOSSES or any(t.get("outcome") != "loss" for t in last):
+        return None
+    try:
+        closed_at = datetime.fromisoformat(str(last[-1].get("closed_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if closed_at.tzinfo is None:
+        closed_at = closed_at.replace(tzinfo=timezone.utc)
+    if now - closed_at >= timedelta(hours=BENCH_HOURS):
+        return None
+    return (f"[BENCHED] {symbol}: last {BENCH_AFTER_LOSSES} closed trades were all losses, the latest "
+            f"closed {closed_at.strftime('%Y-%m-%d %H:%M')} UTC -- benched for {BENCH_HOURS}h (rulebook Rule 2).")
+
+
+def consume_repeat_deviation(journal: list[dict], symbol: str) -> str | None:
+    """Post-trade review rule: same deviation on the last two closes -> PASS the next setup once.
+
+    Mutates `journal` (marks the latest review as served) so the caller can
+    persist it; returns the skip note, or None.
+    """
+    last = _closed_for(journal, symbol)[-2:]
+    if len(last) < 2 or not all(isinstance(t.get("review"), dict) for t in last):
+        return None
+    d1, d2 = last[0]["review"].get("deviation"), last[1]["review"].get("deviation")
+    if d1 != d2 or d2 in (None, "none") or last[1]["review"].get("pass_served"):
+        return None
+    last[1]["review"]["pass_served"] = True
+    return (f"[REVIEW PASS] {symbol}: the same deviation ({d2}) appeared on the last two closed trades -- "
+            f"passing this setup (rulebook post-trade review).")
+
+
+# --------------------------------------------------------------------------- #
 # Weekly version comparison
 # --------------------------------------------------------------------------- #
 
@@ -255,6 +347,15 @@ def weekly_version_report(journal: list[dict], bot: str, decisions: list[dict] |
             f"avg loss {sum(losses) / len(losses) if losses else 0:+.2f}R, "
             f"total {sum(rs):+.2f}R / ${usd:+.2f}" if rs else f"  {version}: {len(trades)} trades (no R data)"
         )
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    reviewed = [t for t in journal if t.get("status") == "closed" and isinstance(t.get("review"), dict)
+                and str(t.get("closed_at") or "") >= week_ago]
+    if reviewed:
+        lines.append("Post-trade reviews this week:")
+        for t in reviewed:
+            lines.append(f"  {t.get('symbol')} {t.get('side')} closed {str(t.get('closed_at'))[:16]} "
+                         f"({t.get('outcome')}, {float(t.get('profit') or 0):+.2f}):")
+            lines += [f"    {line}" for line in t["review"].get("lines", [])]
     mine = [d for d in decisions if d.get("bot") == bot]
     if mine:
         counts: dict[str, int] = {}

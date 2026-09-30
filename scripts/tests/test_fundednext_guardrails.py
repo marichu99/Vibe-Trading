@@ -28,7 +28,7 @@ def _patch_get_account(monkeypatch, *, balance: float, equity: float | None = No
 class TestEffectiveMaxLossUsd:
     def test_one_percent_of_balance_below_ceiling(self, monkeypatch) -> None:
         _patch_get_account(monkeypatch, balance=3000.0)
-        assert fn_guard.effective_max_loss_usd("mt5fn-live-trade", mandate_ceiling=60.0) == pytest.approx(30.0)
+        assert fn_guard.effective_max_loss_usd("mt5fn-live-trade", mandate_ceiling=60.0) == pytest.approx(22.5)  # 0.75% (rulebook)
 
     def test_ceiling_binds_once_balance_grows(self, monkeypatch) -> None:
         _patch_get_account(monkeypatch, balance=10000.0)
