@@ -36,3 +36,4 @@ def _isolate_strategy_tracking(monkeypatch, tmp_path):
     monkeypatch.setattr(strategy_tracking, "DECISION_LOG_PATH", tmp_path / "decision_log.jsonl")
     monkeypatch.setattr(strategy_tracking, "_mid_price", lambda symbol, connection: None)
     monkeypatch.setattr(strategy_tracking, "trend_gate", lambda symbol, connection: (None, "stubbed in tests"))
+    monkeypatch.setattr(strategy_tracking, "openrouter_balance_usd", lambda: None)

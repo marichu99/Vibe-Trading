@@ -1124,6 +1124,7 @@ def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
         "status": "open",
         "strategy_version": strategy_tracking.STRATEGY_VERSION,
         "stop_adjusted": bool(order.get("stop_adjusted")),
+        "trend_alignment": order.get("trend_alignment"),
     })
     _write_journal(entries)
 
@@ -2328,6 +2329,9 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             report_text = report_text + _post_trade_cap_check(trade)
             report_text = report_text + _post_trade_spread_check(trade, placed_order)
             report_text = report_text + _post_trade_reward_risk_check(trade, placed_order)
+            # "with" = H4+D1 agreed and the gate allowed only this side; counter-trend
+            # fills never get here (closed by _enforce_trend_rule).
+            placed_order["trend_alignment"] = "with" if trend_allowed else "neutral"
             _journal_record_open(trade["symbol"], trade["connection"], placed_order)
     elif trade:
         blocked_note = _blocked_order_note(run_id)

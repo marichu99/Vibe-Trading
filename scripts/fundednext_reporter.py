@@ -612,6 +612,7 @@ def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
         "status": "open",
         "strategy_version": strategy_tracking.STRATEGY_VERSION,
         "stop_adjusted": bool(order.get("stop_adjusted")),
+        "trend_alignment": order.get("trend_alignment"),
     })
     _write_journal(entries)
     fn_state.record_trading_day()
@@ -720,7 +721,14 @@ def _journal_reconcile_closed(symbol: str, connection: str) -> None:
         deal = latest_close_by_position.get(ticket)
         entry["status"] = "closed"
         if deal:
-            entry["closed_at"] = deal.get("time") or datetime.now(timezone.utc).isoformat()
+            # Deal times are FundedNext's EET/EEST wall clock labelled as UTC
+            # (same skew as position times, see _broker_time_to_utc). Fixed
+            # 2026-09-30: a trade that closed 16:45 UTC was journaled as 19:45,
+            # which skewed the rulebook's 24h bench window and the reviews.
+            closed_utc = _broker_time_to_utc(deal.get("time"))
+            closed_iso = closed_utc.isoformat() if closed_utc else datetime.now(timezone.utc).isoformat()
+            deal = {**deal, "time": closed_iso}
+            entry["closed_at"] = closed_iso
             profit = deal.get("profit")
             entry["exit_price"] = deal.get("price")
             entry["profit"] = profit
@@ -1584,6 +1592,9 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             report_text = report_text + _post_trade_cap_check(trade)
             report_text = report_text + _post_trade_spread_check(trade, placed_order)
             report_text = report_text + _post_trade_reward_risk_check(trade, placed_order)
+            # "with" = H4+D1 agreed and the gate allowed only this side; counter-trend
+            # fills never get here (closed by _enforce_trend_rule).
+            placed_order["trend_alignment"] = "with" if trend_allowed else "neutral"
             _journal_record_open(trade["symbol"], trade["connection"], placed_order)
     elif trade:
         blocked_note = _blocked_order_note(run_id)

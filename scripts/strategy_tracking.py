@@ -47,6 +47,22 @@ BENCH_HOURS = 24
 # target counts as "exited at the plan's level" (spread/slippage tolerance).
 PLAN_LEVEL_TOLERANCE_R = 0.15
 
+# Pre-committed scale/pause criteria for the CURRENT strategy version
+# (2026-09-30, agreed before results came in so they aren't decided on mood):
+# after SCALE_MIN_TRADES closed trades, total >= SCALE_UP_R -> return
+# FundedNext to full size; total <= PAUSE_R at any point -> pause and revisit.
+SCALE_MIN_TRADES = 10
+# Versions that count as "the new setup" for the scale rule: v2 (FX desk +
+# data pack + plain exits + trend gate) and v3 (v2 + rulebook limits) trade
+# the same way, so both count toward the same sample.
+NEW_SETUP_VERSIONS = {"v2-fxdesk-datapack-plainexit-trendgate", STRATEGY_VERSION}
+SCALE_UP_R = 2.0
+PAUSE_R = -3.0
+# A "wait" followed within OUTCOME_HOURS by a one-way move this large counts
+# as a potentially missed trade (evidence for/against adding a London pass).
+MISSED_MOVE_PIPS = 30
+OPENROUTER_LOW_USD = 5.0
+
 logger = logging.getLogger(__name__)
 
 # The wrapper is asked for a "Decision:" line but doesn't always comply --
@@ -347,6 +363,17 @@ def weekly_version_report(journal: list[dict], bot: str, decisions: list[dict] |
             f"avg loss {sum(losses) / len(losses) if losses else 0:+.2f}R, "
             f"total {sum(rs):+.2f}R / ${usd:+.2f}" if rs else f"  {version}: {len(trades)} trades (no R data)"
         )
+    current = [t for t in journal if t.get("status") == "closed" and t.get("strategy_version") in NEW_SETUP_VERSIONS]
+    current_rs = [r for r in (_trade_r(t) for t in current) if r is not None]
+    lines.append(scale_verdict(len(current_rs), sum(current_rs)))
+    by_trend: dict[str, list[float]] = {}
+    for t in current:
+        r = _trade_r(t)
+        if r is not None:
+            by_trend.setdefault(t.get("trend_alignment") or "unrecorded", []).append(r)
+    if by_trend:
+        lines.append("New setup by H4/D1 trend at entry: " + "; ".join(
+            f"{k} {len(v)} trades {sum(v):+.2f}R" for k, v in sorted(by_trend.items())))
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     reviewed = [t for t in journal if t.get("status") == "closed" and isinstance(t.get("review"), dict)
                 and str(t.get("closed_at") or "") >= week_ago]
@@ -368,9 +395,45 @@ def weekly_version_report(journal: list[dict], bot: str, decisions: list[dict] |
         if waits:
             ups = [d["outcome"]["max_up_pips"] for d in waits]
             downs = [d["outcome"]["max_down_pips"] for d in waits]
+            missed = sum(max(u, dn) >= MISSED_MOVE_PIPS for u, dn in zip(ups, downs))
             lines.append(
                 f"'Wait' calls with {OUTCOME_HOURS}h outcomes: {len(waits)}; price then ran on average "
-                f"{sum(ups) / len(ups):.0f} pips up / {sum(downs) / len(downs):.0f} pips down "
-                f"(large one-sided runs after waits = missed trades)."
+                f"{sum(ups) / len(ups):.0f} pips up / {sum(downs) / len(downs):.0f} pips down. "
+                f"{missed} of {len(waits)} were followed by a {MISSED_MOVE_PIPS}+ pip one-way move "
+                f"(if that stays above ~1 in 3 over 2-3 weeks, a London-open trading pass is worth testing)."
             )
+    balance = openrouter_balance_usd()
+    if balance is not None:
+        lines.append(f"OpenRouter balance: ${balance:.2f}" + (
+            f" -- LOW: top up and enable auto top-up at https://openrouter.ai/settings/credits"
+            if balance < OPENROUTER_LOW_USD else " (auto top-up at https://openrouter.ai/settings/credits recommended)"))
     return "\n".join(lines)
+
+
+def scale_verdict(n_trades: int, total_r: float) -> str:
+    """The pre-committed scale/pause rule for the current version, as one line."""
+    head = f"Scale rule (new setup, v2+v3): {n_trades} closed trades, {total_r:+.2f}R -> "
+    if total_r <= PAUSE_R:
+        return head + f"PAUSE and revisit (at or below {PAUSE_R:+.0f}R)."
+    if n_trades >= SCALE_MIN_TRADES and total_r >= SCALE_UP_R:
+        return head + "SCALE UP: return FundedNext to full size (0.24 EURUSD / 0.30 GBPUSD)."
+    if n_trades >= SCALE_MIN_TRADES:
+        return head + f"hold current size (needs {SCALE_UP_R:+.0f}R after {SCALE_MIN_TRADES} trades to scale up)."
+    return head + f"keep collecting ({n_trades}/{SCALE_MIN_TRADES} trades before any size change)."
+
+
+def openrouter_balance_usd() -> float | None:
+    """Remaining OpenRouter credit (same /credits endpoint as the reporter's alert); None on any failure."""
+    import os
+    import urllib.request
+
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        req = urllib.request.Request("https://openrouter.ai/api/v1/credits", headers={"Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))["data"]
+        return float(data["total_credits"]) - float(data["total_usage"])
+    except Exception:
+        return None
