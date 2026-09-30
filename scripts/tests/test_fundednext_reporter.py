@@ -106,6 +106,45 @@ class TestNextSessionBoundary:
         assert (boundary, session) == (datetime(2026, 3, 30, 7, 0, tzinfo=timezone.utc), "london")
 
 
+# ---------------------------------------------------------------------------
+# _extract_placed_orders -- mirrored from committee_reporter.py's identical
+# regression test: a pass that places two orders (e.g. the LLM misreads an
+# ambiguous first result and "retries" an order that already filled) must
+# have BOTH fills reach the post-trade guardrail chain / journal, not just
+# the first one found in the trace.
+# ---------------------------------------------------------------------------
+
+
+class TestExtractPlacedOrders:
+    def test_returns_every_ok_result_not_just_the_first(self, monkeypatch) -> None:
+        first = {"status": "ok", "ticket": "1", "symbol": "EURUSD"}
+        second = {"status": "ok", "ticket": "2", "symbol": "EURUSD"}
+        monkeypatch.setattr(
+            fr, "_trace_entries",
+            lambda run_id: [
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(first)},
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(second)},
+            ],
+        )
+        assert fr._extract_placed_orders("run-1") == [first, second]
+
+    def test_single_result_wrapper_returns_the_first(self, monkeypatch) -> None:
+        first = {"status": "ok", "ticket": "1", "symbol": "EURUSD"}
+        second = {"status": "ok", "ticket": "2", "symbol": "EURUSD"}
+        monkeypatch.setattr(
+            fr, "_trace_entries",
+            lambda run_id: [
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(first)},
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(second)},
+            ],
+        )
+        assert fr._extract_placed_order("run-1") == first
+
+    def test_empty_when_no_placements(self, monkeypatch) -> None:
+        monkeypatch.setattr(fr, "_trace_entries", lambda run_id: [{"type": "tool_result", "tool": "trading_quote"}])
+        assert fr._extract_placed_orders("run-1") == []
+
+
 class TestParseDecisionReasoning:
     def test_parses_well_formed_report(self) -> None:
         text = "Decision: long, momentum favors EURUSD\nReasoning: broke resistance on volume\nConfidence: high"
