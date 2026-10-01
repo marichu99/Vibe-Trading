@@ -625,6 +625,70 @@ class TestPostTradeRewardRiskCheck:
         assert calls == {}
 
 
+class TestHandleFilledOrder:
+    """Real bug found by /code-review (mirrored from the identical fix in
+    committee_reporter.py): the journal write used to live only in
+    run_committee's "no violation" branch, so a fill a guardrail immediately
+    closed (spec/trend/stop-floor-budget violation) silently never reached
+    the trade journal -- and, on this bot specifically, never called
+    fn_state.record_trading_day() either, undercounting progress toward
+    FundedNext's own minimum-trading-days rule."""
+
+    TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
+
+    def test_journals_even_when_spec_violation_closes_it(self, monkeypatch) -> None:
+        journaled = []
+        monkeypatch.setattr(fr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spec_check", lambda *a, **k: "\n\n[CRITICAL -- SPEC VIOLATION, AUTO-CLOSED] ...")
+        monkeypatch.setattr(fr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDx", "side": "buy", "quantity": 5.0, "order_id": "1",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+
+        note, traded = fr._handle_filled_order(self.TRADE, order, None)
+
+        assert traded is False
+        assert "SPEC VIOLATION" in note
+        # Journaled under the order's OWN (wrong) symbol, not trade["symbol"]
+        # -- misfiling it into "EURUSD"'s history would be its own bug.
+        assert journaled == [("EURUSDx", "mt5fn-live-trade", order)]
+
+    def test_journals_normally_when_no_violation(self, monkeypatch) -> None:
+        journaled = []
+        monkeypatch.setattr(fr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(fr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSD", "side": "buy", "quantity": 0.24, "order_id": "2",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+
+        note, traded = fr._handle_filled_order(self.TRADE, order, {"buy"})
+
+        assert traded is True
+        assert journaled == [("EURUSD", "mt5fn-live-trade", order)]
+        assert order["trend_alignment"] == "with"
+
+    def test_spec_violation_still_counts_as_a_trading_day(self, tmp_path, monkeypatch) -> None:
+        """End-to-end through the REAL _journal_record_open (not a spy): a
+        fill that gets auto-closed for a spec violation is still a real
+        trade that happened on the account today."""
+        monkeypatch.setattr(fr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        monkeypatch.setattr(fn_state, "STATE_PATH", tmp_path / "state.json")
+        monkeypatch.setattr(fr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spec_check", lambda *a, **k: "\n\n[CRITICAL -- SPEC VIOLATION, AUTO-CLOSED] ...")
+        order = {"symbol": "EURUSDx", "side": "buy", "quantity": 5.0, "order_id": "1",
+                 "fill_price": 1.1, "stop_loss": 1.0, "take_profit": 1.2}
+
+        note, traded = fr._handle_filled_order(self.TRADE, order, None)
+
+        assert traded is False
+        assert len(fr._read_journal()) == 1
+        assert fn_state.trading_days_count() == 1
+
+
 class TestResolveFillPrice:
     TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.01}
 
