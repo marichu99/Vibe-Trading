@@ -74,6 +74,7 @@ LOG_PATH = REPO_ROOT / "logs" / "daily_repair_agent.log"
 CLAUDE_TIMEOUT_SECONDS = 45 * 60
 TEST_TIMEOUT_SECONDS = 5 * 60
 
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
