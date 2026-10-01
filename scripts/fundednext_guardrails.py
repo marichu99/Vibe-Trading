@@ -64,13 +64,16 @@ BROKER = "mt5fn"
 # / 6% static overall, verified 2026-09 for the actual purchased account type
 # — NOT the 5%/10% Stellar 2-Step figures this was originally scoped for) —
 # same ~80% buffer ratio as before, see module docstring.
-DAILY_LOSS_HALT_PCT = 0.024
+# Rulebook 2026-09-30: daily halt tightened 2.4% -> 2.0%. MAX_DRAWDOWN_HALT_PCT
+# kept at 4.8% (the rulebook's 5.0% would be looser).
+DAILY_LOSS_HALT_PCT = 0.020
 MAX_DRAWDOWN_HALT_PCT = 0.048
 
 # 1% of CURRENT balance, matching FundedNext's own imposable "1% max risk per
 # trade" rule (not a portfolio-aggregate split like the Exness account's
 # _effective_max_loss_usd — see effective_max_loss_usd's own docstring).
-RISK_PER_TRADE_FRACTION = 0.01
+# Rulebook 2026-09-30: 0.75% of current balance (was 1%).
+RISK_PER_TRADE_FRACTION = 0.0075
 
 # Mirrors scripts/commit_fundednext_mandate.py's MAX_LOSS_PER_ORDER_USD ($60
 # = 1% of the $6,000 starting balance). These are two INDEPENDENTLY

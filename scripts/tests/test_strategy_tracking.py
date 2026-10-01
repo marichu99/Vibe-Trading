@@ -73,6 +73,22 @@ class TestRecordAndOutcomes:
         assert st.fill_decision_outcomes("exness", timezone.utc, t0 + timedelta(hours=7)) == 0
         assert "outcome" not in st.read_decisions()[0]
 
+    def test_gold_pip_size_matches_market_data_pack(self, monkeypatch) -> None:
+        """Real bug: this used to use pip=0.1 for XAU, 10x market_data_pack.py's
+        pip=0.01 (digits=2) convention for the same instrument -- gold is
+        currently paused in both bots' TARGETS, but the moment it resumes
+        this would silently understate every close/max-up/max-down pip
+        outcome by 10x."""
+        t0 = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+        st._append({"ts": t0.isoformat(), "bot": "exness", "symbol": "XAUUSDm",
+                    "connection": "mt5-live-trade", "decision": "wait", "price": 2000.0})
+        bars = [{"time": "2026-09-28T15:00:00+00:00", "high": 2001.0, "low": 1999.0, "close": 2000.5}]
+        self._fake_bars(monkeypatch, bars)
+
+        assert st.fill_decision_outcomes("exness", timezone.utc, t0 + timedelta(hours=9)) == 1
+        out = st.read_decisions()[0]["outcome"]
+        assert out == {"hours": 8, "close_move_pips": 50.0, "max_up_pips": 100.0, "max_down_pips": 100.0}
+
 
 class TestWeeklyReport:
     def test_groups_by_version_in_r(self) -> None:

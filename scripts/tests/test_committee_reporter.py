@@ -1531,12 +1531,28 @@ class TestLiveCircuitBreakerCheck:
         targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
         calls = self._patch_broker(
             monkeypatch, tmp_path, targets=targets, positions=[],
-            equity=90.0, baseline={"date": today, "equity": 100.0},  # 10% drawdown, under 50%
+            equity=98.5, baseline={"date": today, "equity": 100.0},  # 1.5%: under both the 2% daily stop and 50% halt
         )
 
         result = cr._live_circuit_breaker_check(targets[0]["trade"])
 
         assert result is None
+        assert calls["trip"] == []
+        assert calls["close"] == []
+
+    def test_daily_loss_stop_blocks_without_tripping_kill_switch(self, monkeypatch, tmp_path) -> None:
+        # Rulebook 2026-09-30: 2%+ below today's baseline -> no new trades today,
+        # but the persistent kill switch (50%) is NOT tripped and nothing is flattened.
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
+        calls = self._patch_broker(
+            monkeypatch, tmp_path, targets=targets, positions=[],
+            equity=90.0, baseline={"date": today, "equity": 100.0},
+        )
+
+        result = cr._live_circuit_breaker_check(targets[0]["trade"])
+
+        assert result is not None and "[DAILY LOSS STOP]" in result
         assert calls["trip"] == []
         assert calls["close"] == []
 
@@ -1812,8 +1828,8 @@ class TestPostTradeRewardRiskCheck:
         assert "CORRECTED" in note and "tightened stop-loss" in note
         assert calls["ticket"] == self.NEW_TICKET
         assert calls["take_profit"] == 1.1010
-        assert calls["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
-        assert order["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
+        assert calls["stop_loss"] == pytest.approx(1.0995)
+        assert order["stop_loss"] == pytest.approx(1.0995)
         assert order["take_profit"] == 1.1010
 
     def test_widens_target_when_tightening_would_violate_floor(self, monkeypatch) -> None:
@@ -1822,7 +1838,7 @@ class TestPostTradeRewardRiskCheck:
         note = cr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "widened take-profit" in note
         assert calls["stop_loss"] == 1.0990
-        assert calls["take_profit"] == pytest.approx(1.1015)
+        assert calls["take_profit"] == pytest.approx(1.10175)  # (0.0010 + s) * 1.5 + s, s = 0.0001
 
     def test_zero_fill_price_falls_back_to_live_position(self, monkeypatch) -> None:
         positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.1000}]
@@ -1865,6 +1881,63 @@ class TestPostTradeRewardRiskCheck:
         calls = self._patch(monkeypatch)
         assert cr._post_trade_reward_risk_check(self.TRADE, {"side": "buy", "fill_price": 1.1}) == ""
         assert calls == {}
+
+
+class TestHandleFilledOrder:
+    """Real bug found by /code-review: the journal write used to live only in
+    run_committee's "no violation" branch, so a fill a guardrail immediately
+    closed (spec/trend/stop-floor-budget violation) silently never reached
+    the trade journal -- see _handle_filled_order's own docstring."""
+
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def test_journals_even_when_spec_violation_closes_it(self, monkeypatch) -> None:
+        journaled = []
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "\n\n[CRITICAL -- SPEC VIOLATION, AUTO-CLOSED] ...")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDcm", "side": "buy", "quantity": 0.25, "order_id": "1",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+
+        note, traded = cr._handle_filled_order(self.TRADE, order, None)
+
+        assert traded is False
+        assert "SPEC VIOLATION" in note
+        # Journaled under the order's OWN (wrong) symbol, not trade["symbol"]
+        # -- misfiling it into "EURUSDm"'s history would be its own bug.
+        assert journaled == [("EURUSDcm", "mt5-live-trade", order)]
+
+    def test_journals_even_when_trend_gate_closes_it(self, monkeypatch) -> None:
+        journaled = []
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "\n\n[TREND GATE -- ORDER CLOSED] ...")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDm", "side": "sell", "quantity": 0.01, "order_id": "2",
+                 "stop_loss": 1.1, "take_profit": 1.0}
+
+        note, traded = cr._handle_filled_order(self.TRADE, order, {"buy"})
+
+        assert traded is False
+        assert "TREND GATE" in note
+        assert journaled == [("EURUSDm", "mt5-live-trade", order)]
+
+    def test_journals_normally_when_no_violation(self, monkeypatch) -> None:
+        journaled = []
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(cr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDm", "side": "buy", "quantity": 0.01, "order_id": "3",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+
+        note, traded = cr._handle_filled_order(self.TRADE, order, {"buy"})
+
+        assert traded is True
+        assert journaled == [("EURUSDm", "mt5-live-trade", order)]
+        assert order["trend_alignment"] == "with"
 
 
 class TestLlmBalanceAlert:

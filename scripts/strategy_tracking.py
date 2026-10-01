@@ -33,9 +33,35 @@ AGENT_DIR = REPO_ROOT / "agent"
 DECISION_LOG_PATH = REPO_ROOT / "logs" / "decision_log.jsonl"
 
 # Bump whenever the committee, data inputs, or exit rules change materially.
-STRATEGY_VERSION = "v2-fxdesk-datapack-plainexit-trendgate"
+# v3 (2026-09-30): the user's prop-firm rulebook (checklist, edge types,
+# strict output, net R:R, max stop, bench, 2h news, 0.75%/2% on FundedNext);
+# exits deliberately still plain stop+target (see exit_replay rule1_full).
+STRATEGY_VERSION = "v3-rulebook-plainexit"
 LEGACY_VERSION = "v1-legacy"
 OUTCOME_HOURS = 8
+
+# Rulebook 2026-09-30 ("Rule 2" / post-trade review).
+BENCH_AFTER_LOSSES = 3
+BENCH_HOURS = 24
+# An exit within this share of the planned risk distance of the stop or the
+# target counts as "exited at the plan's level" (spread/slippage tolerance).
+PLAN_LEVEL_TOLERANCE_R = 0.15
+
+# Pre-committed scale/pause criteria for the CURRENT strategy version
+# (2026-09-30, agreed before results came in so they aren't decided on mood):
+# after SCALE_MIN_TRADES closed trades, total >= SCALE_UP_R -> return
+# FundedNext to full size; total <= PAUSE_R at any point -> pause and revisit.
+SCALE_MIN_TRADES = 10
+# Versions that count as "the new setup" for the scale rule: v2 (FX desk +
+# data pack + plain exits + trend gate) and v3 (v2 + rulebook limits) trade
+# the same way, so both count toward the same sample.
+NEW_SETUP_VERSIONS = {"v2-fxdesk-datapack-plainexit-trendgate", STRATEGY_VERSION}
+SCALE_UP_R = 2.0
+PAUSE_R = -3.0
+# A "wait" followed within OUTCOME_HOURS by a one-way move this large counts
+# as a potentially missed trade (evidence for/against adding a London pass).
+MISSED_MOVE_PIPS = 30
+OPENROUTER_LOW_USD = 5.0
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +193,12 @@ def fill_decision_outcomes(bot: str, server_tz, now: datetime | None = None) -> 
             e["outcome"] = {"note": "no bars in window (market closed?)"}
             filled += 1
             continue
-        pip = 0.01 if e["symbol"][3:6] == "JPY" else (0.1 if e["symbol"][:3] in ("XAU",) else 0.0001)
+        # Matches market_data_pack.build_data_pack's digits/pip convention
+        # (digits=2 for XAU/XAG -> pip=0.01) -- this used to use 0.1 for XAU,
+        # a 10x-too-large pip that would silently understate gold's
+        # close/max-up/max-down pip outcomes by 10x the moment gold trading
+        # (currently paused in both bots' TARGETS) resumes.
+        pip = 0.01 if e["symbol"][3:6] == "JPY" or e["symbol"][:3] in ("XAU", "XAG") else 0.0001
         p0 = e["price"]
         e["outcome"] = {
             "hours": OUTCOME_HOURS,
@@ -222,6 +253,88 @@ def trend_rule_prompt(allowed: set[str], reason: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Rulebook: post-trade review, symbol bench, repeat-deviation pass
+# --------------------------------------------------------------------------- #
+
+_NEXT_TIME = {
+    "none": "No change: the plan was followed; judge the setup, not the outcome.",
+    "early_exit": "Size the stop/target so the trade can resolve within the 40h hold and before Friday 20:00 UTC.",
+    "stop_adjusted": "Place the stop outside the noise floor (1.5x 15m ATR / spread) at entry.",
+    "unknown_exit": "Check the broker history: the exit could not be matched to the plan.",
+}
+
+
+def review_closed_trade(entry: dict) -> dict:
+    """Deterministic 3-line review of a closed journal entry vs its own plan.
+
+    Deviation is one of: none (exited at the planned stop or target),
+    stop_adjusted (the stop-floor check had to move the committee's stop
+    after the fill), early_exit (closed away from both levels: time stop,
+    weekend flatten, trend gate, manual), unknown_exit (no exit price).
+    """
+    try:
+        e, sl, tp = float(entry["entry_price"]), float(entry["stop_loss"]), float(entry["take_profit"])
+        exit_price = float(entry["exit_price"])
+    except (KeyError, TypeError, ValueError):
+        deviation = "unknown_exit"
+    else:
+        risk = abs(e - sl) or 1e-9
+        tol = PLAN_LEVEL_TOLERANCE_R * risk
+        at_plan = abs(exit_price - sl) <= tol or abs(exit_price - tp) <= tol
+        deviation = "stop_adjusted" if entry.get("stop_adjusted") else ("none" if at_plan else "early_exit")
+    followed = deviation == "none"
+    where = {"none": "none", "stop_adjusted": "stop (moved by the post-fill floor check)",
+             "early_exit": "management (exited before the planned stop/target)",
+             "unknown_exit": "unknown (exit not reconciled)"}[deviation]
+    return {
+        "deviation": deviation,
+        "lines": [f"1. Followed the plan: {'Yes' if followed else 'No'}",
+                  f"2. Deviation: {where}",
+                  f"3. Next time: {_NEXT_TIME[deviation]}"],
+    }
+
+
+def _closed_for(journal: list[dict], symbol: str) -> list[dict]:
+    closed = [t for t in journal if t.get("symbol") == symbol and t.get("status") == "closed"]
+    return sorted(closed, key=lambda t: str(t.get("closed_at") or t.get("opened_at") or ""))
+
+
+def bench_reason(journal: list[dict], symbol: str, now: datetime | None = None) -> str | None:
+    """Rule 2: bench a symbol for BENCH_HOURS after BENCH_AFTER_LOSSES straight losses."""
+    now = now or datetime.now(timezone.utc)
+    last = _closed_for(journal, symbol)[-BENCH_AFTER_LOSSES:]
+    if len(last) < BENCH_AFTER_LOSSES or any(t.get("outcome") != "loss" for t in last):
+        return None
+    try:
+        closed_at = datetime.fromisoformat(str(last[-1].get("closed_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if closed_at.tzinfo is None:
+        closed_at = closed_at.replace(tzinfo=timezone.utc)
+    if now - closed_at >= timedelta(hours=BENCH_HOURS):
+        return None
+    return (f"[BENCHED] {symbol}: last {BENCH_AFTER_LOSSES} closed trades were all losses, the latest "
+            f"closed {closed_at.strftime('%Y-%m-%d %H:%M')} UTC -- benched for {BENCH_HOURS}h (rulebook Rule 2).")
+
+
+def consume_repeat_deviation(journal: list[dict], symbol: str) -> str | None:
+    """Post-trade review rule: same deviation on the last two closes -> PASS the next setup once.
+
+    Mutates `journal` (marks the latest review as served) so the caller can
+    persist it; returns the skip note, or None.
+    """
+    last = _closed_for(journal, symbol)[-2:]
+    if len(last) < 2 or not all(isinstance(t.get("review"), dict) for t in last):
+        return None
+    d1, d2 = last[0]["review"].get("deviation"), last[1]["review"].get("deviation")
+    if d1 != d2 or d2 in (None, "none") or last[1]["review"].get("pass_served"):
+        return None
+    last[1]["review"]["pass_served"] = True
+    return (f"[REVIEW PASS] {symbol}: the same deviation ({d2}) appeared on the last two closed trades -- "
+            f"passing this setup (rulebook post-trade review).")
+
+
+# --------------------------------------------------------------------------- #
 # Weekly version comparison
 # --------------------------------------------------------------------------- #
 
@@ -255,6 +368,26 @@ def weekly_version_report(journal: list[dict], bot: str, decisions: list[dict] |
             f"avg loss {sum(losses) / len(losses) if losses else 0:+.2f}R, "
             f"total {sum(rs):+.2f}R / ${usd:+.2f}" if rs else f"  {version}: {len(trades)} trades (no R data)"
         )
+    current = [t for t in journal if t.get("status") == "closed" and t.get("strategy_version") in NEW_SETUP_VERSIONS]
+    current_rs = [r for r in (_trade_r(t) for t in current) if r is not None]
+    lines.append(scale_verdict(len(current_rs), sum(current_rs)))
+    by_trend: dict[str, list[float]] = {}
+    for t in current:
+        r = _trade_r(t)
+        if r is not None:
+            by_trend.setdefault(t.get("trend_alignment") or "unrecorded", []).append(r)
+    if by_trend:
+        lines.append("New setup by H4/D1 trend at entry: " + "; ".join(
+            f"{k} {len(v)} trades {sum(v):+.2f}R" for k, v in sorted(by_trend.items())))
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    reviewed = [t for t in journal if t.get("status") == "closed" and isinstance(t.get("review"), dict)
+                and str(t.get("closed_at") or "") >= week_ago]
+    if reviewed:
+        lines.append("Post-trade reviews this week:")
+        for t in reviewed:
+            lines.append(f"  {t.get('symbol')} {t.get('side')} closed {str(t.get('closed_at'))[:16]} "
+                         f"({t.get('outcome')}, {float(t.get('profit') or 0):+.2f}):")
+            lines += [f"    {line}" for line in t["review"].get("lines", [])]
     mine = [d for d in decisions if d.get("bot") == bot]
     if mine:
         counts: dict[str, int] = {}
@@ -267,9 +400,45 @@ def weekly_version_report(journal: list[dict], bot: str, decisions: list[dict] |
         if waits:
             ups = [d["outcome"]["max_up_pips"] for d in waits]
             downs = [d["outcome"]["max_down_pips"] for d in waits]
+            missed = sum(max(u, dn) >= MISSED_MOVE_PIPS for u, dn in zip(ups, downs))
             lines.append(
                 f"'Wait' calls with {OUTCOME_HOURS}h outcomes: {len(waits)}; price then ran on average "
-                f"{sum(ups) / len(ups):.0f} pips up / {sum(downs) / len(downs):.0f} pips down "
-                f"(large one-sided runs after waits = missed trades)."
+                f"{sum(ups) / len(ups):.0f} pips up / {sum(downs) / len(downs):.0f} pips down. "
+                f"{missed} of {len(waits)} were followed by a {MISSED_MOVE_PIPS}+ pip one-way move "
+                f"(if that stays above ~1 in 3 over 2-3 weeks, a London-open trading pass is worth testing)."
             )
+    balance = openrouter_balance_usd()
+    if balance is not None:
+        lines.append(f"OpenRouter balance: ${balance:.2f}" + (
+            f" -- LOW: top up and enable auto top-up at https://openrouter.ai/settings/credits"
+            if balance < OPENROUTER_LOW_USD else " (auto top-up at https://openrouter.ai/settings/credits recommended)"))
     return "\n".join(lines)
+
+
+def scale_verdict(n_trades: int, total_r: float) -> str:
+    """The pre-committed scale/pause rule for the current version, as one line."""
+    head = f"Scale rule (new setup, v2+v3): {n_trades} closed trades, {total_r:+.2f}R -> "
+    if total_r <= PAUSE_R:
+        return head + f"PAUSE and revisit (at or below {PAUSE_R:+.0f}R)."
+    if n_trades >= SCALE_MIN_TRADES and total_r >= SCALE_UP_R:
+        return head + "SCALE UP: return FundedNext to full size (0.24 EURUSD / 0.30 GBPUSD)."
+    if n_trades >= SCALE_MIN_TRADES:
+        return head + f"hold current size (needs {SCALE_UP_R:+.0f}R after {SCALE_MIN_TRADES} trades to scale up)."
+    return head + f"keep collecting ({n_trades}/{SCALE_MIN_TRADES} trades before any size change)."
+
+
+def openrouter_balance_usd() -> float | None:
+    """Remaining OpenRouter credit (same /credits endpoint as the reporter's alert); None on any failure."""
+    import os
+    import urllib.request
+
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        req = urllib.request.Request("https://openrouter.ai/api/v1/credits", headers={"Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))["data"]
+        return float(data["total_credits"]) - float(data["total_usage"])
+    except Exception:
+        return None

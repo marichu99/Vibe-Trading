@@ -46,6 +46,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import fundednext_news_calendar as fn_news  # noqa: E402  (shared calendar, not FundedNext-specific)
 import market_data_pack  # same scripts/ directory
 import strategy_tracking  # noqa: E402
 
@@ -534,6 +535,18 @@ STOP_TRAILING_ENABLED = False
 # by 2026-09-25, when both bots bought EURUSD into a downtrend on every
 # timeframe. Fails open if trend data can't be read. Flip to False to disable.
 TREND_FILTER_ENABLED = True
+
+# Rulebook (2026-09-30): the user's prop-firm rules, applied to both bots.
+# Exits stay plain stop+target (STOP_TRAILING_ENABLED) -- the proposed
+# breakeven/partial/trail "Rule 1" replayed at -4.22R vs +0.48R.
+MAX_STOP_PRICE_FRACTION = 0.01  # a stop farther than 1% of price is tightened to it
+NEWS_BLACKOUT_WINDOW_MINUTES = 120  # rulebook: no trade within 2h of a high-impact release
+# Rulebook daily loss stop: research-only for the rest of the day once equity is
+# this far below the day's baseline. Unlike LIVE_DRAWDOWN_HALT_PCT it does NOT
+# trip the (persistent, manually-cleared) kill switch -- it resets with the
+# next day's baseline. The 0.75% per-trade cap is NOT applied here: at ~$125
+# equity it is ~$0.93, below the minimum 0.01-lot risk at the ATR floor.
+DAILY_LOSS_STOP_PCT = 0.02
 
 BOT = "exness"
 BROKER_SERVER_TZ = timezone.utc  # Exness MT5 server clock is UTC (verified 2026-09-26)
@@ -1123,6 +1136,8 @@ def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
         "opened_at": datetime.now(timezone.utc).isoformat(),
         "status": "open",
         "strategy_version": strategy_tracking.STRATEGY_VERSION,
+        "stop_adjusted": bool(order.get("stop_adjusted")),
+        "trend_alignment": order.get("trend_alignment"),
     })
     _write_journal(entries)
 
@@ -1279,6 +1294,7 @@ def _journal_reconcile_closed(symbol: str, connection: str) -> None:
         else:
             entry["closed_at"] = datetime.now(timezone.utc).isoformat()
             entry["outcome"] = "unknown"  # closed, but couldn't match the closing deal
+        entry["review"] = strategy_tracking.review_closed_trade(entry)
         changed = True
 
     if changed:
@@ -1370,6 +1386,11 @@ def _live_circuit_breaker_check(trade: dict) -> str | None:
     if baseline_equity <= 0:
         return None
     drawdown = (baseline_equity - equity) / baseline_equity
+    if DAILY_LOSS_STOP_PCT <= drawdown < LIVE_DRAWDOWN_HALT_PCT:
+        return (
+            f"[DAILY LOSS STOP] equity ${equity:.2f} is {drawdown:.1%} below today's baseline "
+            f"${baseline_equity:.2f} (limit {DAILY_LOSS_STOP_PCT:.0%}) -- no new trades today (rulebook)."
+        )
     if drawdown < LIVE_DRAWDOWN_HALT_PCT:
         return None
 
@@ -1660,6 +1681,12 @@ def _between_passes_tick(now_utc: datetime) -> None:
         strategy_tracking.fill_decision_outcomes(BOT, BROKER_SERVER_TZ, now_utc)
     except Exception:
         logger.exception("decision outcome fill crashed; continuing")
+    for spec in TARGETS:
+        if spec.get("trade"):
+            try:
+                _journal_reconcile_closed(spec["trade"]["symbol"], spec["trade"]["connection"])
+            except Exception:
+                logger.exception("journal reconcile crashed for %s; continuing", spec["trade"]["symbol"])
     if _in_weekend_window(now_utc):
         try:
             _weekend_flatten_and_notify()
@@ -1925,14 +1952,20 @@ _REPORT_FORMAT_NO_TRADE = (
 )
 
 _REPORT_FORMAT_TRADE = (
-    "Finally, report in exactly this structure (plain text, these labels verbatim):\n"
-    "Decision: <long / short / wait, one sentence>\n"
-    "Reasoning: <the concrete factors behind the call - technicals, fundamentals, risk/sizing, "
-    "whatever the committee actually weighed - 3-6 sentences, specific numbers where the debate gave them>\n"
-    "Order: <if placed: symbol, side, lots, the resulting fill/price, and the exact stop_loss/take_profit "
-    "levels attached to it (from trading_place_order's response, not just what the PM said - confirm they "
-    "actually landed on the order); if not placed: the specific reason (decision was wait/hold, a position "
-    "already existed, the PM gave no stop level, or the order was rejected - state which)>"
+    # Rulebook output format (2026-09-30). strategy_tracking.parse_decision reads
+    # the DECISION line (PASS counts as a wait).
+    "Finally, report in exactly this structure (plain text, these labels verbatim, in this order):\n"
+    "DECISION: <LONG / SHORT / PASS>\n"
+    "CONFIDENCE: <0-100>\n"
+    "EDGE: <one sentence, naming which of the three allowed edge types>\n"
+    "CHECKLIST: <the head trader's ten numbered answers, one short line each>\n"
+    "ORDER: <if placed: symbol, side, type, fill price, stop_loss, take_profit, lots and net R:R, confirmed "
+    "from trading_place_order's own response (not just what the head trader said); if not placed: none>\n"
+    "STOP MANAGEMENT PLAN: Plain stop and target set at entry; the stop is never widened or moved; automated "
+    "exits only (40h max hold, Friday 20:00 UTC flatten).\n"
+    "INVALIDATION: <what would invalidate the thesis>\n"
+    "REASON FOR PASS: <if PASS or no order was placed: the specific rule-based reason (which checklist item, "
+    "trend rule, position already open, or the order's rejection -- quote its error text); otherwise n/a>"
 )
 
 
@@ -2198,6 +2231,14 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             logger.warning("correlation limit for %s: %s", target, conflict)
             trade = None
 
+    if trade:
+        in_blackout, why = fn_news.is_news_blackout(
+            {trade["symbol"][:3], trade["symbol"][3:6]}, window_minutes=NEWS_BLACKOUT_WINDOW_MINUTES)
+        if in_blackout:
+            breaker_note = f"[NEWS BLACKOUT] {trade['symbol']} pass run research-only: {why}."
+            logger.warning("news blackout for %s: %s", target, why)
+            trade = None
+
     trend_allowed = None
     if trade and TREND_FILTER_ENABLED:
         trend_allowed, trend_reason = strategy_tracking.trend_gate(trade["symbol"], trade["connection"])
@@ -2270,13 +2311,15 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     # already verifies status=="ok" against the connector's own response, so
     # basing `traded` on it directly is both the fix and the single source of
     # truth for what actually reached the broker.
-    #
     # Every successful placement in the trace is run through the guardrail
     # chain below, not just the first -- a pass that places more than one
     # order (e.g. the LLM misreads an ambiguous result and "retries" a fill
     # that had already gone through) must not let a second live position
     # escape spec/trend/stop-floor/reward:risk enforcement and journaling
-    # just because an earlier one already satisfied `traded`.
+    # just because an earlier one already satisfied `traded`. Each order is
+    # run through _handle_filled_order (not inlined here) so every guardrail
+    # it encapsulates -- including the max-stop and always-journal fixes --
+    # applies uniformly whether one order fired or several.
     placed_orders = _extract_placed_orders(run_id) if trade else []
     traded = False
     if placed_orders:
@@ -2291,23 +2334,9 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             resolved_price = _resolve_fill_price(trade, placed_order)
             if resolved_price is not None:
                 placed_order["fill_price"] = resolved_price
-            spec_note = (_enforce_trend_rule(trade, placed_order, trend_allowed)
-                         or _post_trade_spec_check(trade, placed_order))
-            floor_note, floor_closed = ("", False) if spec_note else _post_trade_stop_floor_check(trade, placed_order)
-            if floor_closed:
-                spec_note = floor_note
-            if spec_note:
-                # A spec violation is CLOSED, not just reported -- see
-                # _post_trade_spec_check's docstring for why this is a real
-                # corrective action, not another informational-only check.
-                report_text = report_text + spec_note
-            else:
-                traded = True
-                report_text = report_text + floor_note
-                report_text = report_text + _post_trade_cap_check(trade)
-                report_text = report_text + _post_trade_spread_check(trade, placed_order)
-                report_text = report_text + _post_trade_reward_risk_check(trade, placed_order)
-                _journal_record_open(trade["symbol"], trade["connection"], placed_order)
+            note, order_traded = _handle_filled_order(trade, placed_order, trend_allowed)
+            report_text = report_text + note
+            traded = traded or order_traded
     elif trade:
         blocked_note = _blocked_order_note(run_id)
         if blocked_note:
@@ -2452,11 +2481,66 @@ def _post_trade_stop_floor_check(trade: dict, placed_order: dict) -> tuple[str, 
         return (f"\n\n[STOP FLOOR] {header}; widening the stop to {new_sl:.5f} FAILED "
                 f"({result.get('error')}) -- check manually."), False
     placed_order["stop_loss"] = new_sl
+    placed_order["stop_adjusted"] = True
     logger.info("stop floor: widened %s ticket %s stop %.5f -> %.5f", symbol, ticket, sl, new_sl)
     return (
         f"\n\n[STOP FLOOR -- STOP WIDENED] {header}; stop moved to {new_sl:.5f} "
         f"(risk now ${floor_loss:.2f}, within the ${budget:.2f} cap)."
     ), False
+
+
+def _post_trade_max_stop_check(trade: dict, placed_order: dict) -> str:
+    """Rulebook (2026-09-30): a stop farther than MAX_STOP_PRICE_FRACTION of price is tightened to it.
+
+    Tightening only ever reduces risk, so no budget check is needed. Returns
+    a report note, or "" when the stop is within bounds / data is missing.
+    """
+    side = placed_order.get("side")
+    entry = _resolve_fill_price(trade, placed_order)
+    sl = placed_order.get("stop_loss")
+    if side not in ("buy", "sell") or entry is None or sl is None:
+        return ""
+    entry, sl = float(entry), float(sl)
+    is_buy = side == "buy"
+    max_distance = entry * MAX_STOP_PRICE_FRACTION
+    if ((entry - sl) if is_buy else (sl - entry)) <= max_distance:
+        return ""
+    new_sl = entry - max_distance if is_buy else entry + max_distance
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.service import get_positions
+
+    ticket = str(placed_order.get("order_id") or "").strip()
+    try:
+        pos = next((p for p in get_positions(trade["connection"]).get("positions", [])
+                    if ticket and str(p.get("ticket")) == ticket and p.get("magic") == OUR_MAGIC), None)
+        if pos is None:
+            return f"\n\n[MAX STOP] {trade['symbol']} stop {sl:.5f} is wider than 1% of price; ticket {ticket or '?'} not found -- check manually."
+        result = mt5_sdk.modify_position(_mt5_config_for(trade["connection"]), ticket=pos.get("ticket"),
+                                         stop_loss=new_sl, take_profit=placed_order.get("take_profit"))
+    except Exception as exc:
+        return f"\n\n[MAX STOP] {trade['symbol']} stop wider than 1% of price; tightening raised {exc} -- check manually."
+    if result.get("status") != "ok":
+        return f"\n\n[MAX STOP] tightening {trade['symbol']} stop to {new_sl:.5f} FAILED ({result.get('error')}) -- check manually."
+    placed_order["stop_loss"] = new_sl
+    placed_order["stop_adjusted"] = True
+    return f"\n\n[MAX STOP -- STOP TIGHTENED] {trade['symbol']} stop {sl:.5f} was wider than 1% of price; moved to {new_sl:.5f}."
+
+
+def _rulebook_skip_reason(symbol: str) -> str | None:
+    """Rulebook pre-pass skips: 3-loss bench, or a repeated post-trade deviation."""
+    try:
+        journal = _read_journal()
+        note = strategy_tracking.bench_reason(journal, symbol)
+        if note:
+            return note
+        note = strategy_tracking.consume_repeat_deviation(journal, symbol)
+        if note:
+            _write_journal(journal)  # persists the "pass served" mark
+        return note
+    except Exception:
+        logger.exception("rulebook skip check failed for %s; not skipping", symbol)
+        return None
 
 
 def _post_trade_spread_check(trade: dict, placed_order: dict) -> str:
@@ -2689,22 +2773,25 @@ def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
     if risk_distance <= 0 or reward_distance <= 0:
         return ""  # malformed levels -- nothing sane to enforce
 
-    ratio = reward_distance / risk_distance
-    if ratio >= MIN_REWARD_RISK_RATIO:
-        return ""
-
+    # Rulebook 2026-09-30: the floor is NET of spread -- the spread is paid
+    # on both the risk and the reward side of the trade.
     symbol = trade["symbol"]
     connection = trade["connection"]
     quote = _symbol_live_quote(symbol, connection)
+    spread = max(0.0, float(quote["ask"]) - float(quote["bid"])) if quote else 0.0
+    ratio = (reward_distance - spread) / (risk_distance + spread)
+    if ratio >= MIN_REWARD_RISK_RATIO:
+        return ""
+
     floor_distance = max(_atr_stop_floor(symbol, connection) or 0.0, _spread_stop_floor(quote) or 0.0)
 
-    desired_risk_distance = reward_distance / MIN_REWARD_RISK_RATIO
+    desired_risk_distance = (reward_distance - spread) / MIN_REWARD_RISK_RATIO - spread
     if desired_risk_distance >= floor_distance:
         new_sl = entry - desired_risk_distance if is_buy else entry + desired_risk_distance
         new_tp = tp
         action = f"tightened stop-loss to {new_sl:.5f}"
     else:
-        desired_reward_distance = risk_distance * MIN_REWARD_RISK_RATIO
+        desired_reward_distance = (risk_distance + spread) * MIN_REWARD_RISK_RATIO + spread
         new_sl = sl
         new_tp = entry + desired_reward_distance if is_buy else entry - desired_reward_distance
         action = f"widened take-profit to {new_tp:.5f}"
@@ -2751,6 +2838,52 @@ def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
     placed_order["stop_loss"] = new_sl
     placed_order["take_profit"] = new_tp
     return f"\n\n[AUTOMATED CHECK — CORRECTED] {header} — {action} to restore it."
+
+
+def _handle_filled_order(trade: dict, placed_order: dict, trend_allowed: set[str] | None) -> tuple[str, bool]:
+    """Run every post-fill guardrail against a just-filled order, then journal it.
+
+    Real bug found by /code-review: a fill that a guardrail immediately
+    closes (trend-gate violation, spec violation, or a stop-floor-budget
+    violation) is still a real trade that happened on the live account, but
+    the journal write used to live only in the "no violation" branch below
+    -- so every auto-closed fill silently vanished from the trade journal.
+    That blinds _rulebook_skip_reason's 3-loss bench and repeat-deviation
+    checks, the weekly win/loss report, and _journal_summary_text's own-
+    history fact to exactly the fills most worth tracking -- all three exist
+    specifically to never trust the LLM's own account of what happened.
+    Journals under the order's OWN reported symbol (not trade["symbol"]):
+    a spec violation can carry a different, wrong symbol, and recording it
+    under the expected symbol would misfile it into the wrong instrument's
+    history.
+
+    Returns (report note to append, whether this counts as "traded" for
+    CommitteeResult/email tagging).
+    """
+    spec_note = (_enforce_trend_rule(trade, placed_order, trend_allowed)
+                 or _post_trade_spec_check(trade, placed_order))
+    floor_note, floor_closed = ("", False) if spec_note else _post_trade_stop_floor_check(trade, placed_order)
+    if floor_closed:
+        spec_note = floor_note
+    elif not spec_note:
+        floor_note = floor_note + _post_trade_max_stop_check(trade, placed_order)
+    if spec_note:
+        # A spec violation is CLOSED, not just reported -- see
+        # _post_trade_spec_check's docstring for why this is a real
+        # corrective action, not another informational-only check.
+        note = spec_note
+        traded = False
+    else:
+        note = floor_note
+        note = note + _post_trade_cap_check(trade)
+        note = note + _post_trade_spread_check(trade, placed_order)
+        note = note + _post_trade_reward_risk_check(trade, placed_order)
+        # "with" = H4+D1 agreed and the gate allowed only this side; counter-trend
+        # fills never get here (closed by _enforce_trend_rule).
+        placed_order["trend_alignment"] = "with" if trend_allowed else "neutral"
+        traded = True
+    _journal_record_open(placed_order.get("symbol") or trade["symbol"], trade["connection"], placed_order)
+    return note, traded
 
 
 def _last_json_line(stdout: str | None) -> dict | None:
@@ -3531,7 +3664,8 @@ def run_once(session: str = "new_york") -> None:
         # it was ~$0.80 for an email. A one-line email keeps the day's
         # report from going silent.
         if trade_enabled and spec.get("trade"):
-            conflict = _exclusive_group_conflict(spec["trade"])
+            conflict = (_exclusive_group_conflict(spec["trade"])
+                        or _rulebook_skip_reason(spec["trade"]["symbol"]))
             if conflict:
                 logger.info("skipping %s committee: %s", target, conflict)
                 strategy_tracking.record_decision(

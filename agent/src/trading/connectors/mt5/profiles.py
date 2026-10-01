@@ -85,6 +85,10 @@ MT5_PROFILES: tuple[TradingProfile, ...] = (
             # Exness baseline. Pinning the Exness install makes the routing
             # explicit on both sides.
             "terminal_path": r"C:\Program Files\ExnessKE MT5 Terminal\terminal64.exe",
+            # Exness names symbols with an "m" suffix (EURUSDm). service.place_order
+            # appends it when an order arrives without it -- added 2026-09-29 after
+            # a committee sent "EURUSD" and the order was denied as unpriceable.
+            "symbol_suffix": "m",
         },
         notes=(
             "Places REAL orders against whatever account is signed into your local "

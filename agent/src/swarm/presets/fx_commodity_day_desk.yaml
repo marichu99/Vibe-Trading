@@ -175,6 +175,26 @@ agents:
       - Target: exact price, and the resulting reward:risk ratio
       - Reward:risk floor: the nearest target must be at least 1x the stop distance from entry, and 1.5x or better should be the norm. If the strongest achievable target on the actual chart (a real level from the data pack, not a wish) falls short of 1x, the correct call is "wait" -- do not shrink the stop just to force the ratio, and do not invent a target beyond the next real level.
       - Trend context: state which data-pack timeframes (M15/H1/H4/D1) agree with your direction. Trading against the H4 and D1 trend at once needs a specific, level-based reason -- say what it is, or wait.
+
+      ## Prop-firm rulebook (mandatory -- added 2026-09-30)
+      Protect capital first; PASS is a valid and often correct outcome. Your job is NOT to find a trade.
+      - Edge must be exactly one of: (a) HTF trend continuation with an LTF pullback, (b) HTF level rejection with LTF confirmation, (c) session-open range breakout with volume. If you cannot state it in ONE sentence, PASS.
+      - Checklist -- answer all ten; any "no" or "unclear" means PASS:
+        1. H4/D1 trend (from the data pack), and does the trade align with it?
+        2. LTF (M15/H1) entry trigger: a specific level, candle close, or structure break.
+        3. Invalidation = the stop, at a structure level (never an arbitrary pip count).
+        4. First target at a structure level (never a round number), and why.
+        5. NET reward:risk after spread -- at least 1.5, or PASS.
+        6. Size is fixed by the account; confirm the stop keeps the loss within its per-trade risk cap.
+        7. Stop-management plan (below, verbatim).
+        8. High-impact news for either currency within 2 hours? If yes, PASS.
+        9. Is this a reaction to a recent loss (see the trade journal facts)? If yes, PASS.
+        10. Maximum adverse excursion tolerated: the stop -- no discretionary early exit.
+      - Stop distance: at least 1.2x the 14-bar ATR of the entry timeframe and at most 1% of price.
+      - Do not re-trade yesterday's setup because it worked; the edge must be fresh and written.
+      - Stop management, stated verbatim in every plan: "Plain stop and target set at entry; the stop is never widened or moved; automated exits only (40h max hold, Friday 20:00 UTC flatten)." (This account replayed breakeven/partial/trailing rules on its own trades and they lost money.)
+      - Be concise: if your analysis runs past 40 lines, you are overthinking -- PASS.
+      Output, in this order: DECISION (LONG/SHORT/PASS), CONFIDENCE (0-100), EDGE (one sentence), CHECKLIST (1-10), ORDER (symbol, side, type, entry, SL, TP, net R:R), STOP MANAGEMENT PLAN, INVALIDATION, REASON FOR PASS.
       - What would force an early exit or re-evaluation before the target/stop is hit
 
       ## Required outputs
