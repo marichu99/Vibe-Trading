@@ -2,6 +2,7 @@
 OpenRouter reminder, and FundedNext's broker-clock close-time fix."""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -13,6 +14,16 @@ import strategy_tracking as st
 @pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
     monkeypatch.setattr(st, "openrouter_balance_usd", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _empty_journals(monkeypatch, tmp_path):
+    """pooled_scale_status reads both bots' journal files directly (not a
+    parameter) -- point both at empty, isolated files by default so tests
+    never see this machine's real trade history. Tests that want specific
+    pooled numbers override one or both paths themselves."""
+    monkeypatch.setattr(st, "EXNESS_JOURNAL_PATH", tmp_path / "exness_journal.json")
+    monkeypatch.setattr(st, "FUNDEDNEXT_JOURNAL_PATH", tmp_path / "fn_journal.json")
 
 
 class TestScaleVerdict:
@@ -37,9 +48,31 @@ def _trade(version, r, trend=None):
 def test_report_counts_v2_and_v3_and_splits_by_trend() -> None:
     journal = [_trade("v2-fxdesk-datapack-plainexit-trendgate", 2.0, "with"),
                _trade(st.STRATEGY_VERSION, -1.0, "neutral"), _trade(st.LEGACY_VERSION, -1.0)]
+    st.FUNDEDNEXT_JOURNAL_PATH.write_text(json.dumps(journal))
     text = st.weekly_version_report(journal, "fundednext", decisions=[])
     assert "Scale rule (new setup, v2+v3): 2 closed trades, +1.00R" in text
     assert "neutral 1 trades -1.00R" in text and "with 1 trades +2.00R" in text
+
+
+def test_pooled_scale_status_sums_both_bots_journals() -> None:
+    # The scale rule is pre-committed on the POOLED sample -- a trade logged
+    # on one account must count toward the other's scale/pause decision, not
+    # just its own half of the history.
+    st.EXNESS_JOURNAL_PATH.write_text(json.dumps([_trade(st.STRATEGY_VERSION, 1.5)]))
+    st.FUNDEDNEXT_JOURNAL_PATH.write_text(json.dumps([_trade(st.STRATEGY_VERSION, -0.5)]))
+    n, total = st.pooled_scale_status()
+    assert n == 2
+    assert total == pytest.approx(1.0)
+
+
+def test_strategic_context_prompt_silent_once_a_trigger_fires() -> None:
+    st.EXNESS_JOURNAL_PATH.write_text(json.dumps([]))
+    st.FUNDEDNEXT_JOURNAL_PATH.write_text(json.dumps(
+        [_trade(st.STRATEGY_VERSION, -1.0) for _ in range(2)]))
+    assert "STRATEGIC CONTEXT" in st.strategic_context_prompt()
+    st.FUNDEDNEXT_JOURNAL_PATH.write_text(json.dumps(
+        [_trade(st.STRATEGY_VERSION, -1.0) for _ in range(3)]))
+    assert st.strategic_context_prompt() == ""
 
 
 def test_missed_move_stat_for_waits() -> None:

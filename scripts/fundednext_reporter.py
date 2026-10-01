@@ -1194,18 +1194,23 @@ _REPORT_FORMAT_NO_TRADE = (
 )
 
 _REPORT_FORMAT_TRADE = (
-    # Rulebook output format (2026-09-30). strategy_tracking.parse_decision reads
-    # the DECISION line (PASS counts as a wait).
-    "Finally, report in exactly this structure (plain text, these labels verbatim, in this order):\n"
+    # Rulebook output format (2026-09-30; v4 edge taxonomy + PROPOSAL field,
+    # 2026-10-01). strategy_tracking.parse_decision reads the DECISION line
+    # (PASS counts as a wait). Exits stay plain stop+target either way --
+    # that's locked in the preset's own prompt and in STOP_TRAILING_ENABLED,
+    # not something this report format needs to restate per trade.
+    "Finally, report in exactly this structure (plain text, these labels verbatim, in this order; max 40 "
+    "lines total -- if the head trader's own answer would exceed that, or stated confidence below 60, or "
+    "left any checklist item unclear, DECISION must be PASS regardless of what was otherwise concluded):\n"
     "DECISION: <LONG / SHORT / PASS>\n"
     "CONFIDENCE: <0-100>\n"
-    "EDGE: <one sentence, naming which of the three allowed edge types>\n"
+    "EDGE: <one of HTF_TREND_CONTINUATION / HTF_LEVEL_REJECTION / SESSION_RANGE_BREAKOUT, then one sentence why>\n"
     "CHECKLIST: <the head trader's ten numbered answers, one short line each>\n"
     "ORDER: <if placed: symbol, side, type, fill price, stop_loss, take_profit, lots and net R:R, confirmed "
     "from trading_place_order's own response (not just what the head trader said); if not placed: none>\n"
-    "STOP MANAGEMENT PLAN: Plain stop and target set at entry; the stop is never widened or moved; automated "
-    "exits only (40h max hold, Friday 20:00 UTC flatten).\n"
-    "INVALIDATION: <what would invalidate the thesis>\n"
+    "INVALIDATION: <the specific thesis-break price>\n"
+    "PROPOSAL: <a new rule/filter/exit idea the head trader flagged, marked DO NOT SHIP -- it must not affect "
+    "this pass's decision or order; otherwise \"none\">\n"
     "REASON FOR PASS: <if PASS or no order was placed: the specific rule-based reason (which checklist item, "
     "trend rule, position already open, or the order's rejection -- quote its error text); otherwise n/a>"
 )
@@ -1392,9 +1397,11 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
     session_bias_fact = _session_bias_fact(symbol)
     session_bias_block = f"{session_bias_fact}\n\n" if session_bias_fact else ""
     trend_block = trade.get("trend_rule", "")
+    strategic_context_block = strategy_tracking.strategic_context_prompt()
 
     return (
         f"{swarm_intro}"
+        f"{strategic_context_block}"
         f"The swarm must produce its full debate "
         f"and final decision, including concrete stop-loss and take-profit price levels — every "
         f"committee decision must carry these, not just a direction.\n\n"

@@ -31,6 +31,11 @@ import market_data_pack as mdp
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_DIR = REPO_ROOT / "agent"
 DECISION_LOG_PATH = REPO_ROOT / "logs" / "decision_log.jsonl"
+# Both bots' own journal paths (committee_reporter.py / fundednext_reporter.py
+# define the same constant locally) -- needed here so the scale rule below can
+# pool across both accounts instead of judging each one on its own half-sample.
+EXNESS_JOURNAL_PATH = REPO_ROOT / "logs" / "trade_journal.json"
+FUNDEDNEXT_JOURNAL_PATH = REPO_ROOT / "logs" / "fundednext_trade_journal.json"
 
 # Bump whenever the committee, data inputs, or exit rules change materially.
 # v3 (2026-09-30): the user's prop-firm rulebook (checklist, edge types,
@@ -342,6 +347,57 @@ def _trade_r(entry: dict) -> float | None:
         return None
 
 
+def pooled_scale_status() -> tuple[int, float]:
+    """(n_trades, total_R) for NEW_SETUP_VERSIONS, pooled across BOTH bots' journals.
+
+    scale_verdict's own n/total used to come from whichever single journal
+    called weekly_version_report, so each bot judged the scale rule against
+    its own half of the sample (e.g. 2 trades each) instead of the pooled
+    figure the rule was actually agreed on. Reads both journal files
+    directly rather than taking one as a parameter, since the whole point is
+    to see across the account boundary. Fails soft (0, 0.0) per unreadable
+    file -- a missing/corrupt journal must not crash the prompt this feeds.
+    """
+    n, total = 0, 0.0
+    for path in (EXNESS_JOURNAL_PATH, FUNDEDNEXT_JOURNAL_PATH):
+        try:
+            journal = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for t in journal:
+            if t.get("status") == "closed" and t.get("strategy_version") in NEW_SETUP_VERSIONS:
+                r = _trade_r(t)
+                if r is not None:
+                    n += 1
+                    total += r
+    return n, total
+
+
+def strategic_context_prompt() -> str:
+    """Pre-pass prompt block restating the pre-committed scale/pause rule and
+    today's live pooled standing, so the committee is told -- every pass, with
+    the current numbers, not a snapshot that goes stale -- to execute the
+    locked playbook rather than improvise while the sample is still small.
+    """
+    n, total = pooled_scale_status()
+    hit = n >= SCALE_MIN_TRADES and total >= SCALE_UP_R
+    paused = total <= PAUSE_R
+    if paused or hit:
+        # The rule has actually fired -- scale_verdict's own line (surfaced in
+        # the weekly email) is the right signal to act on, not this per-pass
+        # reminder to hold the line.
+        return ""
+    return (
+        f"STRATEGIC CONTEXT: this strategy version is in a pre-registered observation window. "
+        f"Scale rule (pooled across both accounts): at {SCALE_MIN_TRADES}+ closed trades, "
+        f"<= {PAUSE_R:+.0f}R -> pause and revisit; >= {SCALE_UP_R:+.0f}R -> scale up. Current pooled "
+        f"sample: {n} trades, {total:+.2f}R -- neither trigger hit. Therefore: do NOT change entry logic, "
+        f"exit logic, filters, or sizing this pass -- execute the existing playbook consistently, don't "
+        f"innovate. If you see a genuine improvement, say so as a PROPOSAL (do not ship it) rather than "
+        f"acting on it now.\n\n"
+    )
+
+
 def weekly_version_report(journal: list[dict], bot: str, decisions: list[dict] | None = None) -> str:
     """Plain-text per-version comparison of closed trades and logged decisions."""
     decisions = read_decisions() if decisions is None else decisions
@@ -364,8 +420,7 @@ def weekly_version_report(journal: list[dict], bot: str, decisions: list[dict] |
             f"total {sum(rs):+.2f}R / ${usd:+.2f}" if rs else f"  {version}: {len(trades)} trades (no R data)"
         )
     current = [t for t in journal if t.get("status") == "closed" and t.get("strategy_version") in NEW_SETUP_VERSIONS]
-    current_rs = [r for r in (_trade_r(t) for t in current) if r is not None]
-    lines.append(scale_verdict(len(current_rs), sum(current_rs)))
+    lines.append(scale_verdict(*pooled_scale_status()))
     by_trend: dict[str, list[float]] = {}
     for t in current:
         r = _trade_r(t)

@@ -26,11 +26,16 @@ class TestAvailable:
         assert fn_news.available() is False
 
 
-class TestIsNewsBlackoutFailsOpen:
-    def test_no_api_key_fails_open(self, monkeypatch) -> None:
+class TestIsNewsBlackoutFailsClosed:
+    def test_no_api_key_fails_closed(self, monkeypatch) -> None:
+        # Changed 2026-10-01 (rulebook v4): an unreachable calendar used to
+        # silently report "all clear" forever; it now blocks the current
+        # pass instead, since the committee has no way to tell the check
+        # even ran.
         monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
         blackout, why = fn_news.is_news_blackout({"EUR", "USD"})
-        assert blackout is False and why is None
+        assert blackout is True
+        assert why is not None
 
 
 class TestIsNewsBlackoutWithEvents:

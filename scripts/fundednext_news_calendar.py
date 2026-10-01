@@ -150,13 +150,20 @@ def is_news_blackout(currencies: set[str], now: datetime | None = None, window_m
     """True if ``now`` falls within ``window_minutes`` of a high-impact release
     for any of ``currencies``.
 
-    Fails OPEN (returns (False, None)), never closed, when the calendar is
-    unavailable (no API key, fetch failure, unparseable event time) — a
-    missing news-avoidance signal should never itself block trading; the
-    existing volatility/spread-floor check is still in effect regardless.
+    Fails CLOSED (returns (True, reason)) when the calendar is unreachable --
+    no FINNHUB_API_KEY configured (changed 2026-10-01, rulebook v4: "if
+    calendar API unreachable, PASS, don't fail open" -- the committee has no
+    way to see whether this check even ran, so the earlier "fail open" meant
+    an unconfigured/broken calendar silently produced an all-clear forever).
+    This only skips the CURRENT pass, not a persistent halt -- the next
+    scheduled pass re-checks, so a lapsed key costs missed trades, not a
+    stuck kill switch. A real fetch that genuinely finds zero matching
+    events (API working, just nothing scheduled) still returns (False, None)
+    below -- only "we have no way to know" fails closed, not "nothing's on
+    the calendar."
     """
     if not available():
-        return False, None
+        return True, "news calendar unavailable (no FINNHUB_API_KEY) — failing closed (rulebook v4)"
 
     now = now or datetime.now(timezone.utc)
     events = fetch_calendar()
