@@ -540,7 +540,12 @@ def _write_journal(entries: list[dict]) -> None:
     TRADE_JOURNAL_PATH.write_text(json.dumps(entries, indent=2, default=str), encoding="utf-8")
 
 
-def _extract_placed_order(run_id: str) -> dict | None:
+def _extract_placed_orders(run_id: str) -> list[dict]:
+    """Pull every verified trading_place_order RESULT, not just the first --
+    see committee_reporter.py's identical function for the full rationale
+    (a pass that places more than one order, e.g. a misread retry, must have
+    every fill run through the post-trade guardrail chain and journaled)."""
+    orders = []
     for e in _trace_entries(run_id):
         if e.get("type") != "tool_result" or e.get("tool") != "trading_place_order":
             continue
@@ -552,8 +557,15 @@ def _extract_placed_order(run_id: str) -> dict | None:
         except (TypeError, json.JSONDecodeError):
             continue
         if isinstance(parsed, dict) and parsed.get("status") == "ok":
-            return parsed
-    return None
+            orders.append(parsed)
+    return orders
+
+
+def _extract_placed_order(run_id: str) -> dict | None:
+    """Convenience single-result wrapper around _extract_placed_orders — the
+    first successful placement, or None if this run didn't place one."""
+    orders = _extract_placed_orders(run_id)
+    return orders[0] if orders else None
 
 
 def _blocked_order_note(run_id: str) -> str | None:
@@ -1568,41 +1580,29 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     if not report_text:
         return CommitteeResult(committee, target, market, "error", run_id, "", error="run succeeded but produced no final answer")
 
-    placed_order = _extract_placed_order(run_id) if trade else None
-    traded = bool(placed_order)
-    if traded:
-        # Resolve the real fill price ONCE here and patch it into
-        # placed_order, so every downstream consumer (_post_trade_spread_
-        # check, _post_trade_reward_risk_check, _journal_record_open) can
-        # just read placed_order["fill_price"] directly instead of each
-        # independently calling _resolve_fill_price (and its own
-        # get_positions broker round-trip) -- mirrors the identical fix in
-        # committee_reporter.py's run_committee, found by /code-review.
-        resolved_price = _resolve_fill_price(trade, placed_order)
-        if resolved_price is not None:
-            placed_order["fill_price"] = resolved_price
-        spec_note = (_enforce_trend_rule(trade, placed_order, trend_allowed)
-                     or _post_trade_spec_check(trade, placed_order))
-        floor_note, floor_closed = ("", False) if spec_note else _post_trade_stop_floor_check(trade, placed_order)
-        if floor_closed:
-            spec_note = floor_note
-        elif not spec_note:
-            floor_note = floor_note + _post_trade_max_stop_check(trade, placed_order)
-        if spec_note:
-            # A spec violation is CLOSED, not just reported -- see
-            # _post_trade_spec_check's docstring for why this is a real
-            # corrective action, not another informational-only check.
-            report_text = report_text + spec_note
-            traded = False
-        else:
-            report_text = report_text + floor_note
-            report_text = report_text + _post_trade_cap_check(trade)
-            report_text = report_text + _post_trade_spread_check(trade, placed_order)
-            report_text = report_text + _post_trade_reward_risk_check(trade, placed_order)
-            # "with" = H4+D1 agreed and the gate allowed only this side; counter-trend
-            # fills never get here (closed by _enforce_trend_rule).
-            placed_order["trend_alignment"] = "with" if trend_allowed else "neutral"
-            _journal_record_open(trade["symbol"], trade["connection"], placed_order)
+    # Every successful placement in the trace is run through the guardrail
+    # chain below, not just the first -- see committee_reporter.py's
+    # identical run_committee logic for the full rationale. Each order runs
+    # through _handle_filled_order (not inlined here) so every guardrail it
+    # encapsulates -- including the max-stop and always-journal fixes --
+    # applies uniformly whether one order fired or several.
+    placed_orders = _extract_placed_orders(run_id) if trade else []
+    traded = False
+    if placed_orders:
+        for placed_order in placed_orders:
+            # Resolve the real fill price ONCE here and patch it into
+            # placed_order, so every downstream consumer (_post_trade_spread_
+            # check, _post_trade_reward_risk_check, _journal_record_open) can
+            # just read placed_order["fill_price"] directly instead of each
+            # independently calling _resolve_fill_price (and its own
+            # get_positions broker round-trip) -- mirrors the identical fix in
+            # committee_reporter.py's run_committee, found by /code-review.
+            resolved_price = _resolve_fill_price(trade, placed_order)
+            if resolved_price is not None:
+                placed_order["fill_price"] = resolved_price
+            note, order_traded = _handle_filled_order(trade, placed_order, trend_allowed)
+            report_text = report_text + note
+            traded = traded or order_traded
     elif trade:
         blocked_note = _blocked_order_note(run_id)
         if blocked_note:
@@ -2090,6 +2090,56 @@ def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
     placed_order["stop_loss"] = new_sl
     placed_order["take_profit"] = new_tp
     return f"\n\n[AUTOMATED CHECK — CORRECTED] {header} — {action} to restore it."
+
+
+def _handle_filled_order(trade: dict, placed_order: dict, trend_allowed: set[str] | None) -> tuple[str, bool]:
+    """Run every post-fill guardrail against a just-filled order, then journal it.
+
+    Real bug found by /code-review (mirrored from the identical fix in
+    committee_reporter.py): a fill that a guardrail immediately closes
+    (trend-gate violation, spec violation, or a stop-floor-budget violation)
+    is still a real trade that happened on the live account, but the journal
+    write used to live only in the "no violation" branch below -- so every
+    auto-closed fill silently vanished from the trade journal. That blinds
+    _rulebook_skip_reason's 3-loss bench and repeat-deviation checks, the
+    weekly win/loss report, and _journal_summary_text's own-history fact to
+    exactly the fills most worth tracking -- all three exist specifically to
+    never trust the LLM's own account of what happened. It also meant
+    fn_state.record_trading_day() (only ever called from
+    _journal_record_open) never fired for an auto-closed fill, undercounting
+    progress toward FundedNext's own minimum-trading-days rule on a day whose
+    only activity was a fill that got immediately corrected. Journals under
+    the order's OWN reported symbol (not trade["symbol"]): a spec violation
+    can carry a different, wrong symbol, and recording it under the expected
+    symbol would misfile it into the wrong instrument's history.
+
+    Returns (report note to append, whether this counts as "traded" for
+    CommitteeResult/email tagging).
+    """
+    spec_note = (_enforce_trend_rule(trade, placed_order, trend_allowed)
+                 or _post_trade_spec_check(trade, placed_order))
+    floor_note, floor_closed = ("", False) if spec_note else _post_trade_stop_floor_check(trade, placed_order)
+    if floor_closed:
+        spec_note = floor_note
+    elif not spec_note:
+        floor_note = floor_note + _post_trade_max_stop_check(trade, placed_order)
+    if spec_note:
+        # A spec violation is CLOSED, not just reported -- see
+        # _post_trade_spec_check's docstring for why this is a real
+        # corrective action, not another informational-only check.
+        note = spec_note
+        traded = False
+    else:
+        note = floor_note
+        note = note + _post_trade_cap_check(trade)
+        note = note + _post_trade_spread_check(trade, placed_order)
+        note = note + _post_trade_reward_risk_check(trade, placed_order)
+        # "with" = H4+D1 agreed and the gate allowed only this side; counter-trend
+        # fills never get here (closed by _enforce_trend_rule).
+        placed_order["trend_alignment"] = "with" if trend_allowed else "neutral"
+        traded = True
+    _journal_record_open(placed_order.get("symbol") or trade["symbol"], trade["connection"], placed_order)
+    return note, traded
 
 
 def _last_json_line(stdout: str | None) -> dict | None:

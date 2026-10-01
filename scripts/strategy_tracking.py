@@ -198,7 +198,12 @@ def fill_decision_outcomes(bot: str, server_tz, now: datetime | None = None) -> 
             e["outcome"] = {"note": "no bars in window (market closed?)"}
             filled += 1
             continue
-        pip = 0.01 if e["symbol"][3:6] == "JPY" else (0.1 if e["symbol"][:3] in ("XAU",) else 0.0001)
+        # Matches market_data_pack.build_data_pack's digits/pip convention
+        # (digits=2 for XAU/XAG -> pip=0.01) -- this used to use 0.1 for XAU,
+        # a 10x-too-large pip that would silently understate gold's
+        # close/max-up/max-down pip outcomes by 10x the moment gold trading
+        # (currently paused in both bots' TARGETS) resumes.
+        pip = 0.01 if e["symbol"][3:6] == "JPY" or e["symbol"][:3] in ("XAU", "XAG") else 0.0001
         p0 = e["price"]
         e["outcome"] = {
             "hours": OUTCOME_HOURS,

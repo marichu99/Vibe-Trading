@@ -598,6 +598,43 @@ class TestExtractPlacedOrder:
         assert cr._extract_placed_order("run-1") is None
 
 
+class TestExtractPlacedOrders:
+    def test_returns_every_ok_result_not_just_the_first(self, monkeypatch) -> None:
+        """Regression: a pass that places two orders (e.g. the LLM misreads an
+        ambiguous first result and "retries" an order that already filled)
+        used to only ever have its FIRST fill checked by the post-trade
+        guardrail chain / journaled -- a second live position could silently
+        escape spec/trend/stop-floor/reward:risk enforcement entirely."""
+        first = {"status": "ok", "ticket": "1", "symbol": "EURUSDm"}
+        second = {"status": "ok", "ticket": "2", "symbol": "EURUSDm"}
+        monkeypatch.setattr(
+            cr, "_trace_entries",
+            lambda run_id: [
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(first)},
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(second)},
+            ],
+        )
+        assert cr._extract_placed_orders("run-1") == [first, second]
+
+    def test_skips_non_ok_results_between_ok_ones(self, monkeypatch) -> None:
+        first = {"status": "ok", "ticket": "1"}
+        rejected = {"status": "blocked", "reason": "denied"}
+        second = {"status": "ok", "ticket": "2"}
+        monkeypatch.setattr(
+            cr, "_trace_entries",
+            lambda run_id: [
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(first)},
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(rejected)},
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(second)},
+            ],
+        )
+        assert cr._extract_placed_orders("run-1") == [first, second]
+
+    def test_empty_when_no_placements(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_trace_entries", lambda run_id: [{"type": "tool_result", "tool": "trading_quote"}])
+        assert cr._extract_placed_orders("run-1") == []
+
+
 class TestBlockedOrderNote:
     def test_surfaces_the_real_reason(self, monkeypatch) -> None:
         call_id = "call-1"
@@ -1844,6 +1881,63 @@ class TestPostTradeRewardRiskCheck:
         calls = self._patch(monkeypatch)
         assert cr._post_trade_reward_risk_check(self.TRADE, {"side": "buy", "fill_price": 1.1}) == ""
         assert calls == {}
+
+
+class TestHandleFilledOrder:
+    """Real bug found by /code-review: the journal write used to live only in
+    run_committee's "no violation" branch, so a fill a guardrail immediately
+    closed (spec/trend/stop-floor-budget violation) silently never reached
+    the trade journal -- see _handle_filled_order's own docstring."""
+
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def test_journals_even_when_spec_violation_closes_it(self, monkeypatch) -> None:
+        journaled = []
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "\n\n[CRITICAL -- SPEC VIOLATION, AUTO-CLOSED] ...")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDcm", "side": "buy", "quantity": 0.25, "order_id": "1",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+
+        note, traded = cr._handle_filled_order(self.TRADE, order, None)
+
+        assert traded is False
+        assert "SPEC VIOLATION" in note
+        # Journaled under the order's OWN (wrong) symbol, not trade["symbol"]
+        # -- misfiling it into "EURUSDm"'s history would be its own bug.
+        assert journaled == [("EURUSDcm", "mt5-live-trade", order)]
+
+    def test_journals_even_when_trend_gate_closes_it(self, monkeypatch) -> None:
+        journaled = []
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "\n\n[TREND GATE -- ORDER CLOSED] ...")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDm", "side": "sell", "quantity": 0.01, "order_id": "2",
+                 "stop_loss": 1.1, "take_profit": 1.0}
+
+        note, traded = cr._handle_filled_order(self.TRADE, order, {"buy"})
+
+        assert traded is False
+        assert "TREND GATE" in note
+        assert journaled == [("EURUSDm", "mt5-live-trade", order)]
+
+    def test_journals_normally_when_no_violation(self, monkeypatch) -> None:
+        journaled = []
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(cr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDm", "side": "buy", "quantity": 0.01, "order_id": "3",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+
+        note, traded = cr._handle_filled_order(self.TRADE, order, {"buy"})
+
+        assert traded is True
+        assert journaled == [("EURUSDm", "mt5-live-trade", order)]
+        assert order["trend_alignment"] == "with"
 
 
 class TestLlmBalanceAlert:
