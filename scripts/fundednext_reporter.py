@@ -540,7 +540,12 @@ def _write_journal(entries: list[dict]) -> None:
     TRADE_JOURNAL_PATH.write_text(json.dumps(entries, indent=2, default=str), encoding="utf-8")
 
 
-def _extract_placed_order(run_id: str) -> dict | None:
+def _extract_placed_orders(run_id: str) -> list[dict]:
+    """Pull every verified trading_place_order RESULT, not just the first --
+    see committee_reporter.py's identical function for the full rationale
+    (a pass that places more than one order, e.g. a misread retry, must have
+    every fill run through the post-trade guardrail chain and journaled)."""
+    orders = []
     for e in _trace_entries(run_id):
         if e.get("type") != "tool_result" or e.get("tool") != "trading_place_order":
             continue
@@ -552,8 +557,15 @@ def _extract_placed_order(run_id: str) -> dict | None:
         except (TypeError, json.JSONDecodeError):
             continue
         if isinstance(parsed, dict) and parsed.get("status") == "ok":
-            return parsed
-    return None
+            orders.append(parsed)
+    return orders
+
+
+def _extract_placed_order(run_id: str) -> dict | None:
+    """Convenience single-result wrapper around _extract_placed_orders — the
+    first successful placement, or None if this run didn't place one."""
+    orders = _extract_placed_orders(run_id)
+    return orders[0] if orders else None
 
 
 def _blocked_order_note(run_id: str) -> str | None:
@@ -1561,21 +1573,29 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     if not report_text:
         return CommitteeResult(committee, target, market, "error", run_id, "", error="run succeeded but produced no final answer")
 
-    placed_order = _extract_placed_order(run_id) if trade else None
-    traded = bool(placed_order)
-    if traded:
-        # Resolve the real fill price ONCE here and patch it into
-        # placed_order, so every downstream consumer (_post_trade_spread_
-        # check, _post_trade_reward_risk_check, _journal_record_open) can
-        # just read placed_order["fill_price"] directly instead of each
-        # independently calling _resolve_fill_price (and its own
-        # get_positions broker round-trip) -- mirrors the identical fix in
-        # committee_reporter.py's run_committee, found by /code-review.
-        resolved_price = _resolve_fill_price(trade, placed_order)
-        if resolved_price is not None:
-            placed_order["fill_price"] = resolved_price
-        note, traded = _handle_filled_order(trade, placed_order, trend_allowed)
-        report_text = report_text + note
+    # Every successful placement in the trace is run through the guardrail
+    # chain below, not just the first -- see committee_reporter.py's
+    # identical run_committee logic for the full rationale. Each order runs
+    # through _handle_filled_order (not inlined here) so every guardrail it
+    # encapsulates -- including the max-stop and always-journal fixes --
+    # applies uniformly whether one order fired or several.
+    placed_orders = _extract_placed_orders(run_id) if trade else []
+    traded = False
+    if placed_orders:
+        for placed_order in placed_orders:
+            # Resolve the real fill price ONCE here and patch it into
+            # placed_order, so every downstream consumer (_post_trade_spread_
+            # check, _post_trade_reward_risk_check, _journal_record_open) can
+            # just read placed_order["fill_price"] directly instead of each
+            # independently calling _resolve_fill_price (and its own
+            # get_positions broker round-trip) -- mirrors the identical fix in
+            # committee_reporter.py's run_committee, found by /code-review.
+            resolved_price = _resolve_fill_price(trade, placed_order)
+            if resolved_price is not None:
+                placed_order["fill_price"] = resolved_price
+            note, order_traded = _handle_filled_order(trade, placed_order, trend_allowed)
+            report_text = report_text + note
+            traded = traded or order_traded
     elif trade:
         blocked_note = _blocked_order_note(run_id)
         if blocked_note:

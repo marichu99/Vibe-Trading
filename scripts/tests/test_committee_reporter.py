@@ -598,6 +598,43 @@ class TestExtractPlacedOrder:
         assert cr._extract_placed_order("run-1") is None
 
 
+class TestExtractPlacedOrders:
+    def test_returns_every_ok_result_not_just_the_first(self, monkeypatch) -> None:
+        """Regression: a pass that places two orders (e.g. the LLM misreads an
+        ambiguous first result and "retries" an order that already filled)
+        used to only ever have its FIRST fill checked by the post-trade
+        guardrail chain / journaled -- a second live position could silently
+        escape spec/trend/stop-floor/reward:risk enforcement entirely."""
+        first = {"status": "ok", "ticket": "1", "symbol": "EURUSDm"}
+        second = {"status": "ok", "ticket": "2", "symbol": "EURUSDm"}
+        monkeypatch.setattr(
+            cr, "_trace_entries",
+            lambda run_id: [
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(first)},
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(second)},
+            ],
+        )
+        assert cr._extract_placed_orders("run-1") == [first, second]
+
+    def test_skips_non_ok_results_between_ok_ones(self, monkeypatch) -> None:
+        first = {"status": "ok", "ticket": "1"}
+        rejected = {"status": "blocked", "reason": "denied"}
+        second = {"status": "ok", "ticket": "2"}
+        monkeypatch.setattr(
+            cr, "_trace_entries",
+            lambda run_id: [
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(first)},
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(rejected)},
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(second)},
+            ],
+        )
+        assert cr._extract_placed_orders("run-1") == [first, second]
+
+    def test_empty_when_no_placements(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_trace_entries", lambda run_id: [{"type": "tool_result", "tool": "trading_quote"}])
+        assert cr._extract_placed_orders("run-1") == []
+
+
 class TestBlockedOrderNote:
     def test_surfaces_the_real_reason(self, monkeypatch) -> None:
         call_id = "call-1"
