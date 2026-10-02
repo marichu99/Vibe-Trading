@@ -37,6 +37,19 @@ class TestIsNewsBlackoutFailsClosed:
         assert blackout is True
         assert why is not None
 
+    def test_live_fetch_failure_with_no_cache_fails_closed(self, monkeypatch) -> None:
+        # A configured key whose live fetch is actually failing (outage,
+        # rate limit, timeout) with nothing cached is the same "we don't
+        # know" case as no key at all -- code review 2026-10-02 caught this
+        # still failing open (fetch_calendar swallowed the exception and
+        # returned []), which would have silently defeated the fix above.
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "fetch_calendar",
+                             lambda **kw: (_ for _ in ()).throw(fn_news.CalendarUnavailable("Finnhub down")))
+        blackout, why = fn_news.is_news_blackout({"EUR", "USD"})
+        assert blackout is True
+        assert "Finnhub down" in why and "failing closed" in why
+
 
 class TestIsNewsBlackoutWithEvents:
     def _patch(self, monkeypatch, events: list[dict]) -> None:
@@ -116,3 +129,27 @@ class TestFetchCalendarCaching:
         monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
         monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
         assert fn_news.fetch_calendar() == []
+
+    def _patch_throttled_get_json(self, monkeypatch, fn) -> None:
+        import sys
+        sys.path.insert(0, str(fn_news.AGENT_DIR))
+        import backtest.loaders._http as http_mod
+        monkeypatch.setattr(http_mod, "throttled_get_json", fn)
+
+    def test_live_fetch_failure_raises_when_no_cache(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
+        self._patch_throttled_get_json(monkeypatch, lambda **kw: (_ for _ in ()).throw(RuntimeError("timeout")))
+
+        with pytest.raises(fn_news.CalendarUnavailable):
+            fn_news.fetch_calendar()
+
+    def test_live_fetch_failure_falls_back_to_stale_cache(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
+        fn_news._write_cache({"fetched_date": "2020-01-01",  # deliberately stale
+                               "events": [{"time": "x", "currency": "USD", "impact": "high", "event": "stale"}]})
+        self._patch_throttled_get_json(monkeypatch, lambda **kw: (_ for _ in ()).throw(RuntimeError("timeout")))
+
+        result = fn_news.fetch_calendar()
+        assert result == [{"time": "x", "currency": "USD", "impact": "high", "event": "stale"}]

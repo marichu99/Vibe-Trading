@@ -303,7 +303,12 @@ SIGNAL_ACTIVITY_MAX_LINES = 5
 # subprocess). Deliberately terse (one line, not full reasoning replay/an
 # extra LLM call) — the whole point was minimum added token cost, not a
 # richer feedback mechanism.
-TRADE_JOURNAL_PATH = REPO_ROOT / "logs" / "trade_journal.json"
+# Aliased from strategy_tracking's own copy (not redefined independently)
+# so there is one source of truth for this path -- pooled_scale_status reads
+# strategy_tracking.EXNESS_JOURNAL_PATH directly, and a path that drifted
+# between the two copies would silently halve that function's sample
+# (code review 2026-10-02).
+TRADE_JOURNAL_PATH = strategy_tracking.EXNESS_JOURNAL_PATH
 JOURNAL_SUMMARY_WINDOW = 8
 
 # Grace period before a journal entry not found in get_positions() is
@@ -1028,8 +1033,15 @@ def _read_journal() -> list[dict]:
 
 
 def _write_journal(entries: list[dict]) -> None:
+    # Atomic write (temp file + os.replace, same pattern as strategy_tracking.
+    # _write_decisions) -- a plain write_text left a window where a concurrent
+    # reader (pooled_scale_status, exit_replay, the weekly report) could see a
+    # half-written file and silently treat the JSONDecodeError as "0 trades"
+    # for this bot instead of a real parse failure (code review 2026-10-02).
     TRADE_JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    TRADE_JOURNAL_PATH.write_text(json.dumps(entries, indent=2, default=str), encoding="utf-8")
+    tmp = TRADE_JOURNAL_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(entries, indent=2, default=str), encoding="utf-8")
+    tmp.replace(TRADE_JOURNAL_PATH)
 
 
 def _extract_placed_orders(run_id: str) -> list[dict]:

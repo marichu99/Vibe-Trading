@@ -82,14 +82,27 @@ def _write_cache(data: dict) -> None:
     CACHE_PATH.write_text(json.dumps(data, default=str), encoding="utf-8")
 
 
+class CalendarUnavailable(Exception):
+    """Raised by fetch_calendar when a live fetch fails and there is no
+    cached data to fall back on -- the "we genuinely have no idea" case
+    is_news_blackout fails CLOSED on, as opposed to a graceful degrade to
+    slightly-stale cached events (still real data, not a blind guess)."""
+
+
 def fetch_calendar(*, force: bool = False) -> list[dict]:
     """Return today's cached (or freshly fetched) high-impact economic events.
 
     Refetches at most once per UTC calendar day (not once per pass — a
     committee pass runs every couple of hours, an economic calendar doesn't
     change that often). Each event: {"time": iso str, "currency": str,
-    "impact": str, "event": str}. Returns [] (fails open — see
-    is_news_blackout) on a missing API key or any fetch/parse error.
+    "impact": str, "event": str}.
+
+    Returns [] on a missing API key (available() already told the caller
+    that). On a fetch/parse error: returns the last cached events if any
+    exist (stale-but-real data, a reasonable degrade), or raises
+    CalendarUnavailable if there is nothing cached at all -- see that
+    class's docstring and is_news_blackout for why those two cases are
+    treated differently.
     """
     api_key = _api_key()
     if not api_key:
@@ -113,11 +126,13 @@ def fetch_calendar(*, force: bool = False) -> list[dict]:
             params={"from": start, "to": end, "token": api_key},
             timeout=_FINNHUB_TIMEOUT_S,
         )
-    except Exception:
-        # Fails open on the CALLER's side (is_news_blackout treats [] as "no
-        # known blackout"), not here -- a transient fetch failure must never
-        # itself become a reason to skip trading.
-        return cache.get("events") or []
+    except Exception as exc:
+        cached = cache.get("events")
+        if cached is not None:
+            # Stale but real -- today's high-impact calendar rarely changes
+            # hour to hour, so yesterday's fetch is still a reasonable signal.
+            return cached
+        raise CalendarUnavailable(f"Finnhub fetch failed and no cached events exist: {exc}") from exc
 
     raw_events = payload.get("economicCalendar") if isinstance(payload, dict) else None
     events = _normalize_events(raw_events if isinstance(raw_events, list) else [])
@@ -166,7 +181,14 @@ def is_news_blackout(currencies: set[str], now: datetime | None = None, window_m
         return True, "news calendar unavailable (no FINNHUB_API_KEY) — failing closed (rulebook v4)"
 
     now = now or datetime.now(timezone.utc)
-    events = fetch_calendar()
+    try:
+        events = fetch_calendar()
+    except CalendarUnavailable as exc:
+        # A configured key whose live fetch is actually failing (outage,
+        # rate limit, timeout) with nothing cached to fall back on is the
+        # same "we have no way to know" case as no key at all -- fails
+        # closed the same way, not open.
+        return True, f"{exc} — failing closed (rulebook v4)"
     window = timedelta(minutes=window_minutes)
     for event in events:
         if event["currency"] not in currencies:
