@@ -619,6 +619,20 @@ class TestPostTradeRewardRiskCheck:
         assert fr._post_trade_reward_risk_check(self.TRADE, {"side": "buy", "fill_price": 1.1}) == ""
         assert calls == {}
 
+    def test_widens_target_instead_of_tightening_when_floor_unreadable(self, monkeypatch) -> None:
+        """Real bug (mirrored from the identical fix in committee_reporter.py):
+        _atr_stop_floor/_spread_stop_floor both fail open to None on a
+        transient bars/quote read error, which used to make floor_distance
+        0.0 and let the stop get tightened with NO floor check at all --
+        the opposite of what the docstring promises. Must fall back to
+        widening the target instead, which never needs the floor."""
+        calls = self._patch(monkeypatch, atr_floor=None, spread_floor=None)
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
+        note = fr._post_trade_reward_risk_check(self.TRADE, order)
+        assert "CORRECTED" in note and "widened take-profit" in note
+        assert calls["stop_loss"] == 1.0990  # stop left untouched -- no floor to safely tighten against
+        assert calls["take_profit"] == pytest.approx(1.10175)  # (0.0010 + s) * 1.5 + s, s = 0.0001
+
     def test_zero_fill_price_falls_back_to_live_position(self, monkeypatch) -> None:
         """Real incident 2026-09-17: trading_place_order's own response had
         fill_price=0.0 (MT5 order_send()/deal-fill propagation gap), which
