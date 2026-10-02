@@ -1386,7 +1386,22 @@ def _live_circuit_breaker_check(trade: dict) -> str | None:
     if baseline_equity <= 0:
         return None
     drawdown = (baseline_equity - equity) / baseline_equity
-    if DAILY_LOSS_STOP_PCT <= drawdown < LIVE_DRAWDOWN_HALT_PCT:
+
+    # DAILY_LOSS_STOP_PCT's own comment promises "research-only for the rest
+    # of the day" once tripped -- but this used to just re-compare the
+    # INSTANTANEOUS drawdown on every call, with nothing persisted. Real
+    # scenario: equity dips past the 2% stop on one check (research-only),
+    # then recovers above it by a later same-day check (a second scheduled
+    # pass, a manual re-run, or --loop with a short --interval) -- live
+    # trading would silently resume, contradicting the rulebook. Persisted
+    # on the baseline dict so it naturally resets with tomorrow's fresh
+    # baseline, same lifecycle as baseline_equity itself.
+    daily_loss_stop_tripped = bool(baseline.get("daily_loss_stop_tripped"))
+    if not daily_loss_stop_tripped and DAILY_LOSS_STOP_PCT <= drawdown < LIVE_DRAWDOWN_HALT_PCT:
+        baseline["daily_loss_stop_tripped"] = True
+        _write_live_baseline(baseline)
+        daily_loss_stop_tripped = True
+    if daily_loss_stop_tripped and drawdown < LIVE_DRAWDOWN_HALT_PCT:
         return (
             f"[DAILY LOSS STOP] equity ${equity:.2f} is {drawdown:.1%} below today's baseline "
             f"${baseline_equity:.2f} (limit {DAILY_LOSS_STOP_PCT:.0%}) -- no new trades today (rulebook)."
@@ -2792,8 +2807,14 @@ def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
 
     floor_distance = max(_atr_stop_floor(symbol, connection) or 0.0, _spread_stop_floor(quote) or 0.0)
 
+    # floor_distance == 0.0 means the floor couldn't be read (both helpers
+    # fail open to None on a transient bars/quote error), not "no floor" --
+    # tightening unchecked in that case could land inside live spread (the
+    # exact failure _post_trade_stop_floor_check guards against with its own
+    # `if floor_distance <= 0: return "", False`). Falling to the
+    # widen-take-profit branch is always safe regardless of floor knowledge.
     desired_risk_distance = (reward_distance - spread) / MIN_REWARD_RISK_RATIO - spread
-    if desired_risk_distance >= floor_distance:
+    if floor_distance > 0 and desired_risk_distance >= floor_distance:
         new_sl = entry - desired_risk_distance if is_buy else entry + desired_risk_distance
         new_tp = tp
         action = f"tightened stop-loss to {new_sl:.5f}"
