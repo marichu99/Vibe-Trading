@@ -2049,8 +2049,14 @@ def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
 
     floor_distance = max(_atr_stop_floor(symbol, trade["connection"]) or 0.0, _spread_stop_floor(quote) or 0.0)
 
+    # floor_distance == 0.0 means the floor couldn't be read (both helpers
+    # fail open to None on a transient bars/quote error), not "no floor" --
+    # tightening unchecked in that case could land inside live spread (the
+    # exact failure _post_trade_stop_floor_check guards against with its own
+    # `if floor_distance <= 0: return "", False`). Falling to the
+    # widen-take-profit branch is always safe regardless of floor knowledge.
     desired_risk_distance = (reward_distance - spread) / MIN_REWARD_RISK_RATIO - spread
-    if desired_risk_distance >= floor_distance:
+    if floor_distance > 0 and desired_risk_distance >= floor_distance:
         new_sl = entry - desired_risk_distance if is_buy else entry + desired_risk_distance
         new_tp = tp
         action = f"tightened stop-loss to {new_sl:.5f}"

@@ -1556,6 +1556,33 @@ class TestLiveCircuitBreakerCheck:
         assert calls["trip"] == []
         assert calls["close"] == []
 
+    def test_daily_loss_stop_persists_after_equity_recovers_same_day(self, monkeypatch, tmp_path) -> None:
+        """Real bug: the daily loss stop's own comment promises "research-only
+        for the rest of the day," but the check used to just re-compare the
+        INSTANTANEOUS drawdown every call with nothing persisted -- so a
+        later same-day check (a second scheduled pass, a manual re-run) that
+        catches equity having recovered above the 2% threshold would
+        silently let live trading resume the same day."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
+        calls = self._patch_broker(
+            monkeypatch, tmp_path, targets=targets, positions=[],
+            equity=90.0, baseline={"date": today, "equity": 100.0},  # 10%: trips the daily stop
+        )
+        first = cr._live_circuit_breaker_check(targets[0]["trade"])
+        assert first is not None and "[DAILY LOSS STOP]" in first
+
+        # Equity recovers above the 2% threshold on a later same-day check --
+        # must STILL be research-only, not silently resume live trading.
+        import src.trading.service as service
+        monkeypatch.setattr(service, "get_account", lambda conn: {"account": {"equity": 99.0}})
+        second = cr._live_circuit_breaker_check(targets[0]["trade"])
+
+        assert second is not None and "[DAILY LOSS STOP]" in second
+        assert calls["trip"] == []  # still just the soft stop, not the persistent kill switch
+        saved = json.loads((tmp_path / "live_baseline.json").read_text(encoding="utf-8"))
+        assert saved["daily_loss_stop_tripped"] is True
+
     def test_already_halted_returns_message_without_re_tripping(self, monkeypatch, tmp_path) -> None:
         targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
         calls = self._patch_broker(monkeypatch, tmp_path, targets=targets, positions=[], equity=100.0, halted=True)
@@ -1881,6 +1908,24 @@ class TestPostTradeRewardRiskCheck:
         calls = self._patch(monkeypatch)
         assert cr._post_trade_reward_risk_check(self.TRADE, {"side": "buy", "fill_price": 1.1}) == ""
         assert calls == {}
+
+    def test_widens_target_instead_of_tightening_when_floor_unreadable(self, monkeypatch) -> None:
+        """Real bug: _atr_stop_floor/_spread_stop_floor both fail open to
+        None (e.g. a transient bars/quote read error right after the fill --
+        the rest of this file treats that as routine), which used to make
+        floor_distance 0.0 and let the stop get tightened with NO floor
+        check at all -- the opposite of what the docstring promises ("never
+        past the ATR/spread volatility floor"), and inconsistent with
+        _post_trade_stop_floor_check's own `if floor_distance <= 0` guard
+        for the identical case. Must fall back to widening the target
+        instead, which never needs the floor."""
+        calls = self._patch(monkeypatch, atr_floor=None, spread_floor=None)
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
+        note = cr._post_trade_reward_risk_check(self.TRADE, order)
+        assert "CORRECTED" in note and "widened take-profit" in note
+        assert calls["stop_loss"] == 1.0990  # stop left untouched -- no floor to safely tighten against
+        assert calls["take_profit"] == pytest.approx(1.10175)  # (0.0010 + s) * 1.5 + s, s = 0.0001
+        assert order["stop_loss"] == 1.0990
 
 
 class TestHandleFilledOrder:
