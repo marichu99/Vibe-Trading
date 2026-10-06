@@ -742,6 +742,72 @@ class TestHandleFilledOrder:
         assert fn_state.trading_days_count() == 1
 
 
+class TestJournalAnyPlacedOrders:
+    """Real incident 2026-10-05 (FundedNext GBPUSD empty_model_response),
+    found by the daily-repair agent's 2026-10-06 review -- see
+    committee_reporter.py's identical test class for the full rationale."""
+
+    TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
+
+    def test_empty_when_run_id_is_none(self, monkeypatch) -> None:
+        called = []
+        monkeypatch.setattr(fr, "_extract_placed_orders", lambda run_id: called.append(run_id) or [])
+        notes, traded, any_placed = fr._journal_any_placed_orders(self.TRADE, None, None)
+        assert (notes, traded, any_placed) == ("", False, False)
+        assert called == []
+
+    def test_empty_when_trade_is_none(self, monkeypatch) -> None:
+        called = []
+        monkeypatch.setattr(fr, "_extract_placed_orders", lambda run_id: called.append(run_id) or [])
+        notes, traded, any_placed = fr._journal_any_placed_orders(None, "run-1", None)
+        assert (notes, traded, any_placed) == ("", False, False)
+        assert called == []
+
+    def test_journals_an_order_placed_before_a_later_failure(self, monkeypatch) -> None:
+        order = {"status": "ok", "ticket": "1", "symbol": "EURUSD"}
+        monkeypatch.setattr(fr, "_extract_placed_orders", lambda run_id: [order])
+        monkeypatch.setattr(fr, "_resolve_fill_price", lambda trade, o: 1.1234)
+        monkeypatch.setattr(fr, "_handle_filled_order", lambda trade, o, trend: ("\n\n[JOURNALED]", True))
+
+        notes, traded, any_placed = fr._journal_any_placed_orders(self.TRADE, "run-1", None)
+
+        assert any_placed is True
+        assert traded is True
+        assert "[JOURNALED]" in notes
+        assert order["fill_price"] == 1.1234
+
+    def test_any_placed_true_even_when_every_order_gets_closed(self, monkeypatch) -> None:
+        order = {"status": "ok", "ticket": "1", "symbol": "EURUSDx"}
+        monkeypatch.setattr(fr, "_extract_placed_orders", lambda run_id: [order])
+        monkeypatch.setattr(fr, "_resolve_fill_price", lambda trade, o: None)
+        monkeypatch.setattr(fr, "_handle_filled_order", lambda trade, o, trend: ("\n\n[SPEC VIOLATION]", False))
+
+        notes, traded, any_placed = fr._journal_any_placed_orders(self.TRADE, "run-1", None)
+
+        assert any_placed is True
+        assert traded is False
+        assert "[SPEC VIOLATION]" in notes
+
+    def test_multiple_orders_all_run_and_aggregated(self, monkeypatch) -> None:
+        first = {"status": "ok", "ticket": "1", "symbol": "EURUSD"}
+        second = {"status": "ok", "ticket": "2", "symbol": "EURUSD"}
+        monkeypatch.setattr(fr, "_extract_placed_orders", lambda run_id: [first, second])
+        monkeypatch.setattr(fr, "_resolve_fill_price", lambda trade, o: None)
+        calls = []
+
+        def _fake_handle(trade, o, trend):
+            calls.append(o["ticket"])
+            return f"\n\n[{o['ticket']}]", o["ticket"] == "2"
+
+        monkeypatch.setattr(fr, "_handle_filled_order", _fake_handle)
+        notes, traded, any_placed = fr._journal_any_placed_orders(self.TRADE, "run-1", None)
+
+        assert calls == ["1", "2"]
+        assert any_placed is True
+        assert traded is True
+        assert "[1]" in notes and "[2]" in notes
+
+
 class TestResolveFillPrice:
     TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.01}
 

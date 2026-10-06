@@ -1985,6 +1985,88 @@ class TestHandleFilledOrder:
         assert order["trend_alignment"] == "with"
 
 
+class TestJournalAnyPlacedOrders:
+    """Real incident 2026-10-05 (FundedNext GBPUSD empty_model_response),
+    found by the daily-repair agent's 2026-10-06 review: a run that places
+    an order and THEN fails on a later step used to skip every guardrail and
+    the journal entirely, because run_committee's non-success/empty-answer
+    branches returned before ever looking at the trace. This incident itself
+    happened not to have placed an order, but the gap was real and live --
+    _journal_any_placed_orders is now shared by every return point."""
+
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def test_empty_when_run_id_is_none(self, monkeypatch) -> None:
+        # The "could not parse CLI output" branch has no run_id at all --
+        # genuinely nothing to recover there.
+        called = []
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: called.append(run_id) or [])
+        notes, traded, any_placed = cr._journal_any_placed_orders(self.TRADE, None, None)
+        assert (notes, traded, any_placed) == ("", False, False)
+        assert called == []  # never even looked -- there's no run_id to look with
+
+    def test_empty_when_trade_is_none(self, monkeypatch) -> None:
+        # A research-only pass (trade=None) has nothing to journal against.
+        called = []
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: called.append(run_id) or [])
+        notes, traded, any_placed = cr._journal_any_placed_orders(None, "run-1", None)
+        assert (notes, traded, any_placed) == ("", False, False)
+        assert called == []
+
+    def test_journals_an_order_placed_before_a_later_failure(self, monkeypatch) -> None:
+        """The actual regression: a run that places an order and then fails
+        (empty_model_response, max-iterations, ...) must still run that
+        order through the guardrail chain and journal it -- any_placed=True
+        is what lets run_committee's error branches append the
+        [POST-FAILURE GUARDRAIL CHECK] note instead of silently dropping it."""
+        order = {"status": "ok", "ticket": "1", "symbol": "EURUSDm"}
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: [order])
+        monkeypatch.setattr(cr, "_resolve_fill_price", lambda trade, o: 1.1234)
+        monkeypatch.setattr(cr, "_handle_filled_order", lambda trade, o, trend: ("\n\n[JOURNALED]", True))
+
+        notes, traded, any_placed = cr._journal_any_placed_orders(self.TRADE, "run-1", None)
+
+        assert any_placed is True
+        assert traded is True
+        assert "[JOURNALED]" in notes
+        assert order["fill_price"] == 1.1234  # patched in before _handle_filled_order ran
+
+    def test_any_placed_true_even_when_every_order_gets_closed(self, monkeypatch) -> None:
+        # A placed order that a guardrail immediately closes still counts as
+        # "placed" for the caller's post-failure note, even though traded
+        # ends up False -- the point is that it was journaled, not that it
+        # survived.
+        order = {"status": "ok", "ticket": "1", "symbol": "EURUSDcm"}
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: [order])
+        monkeypatch.setattr(cr, "_resolve_fill_price", lambda trade, o: None)
+        monkeypatch.setattr(cr, "_handle_filled_order", lambda trade, o, trend: ("\n\n[SPEC VIOLATION]", False))
+
+        notes, traded, any_placed = cr._journal_any_placed_orders(self.TRADE, "run-1", None)
+
+        assert any_placed is True
+        assert traded is False
+        assert "[SPEC VIOLATION]" in notes
+
+    def test_multiple_orders_all_run_and_aggregated(self, monkeypatch) -> None:
+        first = {"status": "ok", "ticket": "1", "symbol": "EURUSDm"}
+        second = {"status": "ok", "ticket": "2", "symbol": "EURUSDm"}
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: [first, second])
+        monkeypatch.setattr(cr, "_resolve_fill_price", lambda trade, o: None)
+        calls = []
+
+        def _fake_handle(trade, o, trend):
+            calls.append(o["ticket"])
+            return f"\n\n[{o['ticket']}]", o["ticket"] == "2"
+
+        monkeypatch.setattr(cr, "_handle_filled_order", _fake_handle)
+        notes, traded, any_placed = cr._journal_any_placed_orders(self.TRADE, "run-1", None)
+
+        assert calls == ["1", "2"]  # both orders run, not just the first
+        assert any_placed is True
+        assert traded is True  # True if ANY order ended up traded
+        assert "[1]" in notes and "[2]" in notes
+
+
 class TestLlmBalanceAlert:
     def _patch(self, monkeypatch, tmp_path, *, provider: str, balance):
         monkeypatch.setenv("LANGCHAIN_PROVIDER", provider)

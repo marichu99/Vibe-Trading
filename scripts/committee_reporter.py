@@ -2327,14 +2327,33 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     status = payload.get("status", "unknown")
     run_id = payload.get("run_id")
     if status != "success":
-        return CommitteeResult(
-            committee, target, market, "error", run_id, "",
-            error=payload.get("reason") or f"run status was '{status}'",
-        )
+        # A run that places an order and THEN fails on a later step (an
+        # empty model response, max-iterations, an unparseable final
+        # answer) must not let that fill skip every guardrail and the
+        # journal just because the run itself didn't end cleanly -- real
+        # incident 2026-10-05 (FundedNext GBPUSD empty_model_response)
+        # happened not to have placed anything, but confirmed the gap was
+        # live; found and fixed per the daily-repair agent's 2026-10-06
+        # review of that incident.
+        notes, traded, any_placed = _journal_any_placed_orders(trade, run_id, trend_allowed)
+        error_text = payload.get("reason") or f"run status was '{status}'"
+        if any_placed:
+            error_text += (
+                f"\n\n[POST-FAILURE GUARDRAIL CHECK] this run ended '{status}' but had already placed a "
+                f"live order -- it was still run through the full guardrail chain and journaled:{notes}"
+            )
+        return CommitteeResult(committee, target, market, "error", run_id, "", error=error_text, traded=traded)
 
     report_text = _read_final_answer(run_id) if run_id else ""
     if not report_text:
-        return CommitteeResult(committee, target, market, "error", run_id, "", error="run succeeded but produced no final answer")
+        notes, traded, any_placed = _journal_any_placed_orders(trade, run_id, trend_allowed)
+        error_text = "run succeeded but produced no final answer"
+        if any_placed:
+            error_text += (
+                f"\n\n[POST-FAILURE GUARDRAIL CHECK] this run had already placed a live order -- it was "
+                f"still run through the full guardrail chain and journaled:{notes}"
+            )
+        return CommitteeResult(committee, target, market, "error", run_id, "", error=error_text, traded=traded)
 
     # A trading_place_order CALL happening is not the same as an order being
     # PLACED — a call the mandate gate blocks (wrong size, breach, halted,
@@ -2345,33 +2364,9 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     # already verifies status=="ok" against the connector's own response, so
     # basing `traded` on it directly is both the fix and the single source of
     # truth for what actually reached the broker.
-    # Every successful placement in the trace is run through the guardrail
-    # chain below, not just the first -- a pass that places more than one
-    # order (e.g. the LLM misreads an ambiguous result and "retries" a fill
-    # that had already gone through) must not let a second live position
-    # escape spec/trend/stop-floor/reward:risk enforcement and journaling
-    # just because an earlier one already satisfied `traded`. Each order is
-    # run through _handle_filled_order (not inlined here) so every guardrail
-    # it encapsulates -- including the max-stop and always-journal fixes --
-    # applies uniformly whether one order fired or several.
-    placed_orders = _extract_placed_orders(run_id) if trade else []
-    traded = False
-    if placed_orders:
-        for placed_order in placed_orders:
-            # Resolve the real fill price ONCE here and patch it into
-            # placed_order, so every downstream consumer (_post_trade_spread_
-            # check, _post_trade_reward_risk_check, _journal_record_open) can
-            # just read placed_order["fill_price"] directly instead of each
-            # independently calling _resolve_fill_price (and its own
-            # get_positions broker round-trip) -- real inefficiency found by
-            # /code-review: up to 3 redundant broker calls per trade.
-            resolved_price = _resolve_fill_price(trade, placed_order)
-            if resolved_price is not None:
-                placed_order["fill_price"] = resolved_price
-            note, order_traded = _handle_filled_order(trade, placed_order, trend_allowed)
-            report_text = report_text + note
-            traded = traded or order_traded
-    elif trade:
+    notes, traded, any_placed = _journal_any_placed_orders(trade, run_id, trend_allowed)
+    report_text = report_text + notes
+    if not any_placed and trade:
         blocked_note = _blocked_order_note(run_id)
         if blocked_note:
             report_text = report_text + blocked_note
@@ -2924,6 +2919,49 @@ def _handle_filled_order(trade: dict, placed_order: dict, trend_allowed: set[str
         traded = True
     _journal_record_open(placed_order.get("symbol") or trade["symbol"], trade["connection"], placed_order)
     return note, traded
+
+
+def _journal_any_placed_orders(
+    trade: dict | None, run_id: str | None, trend_allowed: set[str] | None
+) -> tuple[str, bool, bool]:
+    """Run every verified placed order in this run's trace (if any) through
+    the full post-fill guardrail chain and journal it. Returns (report notes,
+    traded, any orders were placed at all).
+
+    Shared by every return point in run_committee -- success, a non-success
+    status, and an empty final answer -- not just the success path. A run
+    that places an order and THEN fails on a later step (an empty model
+    response, max-iterations, an unparseable final answer) must not let that
+    fill skip every guardrail and the journal just because the run itself
+    didn't end cleanly. Real incident 2026-10-05 (FundedNext GBPUSD
+    empty_model_response) happened not to have placed anything, but
+    confirmed this gap was live; the daily-repair agent's 2026-10-06 review
+    of that incident is what found it.
+
+    `run_id` being None (the CLI's own JSON output failed to parse, so there
+    is no run directory to inspect) returns (empty, False, False) -- there is
+    genuinely nothing to recover there.
+    """
+    if not trade or not run_id:
+        return "", False, False
+    notes = ""
+    traded = False
+    placed_orders = _extract_placed_orders(run_id)
+    for placed_order in placed_orders:
+        # Resolve the real fill price ONCE here and patch it into
+        # placed_order, so every downstream consumer (_post_trade_spread_
+        # check, _post_trade_reward_risk_check, _journal_record_open) can
+        # just read placed_order["fill_price"] directly instead of each
+        # independently calling _resolve_fill_price (and its own
+        # get_positions broker round-trip) -- real inefficiency found by
+        # /code-review: up to 3 redundant broker calls per trade.
+        resolved_price = _resolve_fill_price(trade, placed_order)
+        if resolved_price is not None:
+            placed_order["fill_price"] = resolved_price
+        note, order_traded = _handle_filled_order(trade, placed_order, trend_allowed)
+        notes += note
+        traded = traded or order_traded
+    return notes, traded, bool(placed_orders)
 
 
 def _last_json_line(stdout: str | None) -> dict | None:
