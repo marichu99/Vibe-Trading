@@ -267,12 +267,9 @@ def build_data_pack(symbol: str, connection: str, *, now: datetime | None = None
         sys.path.insert(0, str(REPO_ROOT / "scripts"))
         import fundednext_news_calendar as fn_news
 
-        if not fn_news.available():
-            lines.append("- calendar source not configured — check any scheduled events yourself")
-        else:
-            events = [e for e in fn_news.fetch_calendar() if e.get("currency") in (base, quote_ccy)]
-            lines += [f"- {e['time']} {e['currency']}: {e['event']}" for e in events] or \
-                     ["- none scheduled for these currencies today"]
+        events = [e for e in fn_news.fetch_calendar() if e.get("currency") in (base, quote_ccy)]
+        lines += [f"- {e['time']} {e['currency']}: {e['event']}" for e in events] or \
+                 ["- none scheduled for these currencies today"]
     except Exception as exc:
         lines.append(f"- calendar unavailable ({exc})")
     lines.append("")

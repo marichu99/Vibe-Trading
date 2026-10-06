@@ -3,10 +3,19 @@
 No economic-calendar/scheduled-news-event tool exists anywhere else in this
 repo (agent/src/tools/fred_macro_tool.py is backward-looking macro SERIES
 data — CPI, unemployment, etc. — not a forward-looking calendar of exact
-release timestamps). This module is a small, standalone integration:
-Finnhub's free-tier economic calendar endpoint, fetched/cached once per day
-(not once per pass) and filtered to high-impact events for the currencies
-this account actually trades (EUR/USD/AUD).
+release timestamps). This module fetches/caches once per day (not once per
+pass) and filters to high-impact events for the currencies this account
+actually trades (EUR/USD/AUD), from two sources tried in order:
+
+1. Finnhub's economic calendar endpoint (needs FINNHUB_API_KEY). As of
+   2026-10-06 this endpoint returns 403 "You don't have access to this
+   resource" even with a freshly-rotated, otherwise-valid key — Finnhub has
+   moved /calendar/economic behind a paid plan. Key rotation (D8) does NOT
+   fix this; it is left in place only in case the account is ever upgraded.
+2. ForexFactory's unofficial public JSON feed
+   (https://nfs.faireconomy.media/ff_calendar_thisweek.json) — no key, no
+   cost, used by the retail algo-trading community for exactly this. This
+   is now the PRIMARY source in practice, not just a backstop.
 
 IMPORTANT — this is a RISK-AVOIDANCE measure, not a FundedNext compliance
 requirement. FundedNext's own "News Reward Share Rule" (a 5-minute-before/
@@ -21,9 +30,10 @@ floor check already guards against an inadequately-wide stop, but not
 against a SCHEDULED event about to spike volatility regardless of how wide
 the stop is.
 
-Needs FINNHUB_API_KEY set in the environment (a free Finnhub account key,
-sign up at finnhub.io) — this is a user action, not something committed to
-the repo. Modeled on fred_macro_tool.py's env-var-key convention (check
+FINNHUB_API_KEY, if set in the environment, is a free Finnhub account key
+(sign up at finnhub.io) — this is a user action, not something committed to
+the repo; it is optional now that ForexFactory needs no key at all. Modeled
+on fred_macro_tool.py's env-var-key convention (check
 availability, fail with a clear reason if absent) but reads the environment
 directly via os.environ rather than going through
 src.config.accessor.get_env_config()/EnvConfig: that schema is shared,
@@ -60,6 +70,15 @@ _CALENDAR_URL = "https://finnhub.io/api/v1/calendar/economic"
 # blackout check near a UTC day boundary still sees events on the adjacent
 # calendar day, cheap enough for a once-a-day fetch.
 _FETCH_WINDOW_DAYS = 2
+
+_FOREXFACTORY_HOST_KEY = "forexfactory"
+_FOREXFACTORY_MIN_INTERVAL_ENV = "VIBE_TRADING_FOREXFACTORY_MIN_INTERVAL"
+_FOREXFACTORY_DEFAULT_MIN_INTERVAL = 1.0
+_FOREXFACTORY_TIMEOUT_S = 15.0
+# Unofficial, no-auth, read-only public feed; no token to redact and no
+# published SLA, hence the stale-cache/CalendarUnavailable fallbacks below
+# still apply to it exactly as they do to Finnhub.
+_FOREXFACTORY_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 
 def _api_key() -> str | None:
@@ -113,9 +132,11 @@ def mask_secrets() -> logging.Filter:
 
 
 def available() -> bool:
-    """True when FINNHUB_API_KEY is configured. When this is False,
-    is_news_blackout fails CLOSED (changed 2026-10-01, rulebook v4) -- see
-    its own docstring for why."""
+    """True when FINNHUB_API_KEY is configured. No longer the sole gate on
+    is_news_blackout's fail-closed decision (changed 2026-10-06 when the
+    ForexFactory no-key fallback was added) -- it only controls whether
+    _fetch_live_events_any_source bothers trying Finnhub at all. See
+    is_news_blackout's own docstring for the current fail-closed condition."""
     return bool(_api_key())
 
 
@@ -124,7 +145,10 @@ def news_api_status() -> str:
     prompt's NEWS_API_STATUS field (D6, v5.1, 2026-10-06). Derived from the
     existing cache file with no extra network call (call this AFTER
     is_news_blackout has already run for this pass, so the cache reflects
-    whatever that call just did).
+    whatever that call just did). Purely cache-state-driven since 2026-10-06
+    -- it no longer depends on available() (a missing Finnhub key), because
+    a cache entry can now come from the ForexFactory fallback just as
+    validly as from Finnhub.
 
     "STALE" is the state D1's fail-closed fix does NOT catch: a live fetch
     that fails but falls back to a cached (possibly day-old) calendar still
@@ -134,8 +158,6 @@ def news_api_status() -> str:
     the "NEWS_API_STATUS != OK -> PASS" prompt rule) is the first thing that
     surfaces that risk at all.
     """
-    if not available():
-        return "UNAVAILABLE"
     cache = _read_cache()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if cache.get("fetched_date") == today and isinstance(cache.get("events"), list):
@@ -186,6 +208,55 @@ def _fetch_live_events(api_key: str) -> list[dict]:
     return _normalize_events(raw_events if isinstance(raw_events, list) else [])
 
 
+def _fetch_forexfactory_events() -> list[dict]:
+    """ForexFactory's unofficial public JSON calendar -- no key needed. Same
+    no-caching, raise-on-failure contract as _fetch_live_events. Covers only
+    "this week" (the feed's own window), narrower than Finnhub's
+    +/-_FETCH_WINDOW_DAYS, which is fine here: fetch_calendar refetches
+    daily and a blackout check only ever looks a few minutes either side of
+    `now`. Field names differ from Finnhub's ("country"/"title" instead of
+    "currency"/"event", capitalized "impact") -- _normalize_events accepts
+    both.
+    """
+    sys.path.insert(0, str(AGENT_DIR))
+    from backtest.loaders._http import resolve_min_interval, throttled_get_json
+
+    payload = throttled_get_json(
+        _FOREXFACTORY_URL,
+        host_key=_FOREXFACTORY_HOST_KEY,
+        min_interval=resolve_min_interval(_FOREXFACTORY_MIN_INTERVAL_ENV, _FOREXFACTORY_DEFAULT_MIN_INTERVAL),
+        timeout=_FOREXFACTORY_TIMEOUT_S,
+    )
+    return _normalize_events(payload if isinstance(payload, list) else [])
+
+
+def _fetch_live_events_any_source() -> tuple[list[dict], str]:
+    """Try Finnhub first (only when a key is configured), then the
+    ForexFactory fallback (needs no key). Returns (events, source_name)
+    from whichever succeeds first. Raises CalendarUnavailable, carrying
+    both failure reasons, only when neither source works.
+
+    No caching and no stale-data fallback here -- see fetch_calendar (wraps
+    this with caching + a stale-cache degrade) and startup_self_test (wants
+    to know whether the live pipeline works right now, not whether a cache
+    happens to exist from a previous successful day).
+    """
+    errors = []
+    api_key = _api_key()
+    if api_key:
+        try:
+            return _fetch_live_events(api_key), "finnhub"
+        except Exception as exc:
+            errors.append(f"Finnhub: {_redact(str(exc))}")
+    else:
+        errors.append("Finnhub: no FINNHUB_API_KEY configured")
+    try:
+        return _fetch_forexfactory_events(), "forexfactory"
+    except Exception as exc:
+        errors.append(f"ForexFactory: {_redact(str(exc))}")
+    raise CalendarUnavailable("; ".join(errors))
+
+
 def fetch_calendar(*, force: bool = False) -> list[dict]:
     """Return today's cached (or freshly fetched) high-impact economic events.
 
@@ -194,80 +265,75 @@ def fetch_calendar(*, force: bool = False) -> list[dict]:
     change that often). Each event: {"time": iso str, "currency": str,
     "impact": str, "event": str}.
 
-    Returns [] on a missing API key (available() already told the caller
-    that). On a fetch/parse error: returns the last cached events if any
-    exist (stale-but-real data, a reasonable degrade), or raises
-    CalendarUnavailable if there is nothing cached at all -- see that
-    class's docstring and is_news_blackout for why those two cases are
-    treated differently.
+    Tries Finnhub then ForexFactory (see _fetch_live_events_any_source). On
+    a failure of BOTH: returns the last cached events if any exist
+    (stale-but-real data, a reasonable degrade, regardless of which source
+    originally wrote them), or raises CalendarUnavailable if there is
+    nothing cached at all -- see that class's docstring and is_news_blackout
+    for why those two cases are treated differently.
     """
-    api_key = _api_key()
-    if not api_key:
-        return []
-
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cache = _read_cache()
     if not force and cache.get("fetched_date") == today and isinstance(cache.get("events"), list):
         return cache["events"]
 
     try:
-        events = _fetch_live_events(api_key)
-    except Exception as exc:
+        events, source = _fetch_live_events_any_source()
+    except CalendarUnavailable as exc:
         cached = cache.get("events")
         if cached is not None:
             # Stale but real -- today's high-impact calendar rarely changes
             # hour to hour, so yesterday's fetch is still a reasonable signal.
             return cached
-        # _redact strips the token query param BEFORE this string exists
-        # anywhere else -- is_news_blackout's reason flows straight into the
-        # emailed report, and a bare requests exception embeds the full
-        # request URL (token included). See _redact's own docstring for the
-        # real incident this fixes (2026-10-02/10-05, found alongside D1).
-        raise CalendarUnavailable(f"Finnhub fetch failed and no cached events exist: {_redact(str(exc))}") from exc
+        raise CalendarUnavailable(f"no cached events exist ({exc})") from exc
 
-    _write_cache({"fetched_date": today, "events": events})
+    if source == "forexfactory":
+        logger.info("news calendar: Finnhub unavailable, using ForexFactory fallback")
+    _write_cache({"fetched_date": today, "source": source, "events": events})
     return events
 
 
 def startup_self_test(*, alert_fn=None) -> bool:
     """Call once per loop process, before its first pass. Makes one live,
-    uncached Finnhub call and confirms it actually succeeds.
+    uncached attempt via _fetch_live_events_any_source (Finnhub, then the
+    ForexFactory fallback) and confirms at least one of them actually works.
 
-    Real incident: the key started returning 403 Forbidden on 2026-10-02 and
-    nothing caught it -- the fail-closed fix (correctly) blocked trading
-    pass after pass, but silently, for four trading days before anyone
-    noticed. This exists so a dead/misconfigured key is loud at boot instead
-    of quiet forever.
+    Real incident: the Finnhub key started returning 403 Forbidden on
+    2026-10-02 and nothing caught it -- the fail-closed fix (correctly)
+    blocked trading pass after pass, but silently, for four trading days
+    before anyone noticed. This exists so a fully-dead calendar pipeline is
+    loud at boot instead of quiet forever.
 
-    Returns True (nothing to test) when FINNHUB_API_KEY isn't configured at
-    all -- that's a deliberate, already-known "blackout check disabled,
-    fails closed every pass" state (available() is False), not something
-    this self-test is for. Returns False only when a key IS configured but
-    the live call still fails -- logs CRITICAL and, if `alert_fn` is given
-    (the caller's own send_email, passed in rather than imported here to
-    avoid an SMTP-env dependency in this module), sends an alert. The
-    caller decides what to do with a False return (see each reporter's
-    startup: exit(1) rather than proceed to trade on a known-broken check).
+    Returns True whenever EITHER source answers live -- including the
+    now-common case of no Finnhub key/access (2026-10-06: Finnhub's
+    /calendar/economic now requires a paid plan; a key rotation alone does
+    NOT fix that, see D8 follow-up), since ForexFactory alone is enough to
+    run the blackout check. Returns False only when BOTH fail -- logs
+    CRITICAL and, if `alert_fn` is given (the caller's own send_email,
+    passed in rather than imported here to avoid an SMTP-env dependency in
+    this module), sends an alert. The caller decides what to do with a
+    False return (see each reporter's startup: exit(1) rather than proceed
+    to trade on a known-broken check).
     """
-    if not available():
-        return True
     try:
-        _fetch_live_events(_api_key())
+        _, source = _fetch_live_events_any_source()
+        if source == "forexfactory":
+            logger.info("news calendar startup self-test: Finnhub unavailable, using ForexFactory fallback")
         return True
-    except Exception as exc:
-        reason = _redact(str(exc))
+    except CalendarUnavailable as exc:
+        reason = str(exc)
         logger.critical("news calendar startup self-test failed: %s", reason)
         if alert_fn:
             try:
                 alert_fn(
                     "[Vibe-Trading] CRITICAL: news calendar startup self-test failed",
-                    "The Finnhub economic calendar self-test failed at startup:\n\n"
+                    "Both the Finnhub economic calendar and the ForexFactory fallback "
+                    "failed at startup:\n\n"
                     f"{reason}\n\n"
                     "This process is exiting rather than trading with a known-broken news "
-                    "check. A dead/expired/rate-limited key means EVERY pass fails the news "
-                    "blackout closed (no trades at all) until this is fixed -- check your "
-                    "Finnhub account, rotate the key if needed (see D8 rotation steps), and "
-                    "restart the reporter.",
+                    "check. Every pass would fail the news blackout closed (no trades at "
+                    "all) until this is fixed -- check network access to finnhub.io and "
+                    "nfs.faireconomy.media, and restart the reporter.",
                 )
             except Exception:
                 logger.exception("news calendar startup self-test: alert email failed")
@@ -275,22 +341,28 @@ def startup_self_test(*, alert_fn=None) -> bool:
 
 
 def _normalize_events(raw_events: list) -> list[dict]:
+    """Common shape for both sources. Finnhub: "time"/"currency"/"event",
+    impact "high"/"medium"/"low" (or legacy "3"). ForexFactory: "date"/
+    "country"/"title", impact capitalized "High"/"Medium"/"Low"/"Holiday"
+    -- the .lower() below normalizes that, and "holiday" is excluded the
+    same way "medium"/"low" already are (not in the high-impact set).
+    """
     out = []
     for row in raw_events:
         if not isinstance(row, dict):
             continue
         impact = str(row.get("impact") or "").lower()
-        if impact not in ("high", "3"):  # Finnhub uses "high"/"medium"/"low" in practice
+        if impact not in ("high", "3"):
             continue
         time_str = row.get("time") or row.get("date")
-        currency = row.get("currency")
+        currency = row.get("currency") or row.get("country")
         if not time_str or not currency:
             continue
         out.append({
             "time": str(time_str),
             "currency": str(currency).upper(),
             "impact": impact,
-            "event": row.get("event") or "",
+            "event": row.get("event") or row.get("title") or "",
         })
     return out
 
@@ -300,28 +372,26 @@ def is_news_blackout(currencies: set[str], now: datetime | None = None, window_m
     for any of ``currencies``.
 
     Fails CLOSED (returns (True, reason)) when the calendar is unreachable --
-    no FINNHUB_API_KEY configured (changed 2026-10-01, rulebook v4: "if
-    calendar API unreachable, PASS, don't fail open" -- the committee has no
-    way to see whether this check even ran, so the earlier "fail open" meant
-    an unconfigured/broken calendar silently produced an all-clear forever).
-    This only skips the CURRENT pass, not a persistent halt -- the next
-    scheduled pass re-checks, so a lapsed key costs missed trades, not a
-    stuck kill switch. A real fetch that genuinely finds zero matching
-    events (API working, just nothing scheduled) still returns (False, None)
-    below -- only "we have no way to know" fails closed, not "nothing's on
-    the calendar."
+    changed 2026-10-01, rulebook v4: "if calendar API unreachable, PASS,
+    don't fail open" (the committee has no way to see whether this check
+    even ran, so the earlier "fail open" meant an unconfigured/broken
+    calendar silently produced an all-clear forever). Since 2026-10-06, that
+    only happens when BOTH Finnhub (if a key is configured) and the
+    ForexFactory fallback fail live with nothing cached -- see
+    fetch_calendar/_fetch_live_events_any_source; no FINNHUB_API_KEY alone
+    no longer fails closed on its own, since ForexFactory needs no key. This
+    only skips the CURRENT pass, not a persistent halt -- the next scheduled
+    pass re-checks. A real fetch that genuinely finds zero matching events
+    (API working, just nothing scheduled) still returns (False, None) below
+    -- only "we have no way to know" fails closed, not "nothing's on the
+    calendar."
     """
-    if not available():
-        return True, "news calendar unavailable (no FINNHUB_API_KEY) — failing closed (rulebook v4)"
-
     now = now or datetime.now(timezone.utc)
     try:
         events = fetch_calendar()
     except CalendarUnavailable as exc:
-        # A configured key whose live fetch is actually failing (outage,
-        # rate limit, timeout) with nothing cached to fall back on is the
-        # same "we have no way to know" case as no key at all -- fails
-        # closed the same way, not open.
+        # Both sources failing live with nothing cached is the "we have no
+        # way to know" case -- fails closed, not open.
         return True, f"{exc} — failing closed (rulebook v4)"
     window = timedelta(minutes=window_minutes)
     for event in events:

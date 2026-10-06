@@ -27,12 +27,16 @@ class TestAvailable:
 
 
 class TestIsNewsBlackoutFailsClosed:
-    def test_no_api_key_fails_closed(self, monkeypatch) -> None:
+    def test_no_cached_or_live_data_fails_closed(self, monkeypatch) -> None:
         # Changed 2026-10-01 (rulebook v4): an unreachable calendar used to
         # silently report "all clear" forever; it now blocks the current
         # pass instead, since the committee has no way to tell the check
-        # even ran.
-        monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+        # even ran. Since 2026-10-06 (ForexFactory no-key fallback), a
+        # missing Finnhub key ALONE no longer triggers this -- see
+        # TestIsNewsBlackoutNoFinnhubKeyUsesForexFactory below -- only both
+        # sources failing live with nothing cached does.
+        monkeypatch.setattr(fn_news, "fetch_calendar",
+                             lambda **kw: (_ for _ in ()).throw(fn_news.CalendarUnavailable("both sources down")))
         blackout, why = fn_news.is_news_blackout({"EUR", "USD"})
         assert blackout is True
         assert why is not None
@@ -49,6 +53,19 @@ class TestIsNewsBlackoutFailsClosed:
         blackout, why = fn_news.is_news_blackout({"EUR", "USD"})
         assert blackout is True
         assert "Finnhub down" in why and "failing closed" in why
+
+
+class TestIsNewsBlackoutNoFinnhubKeyUsesForexFactory:
+    """2026-10-06: a missing/paid-tier-gated Finnhub key no longer fails
+    closed on its own -- the ForexFactory fallback needs no key, so the
+    blackout check still runs normally as long as THAT succeeds."""
+
+    def test_no_finnhub_key_but_calendar_still_resolves(self, monkeypatch) -> None:
+        monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+        monkeypatch.setattr(fn_news, "fetch_calendar", lambda **kw: [])
+        blackout, why = fn_news.is_news_blackout({"EUR", "USD"})
+        assert blackout is False
+        assert why is None
 
 
 class TestIsNewsBlackoutWithEvents:
@@ -114,6 +131,86 @@ class TestNormalizeEvents:
     def test_non_dict_rows_skipped(self) -> None:
         assert fn_news._normalize_events(["not a dict", 123]) == []
 
+    def test_accepts_forexfactory_field_names(self) -> None:
+        # ForexFactory: "date"/"country"/"title" instead of Finnhub's
+        # "time"/"currency"/"event", capitalized impact.
+        raw = [{"date": "2026-10-07T14:00:00-04:00", "country": "USD", "impact": "High", "title": "FOMC Minutes"}]
+        out = fn_news._normalize_events(raw)
+        assert out == [{"time": "2026-10-07T14:00:00-04:00", "currency": "USD", "impact": "high", "event": "FOMC Minutes"}]
+
+    def test_forexfactory_holiday_impact_excluded(self) -> None:
+        raw = [{"date": "2026-10-07T00:00:00-04:00", "country": "All", "impact": "Holiday", "title": "Columbus Day"}]
+        assert fn_news._normalize_events(raw) == []
+
+
+class TestFetchForexFactoryEvents:
+    def _patch_throttled_get_json(self, monkeypatch, fn) -> None:
+        import sys
+        sys.path.insert(0, str(fn_news.AGENT_DIR))
+        import backtest.loaders._http as http_mod
+        monkeypatch.setattr(http_mod, "throttled_get_json", fn)
+
+    def test_parses_live_payload(self, monkeypatch) -> None:
+        payload = [
+            {"title": "FOMC Meeting Minutes", "country": "USD", "date": "2026-10-07T14:00:00-04:00",
+             "impact": "High", "forecast": "", "previous": ""},
+            {"title": "Minor release", "country": "EUR", "date": "2026-10-07T09:00:00-04:00",
+             "impact": "Low", "forecast": "", "previous": ""},
+        ]
+        self._patch_throttled_get_json(monkeypatch, lambda *a, **kw: payload)
+        out = fn_news._fetch_forexfactory_events()
+        assert out == [{"time": "2026-10-07T14:00:00-04:00", "currency": "USD", "impact": "high", "event": "FOMC Meeting Minutes"}]
+
+    def test_non_list_payload_yields_no_events(self, monkeypatch) -> None:
+        self._patch_throttled_get_json(monkeypatch, lambda *a, **kw: {"unexpected": "shape"})
+        assert fn_news._fetch_forexfactory_events() == []
+
+    def test_propagates_http_failure(self, monkeypatch) -> None:
+        self._patch_throttled_get_json(monkeypatch, lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("503")))
+        with pytest.raises(RuntimeError):
+            fn_news._fetch_forexfactory_events()
+
+
+class TestFetchLiveEventsAnySource:
+    def test_uses_finnhub_when_key_configured_and_working(self, monkeypatch) -> None:
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "_fetch_live_events", lambda api_key: [{"time": "x", "currency": "USD", "impact": "high", "event": "finnhub"}])
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events",
+                             lambda: (_ for _ in ()).throw(AssertionError("should not be called")))
+        events, source = fn_news._fetch_live_events_any_source()
+        assert source == "finnhub"
+        assert events[0]["event"] == "finnhub"
+
+    def test_falls_back_to_forexfactory_when_no_key(self, monkeypatch) -> None:
+        monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events", lambda: [{"time": "x", "currency": "USD", "impact": "high", "event": "ff"}])
+        events, source = fn_news._fetch_live_events_any_source()
+        assert source == "forexfactory"
+        assert events[0]["event"] == "ff"
+
+    def test_falls_back_to_forexfactory_when_finnhub_fails(self, monkeypatch) -> None:
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "_fetch_live_events", lambda api_key: (_ for _ in ()).throw(RuntimeError("403")))
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events", lambda: [{"time": "x", "currency": "USD", "impact": "high", "event": "ff"}])
+        events, source = fn_news._fetch_live_events_any_source()
+        assert source == "forexfactory"
+
+    def test_raises_combined_error_when_both_fail(self, monkeypatch) -> None:
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "_fetch_live_events", lambda api_key: (_ for _ in ()).throw(RuntimeError("finnhub down")))
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events", lambda: (_ for _ in ()).throw(RuntimeError("ff down")))
+        with pytest.raises(fn_news.CalendarUnavailable) as exc_info:
+            fn_news._fetch_live_events_any_source()
+        assert "finnhub down" in str(exc_info.value)
+        assert "ff down" in str(exc_info.value)
+
+    def test_no_key_message_when_both_fail(self, monkeypatch) -> None:
+        monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events", lambda: (_ for _ in ()).throw(RuntimeError("ff down")))
+        with pytest.raises(fn_news.CalendarUnavailable) as exc_info:
+            fn_news._fetch_live_events_any_source()
+        assert "no FINNHUB_API_KEY configured" in str(exc_info.value)
+
 
 class TestFetchCalendarCaching:
     def test_uses_cache_within_same_day_without_network_call(self, tmp_path, monkeypatch) -> None:
@@ -125,10 +222,41 @@ class TestFetchCalendarCaching:
         result = fn_news.fetch_calendar()
         assert result == [{"time": "x", "currency": "USD", "impact": "high", "event": "cached"}]
 
-    def test_no_key_returns_empty(self, tmp_path, monkeypatch) -> None:
+    def test_no_key_falls_back_to_forexfactory(self, tmp_path, monkeypatch) -> None:
+        # 2026-10-06: no Finnhub key no longer short-circuits to [] -- the
+        # ForexFactory fallback (needs no key) is tried instead.
         monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
         monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
-        assert fn_news.fetch_calendar() == []
+        ff_events = [{"time": "2026-10-06T12:30:00+00:00", "currency": "USD", "impact": "high", "event": "FOMC"}]
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events", lambda: ff_events)
+
+        result = fn_news.fetch_calendar()
+        assert result == ff_events
+        assert fn_news._read_cache()["source"] == "forexfactory"
+
+    def test_finnhub_failure_falls_back_to_forexfactory_live(self, tmp_path, monkeypatch) -> None:
+        # A configured key whose live Finnhub call fails (e.g. the
+        # 2026-10-06 "paid plan only" 403) still gets a real answer from
+        # ForexFactory instead of failing closed.
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
+        monkeypatch.setattr(fn_news, "_fetch_live_events",
+                             lambda api_key: (_ for _ in ()).throw(RuntimeError("403 Forbidden")))
+        ff_events = [{"time": "2026-10-06T12:30:00+00:00", "currency": "EUR", "impact": "high", "event": "ECB"}]
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events", lambda: ff_events)
+
+        result = fn_news.fetch_calendar()
+        assert result == ff_events
+        assert fn_news._read_cache()["source"] == "forexfactory"
+
+    def test_both_sources_fail_raises_when_no_cache(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+        monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events",
+                             lambda: (_ for _ in ()).throw(RuntimeError("down")))
+
+        with pytest.raises(fn_news.CalendarUnavailable):
+            fn_news.fetch_calendar()
 
     def _patch_throttled_get_json(self, monkeypatch, fn) -> None:
         import sys
@@ -216,10 +344,12 @@ class TestMaskSecretsFilter:
 
 
 class TestStartupSelfTest:
-    def test_true_when_no_key_configured(self, monkeypatch) -> None:
-        # A missing key is an already-known, deliberate "fails closed every
-        # pass" state -- not what this self-test exists to catch.
+    def test_true_when_no_key_but_forexfactory_succeeds(self, monkeypatch) -> None:
+        # 2026-10-06: no Finnhub key alone no longer fails the self-test --
+        # the ForexFactory fallback needs no key, so as long as IT answers
+        # live, the pipeline is considered healthy.
         monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events", lambda: [])
         called = []
         assert fn_news.startup_self_test(alert_fn=lambda *a: called.append(a)) is True
         assert called == []
@@ -238,6 +368,10 @@ class TestStartupSelfTest:
             fn_news, "_fetch_live_events",
             lambda api_key: (_ for _ in ()).throw(RuntimeError("403 Forbidden ...&token=livesecret")),
         )
+        # Both sources must fail for the self-test to fail -- the
+        # ForexFactory fallback is tried after Finnhub.
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events",
+                             lambda: (_ for _ in ()).throw(RuntimeError("also down")))
         alerts = []
         with caplog.at_level(_logging.CRITICAL):
             result = fn_news.startup_self_test(alert_fn=lambda subject, body: alerts.append((subject, body)))
@@ -254,6 +388,8 @@ class TestStartupSelfTest:
         # real self-test failure as a crash -- still returns False cleanly.
         monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
         monkeypatch.setattr(fn_news, "_fetch_live_events", lambda api_key: (_ for _ in ()).throw(RuntimeError("down")))
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events",
+                             lambda: (_ for _ in ()).throw(RuntimeError("also down")))
 
         def _broken_alert(subject, body):
             raise ConnectionError("SMTP also down")
@@ -263,6 +399,8 @@ class TestStartupSelfTest:
     def test_false_with_no_alert_fn_given(self, monkeypatch) -> None:
         monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
         monkeypatch.setattr(fn_news, "_fetch_live_events", lambda api_key: (_ for _ in ()).throw(RuntimeError("down")))
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events",
+                             lambda: (_ for _ in ()).throw(RuntimeError("also down")))
         assert fn_news.startup_self_test(alert_fn=None) is False
 
 
