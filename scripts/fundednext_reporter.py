@@ -89,6 +89,11 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("fundednext_reporter")
+# Defense-in-depth (D1, 2026-10-06) -- see fn_news.mask_secrets' own
+# docstring for why this is a backstop, not the primary fix, and does not
+# cover the emailed report body.
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(fn_news.mask_secrets())
 
 # --------------------------------------------------------------------------- #
 # What to run each pass
@@ -779,9 +784,14 @@ def _journal_summary_text(symbol: str) -> str | None:
     net = sum(float(e.get("profit") or 0) for e in scored)
     last = recent[-1]
     reversals = sum(1 for e in scored if e.get("excursion_tag") == "reversal")
+    # Reworded 2026-10-06 (D5): see committee_reporter.py's identical change
+    # for the full rationale -- the old framing biased the committee toward
+    # more active stop management on a pattern the exit_replay evidence
+    # (n=39) shows is negative-expectancy to touch.
     reversal_note = (
-        f" {reversals} of these moved favorably before reversing to a loss — "
-        f"a stop-management issue, not an entry-quality one."
+        f" {reversals} of last {len(scored)} closed trades moved favorably before reversing. Note: "
+        f"replay evidence (n=39) shows stop-tightening on this pattern is negative-expectancy; the "
+        f"correct response is entry/stop-sizing discipline, not exit management."
         if reversals else ""
     )
     return (
@@ -830,7 +840,9 @@ _REASONING_LINE_RE = re.compile(r"^Reasoning:\s*(.+)$", re.MULTILINE)
 def _parse_decision_reasoning(report_text: str) -> tuple[str, str] | None:
     """Extract the Decision/Reasoning lines from a research-only pass's report.
 
-    Mirrored from committee_reporter.py's identical function.
+    Mirrored from committee_reporter.py's identical function -- see its
+    docstring (D3, 2026-10-06) for why this no longer matches the current
+    research-only report format, and why that's left as-is.
     """
     decision_match = _DECISION_LINE_RE.search(report_text)
     reasoning_match = _REASONING_LINE_RE.search(report_text)
@@ -1208,35 +1220,73 @@ class CommitteeResult:
 # Running a committee
 # --------------------------------------------------------------------------- #
 
-_REPORT_FORMAT_NO_TRADE = (
-    "Finally, report in exactly this structure (plain text, these labels verbatim):\n"
-    "Decision: <long / short / wait, one sentence>\n"
-    "Reasoning: <the concrete factors behind the call - technicals, fundamentals, risk/sizing, "
-    "whatever the committee actually weighed - 3-6 sentences, specific numbers where the debate gave them>\n"
-    "Targets & Stops: <PM's price levels, or 'none given' if the call was wait/hold>\n"
-    "Confidence: <the PM's stated confidence, or 'not stated'>"
+_RULEBOOK_V51_RULES = (
+    # D6 (v5.1, 2026-10-06) -- see committee_reporter.py's identical constant
+    # for the full rationale.
+    "Two more rules before you answer:\n"
+    "- If DATA_MISSING below is not \"none\": do not attempt a full debate on incomplete facts -- "
+    "DECISION must be PASS, EDGE/CHECKLIST/ORDER/INVALIDATION/PROPOSAL get trivial placeholder values "
+    "(\"none\" / \"n/a\"), and REASON FOR PASS must quote exactly what's missing. Do NOT salvage this "
+    "into a trade by estimating or guessing the missing value -- a verified fact you don't have is not "
+    "something you can approximate your way around.\n"
+    "- If NEWS_API_STATUS below is not \"OK\": same as above -- DECISION must be PASS, REASON FOR PASS "
+    "must quote the status and why it matters (an UNAVAILABLE or STALE calendar means you cannot verify "
+    "there's no high-impact release about to move price).\n"
+    "PASS is a successful outcome of this process, not a failure of it -- protecting capital by correctly "
+    "recognizing you don't have what you need to trade is the job working as intended.\n\n"
 )
 
 _REPORT_FORMAT_TRADE = (
     # Rulebook output format (2026-09-30; v4 edge taxonomy + PROPOSAL field,
-    # 2026-10-01). strategy_tracking.parse_decision reads the DECISION line
-    # (PASS counts as a wait). Exits stay plain stop+target either way --
-    # that's locked in the preset's own prompt and in STOP_TRAILING_ENABLED,
-    # not something this report format needs to restate per trade.
+    # 2026-10-01; MODE field, D3/D6 2026-10-06; v5.1 DATA_MISSING/
+    # NEWS_API_STATUS/INPUT_PROVENANCE, D6 2026-10-06). strategy_tracking.
+    # parse_decision reads the DECISION line (PASS counts as a wait). Exits
+    # stay plain stop+target either way -- that's locked in the preset's own
+    # prompt and in STOP_TRAILING_ENABLED, not something this report format
+    # needs to restate per trade.
     "Finally, report in exactly this structure (plain text, these labels verbatim, in this order; max 40 "
     "lines total -- if the head trader's own answer would exceed that, or stated confidence below 60, or "
     "left any checklist item unclear, DECISION must be PASS regardless of what was otherwise concluded):\n"
     "DECISION: <LONG / SHORT / PASS>\n"
     "CONFIDENCE: <0-100>\n"
+    "MODE: LIVE\n"
+    "DATA_MISSING: <comma-separated list of any verified fact above that was unavailable (e.g. "
+    "\"live quote\", \"ATR\"), or \"none\">\n"
+    "NEWS_API_STATUS: <echo the NEWS_API_STATUS verified fact above exactly: OK / STALE / UNAVAILABLE>\n"
     "EDGE: <one of HTF_TREND_CONTINUATION / HTF_LEVEL_REJECTION / SESSION_RANGE_BREAKOUT, then one sentence why>\n"
     "CHECKLIST: <the head trader's ten numbered answers, one short line each>\n"
     "ORDER: <if placed: symbol, side, type, fill price, stop_loss, take_profit, lots and net R:R, confirmed "
     "from trading_place_order's own response (not just what the head trader said); if not placed: none>\n"
     "INVALIDATION: <the specific thesis-break price>\n"
+    "INPUT_PROVENANCE: <echo the quote source, quote-fetched-at, and data-pack-built-at facts above, in "
+    "one short line>\n"
     "PROPOSAL: <a new rule/filter/exit idea the head trader flagged, marked DO NOT SHIP -- it must not affect "
     "this pass's decision or order; otherwise \"none\">\n"
     "REASON FOR PASS: <if PASS or no order was placed: the specific rule-based reason (which checklist item, "
     "trend rule, position already open, or the order's rejection -- quote its error text); otherwise n/a>"
+)
+
+# D3 (2026-10-06): replaces the old _REPORT_FORMAT_NO_TRADE -- see
+# committee_reporter.py's identical constant for the full rationale. v5.1
+# DATA_MISSING/NEWS_API_STATUS/INPUT_PROVENANCE added D6 2026-10-06, same as
+# the LIVE format.
+_REPORT_FORMAT_RESEARCH_ONLY = (
+    "Finally, report in exactly this structure (plain text, these labels verbatim, in this order; max 40 "
+    "lines total):\n"
+    "DECISION: PASS\n"
+    "CONFIDENCE: <0-100 -- the debate's own confidence, had this been a live pass>\n"
+    "MODE: RESEARCH_ONLY\n"
+    "DATA_MISSING: <comma-separated list of any verified fact above that was unavailable, or \"none\">\n"
+    "NEWS_API_STATUS: <echo the NEWS_API_STATUS verified fact above exactly: OK / STALE / UNAVAILABLE>\n"
+    "EDGE: <one of HTF_TREND_CONTINUATION / HTF_LEVEL_REJECTION / SESSION_RANGE_BREAKOUT, then one sentence "
+    "why, or \"none\" if no setup qualified>\n"
+    "CHECKLIST: <the head trader's ten numbered answers, one short line each>\n"
+    "ORDER: none (research-only pass -- trading_place_order must not be called under any circumstances)\n"
+    "INVALIDATION: <the specific thesis-break price the debate would have used, or \"n/a\">\n"
+    "INPUT_PROVENANCE: <echo the quote source, quote-fetched-at, and data-pack-built-at facts above, in "
+    "one short line>\n"
+    "PROPOSAL: <a new rule/filter/exit idea the head trader flagged, marked DO NOT SHIP; otherwise \"none\">\n"
+    "REASON FOR PASS: <the specific rule-based reason this pass is research-only -- quote it verbatim>"
 )
 
 
@@ -1299,18 +1349,51 @@ def _challenge_framing(connection: str | None) -> str:
     )
 
 
-def _build_prompt(committee: str, target: str, market: str, trade: dict | None) -> str:
+def _build_prompt(
+    committee: str, target: str, market: str, trade: dict | None,
+    *, research_only: bool = False, research_only_reason: str = "",
+) -> str | None:
+    """Returns None (D2, 2026-10-06) when `trade` is set but no fresh data
+    pack could be verified -- see committee_reporter.py's identical function
+    for the full rationale.
+
+    research_only=True (D3, 2026-10-06) -- see committee_reporter.py's
+    identical function for the full rationale.
+    """
     if not trade:
         return (
             f'Run the {committee} swarm with target="{target}" and market="{market}" '
             f"to produce its full debate and final decision.\n\n"
             f"{_challenge_framing(None)}"
-            f"{_REPORT_FORMAT_NO_TRADE}"
+            f"This pass is RESEARCH-ONLY: no trade spec is configured for this target this session. "
+            f"Produce the full debate and final decision anyway; DECISION must be reported as PASS "
+            f"regardless of what the debate concludes, and no ORDER may be placed.\n\n"
+            f"{_REPORT_FORMAT_RESEARCH_ONLY}"
         )
     symbol = trade["symbol"]
     connection = trade["connection"]
     lots = trade["lots"]
     max_stack = trade.get("max_stack", MAX_SAME_DIRECTION_POSITIONS)
+
+    # HARD gate (D2, 2026-10-06) -- see committee_reporter.py's identical
+    # function for the full rationale. Computed first, before any other
+    # (expensive, broker-round-trip) facts below.
+    pack_built_at = datetime.now(timezone.utc)
+    pack_path = market_data_pack.write_data_pack(symbol, connection)
+    if pack_path is None:
+        logger.warning("NO_DATA_PACK: %s -- data pack unavailable this pass", target)
+        return None
+    swarm_intro = market_data_pack.swarm_instruction(committee, target, market, pack_path)
+
+    # v5.1 (D6, 2026-10-06) -- see committee_reporter.py's identical
+    # computation for the full rationale.
+    news_status = fn_news.news_api_status()
+    news_status_fact = f"NEWS_API_STATUS verified fact: {news_status}."
+    provenance_fact = (
+        f"INPUT PROVENANCE verified facts (echo these in your own INPUT_PROVENANCE line): quote source="
+        f"{connection}, quote fetched at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC, data pack "
+        f"built at {pack_built_at.strftime('%H:%M:%S')} UTC."
+    )
 
     summary = _symbol_position_summary(symbol, connection)
     count, side = summary["count"], summary["side"]
@@ -1414,14 +1497,36 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
     journal_fact = _journal_summary_text(symbol)
     journal_block = f"{journal_fact}\n\n" if journal_fact else ""
 
-    # Verified broker data for the swarm agents (see scripts/market_data_pack.py).
-    # Fails soft: a None path just drops the DATA PACK line.
-    pack_path = market_data_pack.write_data_pack(symbol, connection)
-    swarm_intro = market_data_pack.swarm_instruction(committee, target, market, pack_path)
     session_bias_fact = _session_bias_fact(symbol)
     session_bias_block = f"{session_bias_fact}\n\n" if session_bias_fact else ""
     trend_block = trade.get("trend_rule", "")
     strategic_context_block = strategy_tracking.strategic_context_prompt()
+
+    if research_only:
+        # D3 (2026-10-06) -- see committee_reporter.py's identical branch
+        # for the full rationale.
+        return (
+            f"{swarm_intro}"
+            f"{strategic_context_block}"
+            f"The swarm must produce its full debate and final decision, including the concrete stop-loss "
+            f"and take-profit price levels it WOULD have used — even though no order will be placed this "
+            f"pass (see below for why).\n\n"
+            f"{quote_fact}\n\n"
+            f"{news_status_fact}\n\n"
+            f"{provenance_fact}\n\n"
+            f"{risk_fact}\n\n"
+            f"{volatility_block}"
+            f"{journal_block}"
+            f"{session_bias_block}"
+            f"{trend_block}"
+            f"{_challenge_framing(connection)}"
+            f"THIS PASS IS RESEARCH-ONLY: {research_only_reason} Do NOT call trading_place_order under "
+            f"any circumstances this pass, no matter how strong the setup looks. Produce the full debate "
+            f"and final decision as you normally would, but DECISION must be reported as PASS and REASON "
+            f"FOR PASS must quote the reason above verbatim.\n\n"
+            f"{_RULEBOOK_V51_RULES}"
+            f"{_REPORT_FORMAT_RESEARCH_ONLY}"
+        )
 
     return (
         f"{swarm_intro}"
@@ -1430,12 +1535,15 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
         f"and final decision, including concrete stop-loss and take-profit price levels — every "
         f"committee decision must carry these, not just a direction.\n\n"
         f"{quote_fact}\n\n"
+        f"{news_status_fact}\n\n"
+        f"{provenance_fact}\n\n"
         f"{risk_fact}\n\n"
         f"{volatility_block}"
         f"{journal_block}"
         f"{session_bias_block}"
         f"{trend_block}"
         f"{_challenge_framing(connection)}"
+        f"{_RULEBOOK_V51_RULES}"
         f"Then, based ONLY on the swarm's final decision (made by its final decision-maker -- the "
         f"head trader on fx_commodity_day_desk; 'PM' below means that final decision-maker):\n"
         f"- {position_fact} Still call trading_positions yourself too (for your own report, and as a "
@@ -1509,7 +1617,11 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     (fundednext_news_calendar) for the symbol's currencies, then
     _exclusive_group_conflict (no EURUSD and GBPUSD open at the same time).
     """
+    # D3 (2026-10-06) -- see committee_reporter.py's identical handling for
+    # the full rationale: `trade` keeps its symbol/connection/lots all the
+    # way through, even once downgraded, instead of being nulled out.
     breaker_note = None
+    research_only = False
     if trade:
         live_symbols = {
             spec["trade"]["symbol"]
@@ -1519,32 +1631,54 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         breaker_note = fn_guard.guardrail_check(trade, live_symbols, OUR_MAGIC)
         if breaker_note:
             logger.warning("FundedNext guardrail for %s: %s", target, breaker_note)
-            trade = None
+            research_only = True
 
-    if trade:
+    if trade and not research_only:
         currencies = _symbol_currencies(trade["symbol"])
         in_blackout, why = fn_news.is_news_blackout(currencies, window_minutes=NEWS_BLACKOUT_WINDOW_MINUTES)
         if in_blackout:
             breaker_note = f"[NEWS BLACKOUT] {trade['symbol']} pass run research-only: {why}."
             logger.warning("news blackout for %s: %s", target, why)
-            trade = None
+            research_only = True
 
-    if trade:
+    if trade and not research_only:
         conflict = _exclusive_group_conflict(trade)
         if conflict:
             breaker_note = conflict
             logger.warning("correlation limit for %s: %s", target, conflict)
-            trade = None
+            research_only = True
 
     trend_allowed = None
-    if trade and TREND_FILTER_ENABLED:
+    if trade and not research_only and TREND_FILTER_ENABLED:
         trend_allowed, trend_reason = strategy_tracking.trend_gate(trade["symbol"], trade["connection"])
         logger.info("trend gate for %s: %s", target, trend_reason)
         if trend_allowed:
             trade = {**trade, "trend_rule": strategy_tracking.trend_rule_prompt(trend_allowed, trend_reason)}
 
-    prompt = _build_prompt(committee, target, market, trade)
-    logger.info("running %s on %s (%s)%s", committee, target, market, " [trade-enabled]" if trade else "")
+    prompt = _build_prompt(
+        committee, target, market, trade,
+        research_only=research_only, research_only_reason=breaker_note or "",
+    )
+    if prompt is None:
+        # D2 (2026-10-06) -- see committee_reporter.py's identical early
+        # return for the full rationale.
+        return CommitteeResult(
+            committee, target, market, "success", None,
+            "DECISION: PASS\n"
+            "CONFIDENCE: 0\n"
+            f"MODE: {'RESEARCH_ONLY' if research_only else 'LIVE'}\n"
+            "EDGE: none\n"
+            "CHECKLIST: n/a -- data pack unavailable, LLM not invoked\n"
+            "ORDER: none\n"
+            "INVALIDATION: n/a\n"
+            "PROPOSAL: none\n"
+            "REASON FOR PASS: data_pack_unavailable -- no fresh live data pack could be built this pass "
+            "(see NO_DATA_PACK in the log); the LLM was not invoked rather than let it reason on "
+            "unverified facts (D2).",
+            traded=False,
+        )
+    logger.info("running %s on %s (%s)%s", committee, target, market,
+                " [research-only]" if research_only else (" [trade-enabled]" if trade else ""))
     cmd = [
         sys.executable, "-m", "cli", "run",
         "--prompt", prompt,
@@ -1591,7 +1725,9 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         # happened not to have placed anything, but confirmed the gap was
         # live; found and fixed per the daily-repair agent's 2026-10-06
         # review of that incident.
-        notes, traded, any_placed = _journal_any_placed_orders(trade, run_id, trend_allowed)
+        notes, traded, any_placed = _journal_any_placed_orders(
+            trade, run_id, trend_allowed, research_only=research_only, research_only_reason=breaker_note or "",
+        )
         error_text = payload.get("reason") or f"run status was '{status}'"
         if any_placed:
             error_text += (
@@ -1602,7 +1738,9 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
 
     report_text = _read_final_answer(run_id) if run_id else ""
     if not report_text:
-        notes, traded, any_placed = _journal_any_placed_orders(trade, run_id, trend_allowed)
+        notes, traded, any_placed = _journal_any_placed_orders(
+            trade, run_id, trend_allowed, research_only=research_only, research_only_reason=breaker_note or "",
+        )
         error_text = "run succeeded but produced no final answer"
         if any_placed:
             error_text += (
@@ -1611,11 +1749,36 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             )
         return CommitteeResult(committee, target, market, "error", run_id, "", error=error_text, traded=traded)
 
+    # D4 (2026-10-06) -- see committee_reporter.py's identical check for the
+    # full rationale. Checked against the LLM's RAW answer, before any
+    # guardrail/violation notes get appended below.
+    missing_fields = strategy_tracking.validate_committee_fields(report_text)
+
     # Every successful placement in the trace is run through the guardrail
     # chain below, not just the first -- see committee_reporter.py's
-    # identical run_committee logic for the full rationale.
-    notes, traded, any_placed = _journal_any_placed_orders(trade, run_id, trend_allowed)
+    # identical run_committee logic for the full rationale. Journaled
+    # unconditionally, even if the schema check above will reject this
+    # report below -- a real fill must never be dropped because the
+    # narrative around it is malformed.
+    notes, traded, any_placed = _journal_any_placed_orders(
+        trade, run_id, trend_allowed, research_only=research_only, research_only_reason=breaker_note or "",
+    )
     report_text = report_text + notes
+
+    if missing_fields:
+        # D4: status "error" (not "success") so record_decision logs
+        # result.status instead of trusting parse_decision on a malformed
+        # report. No AI-cost attribution exists anywhere in this codebase
+        # to skip (confirmed in the 2026-10-01 due-diligence review). The
+        # real fill above (if any) is still journaled and still counts
+        # toward `traded` -- only the report's trustworthiness as a
+        # decision record is being rejected, not the fill itself.
+        logger.error("MALFORMED_OUTPUT: %s missing required fields: %s", target, ", ".join(missing_fields))
+        error_text = f"MALFORMED_OUTPUT: missing required field(s): {', '.join(missing_fields)}"
+        if breaker_note:
+            error_text += f"\n\n{breaker_note}"
+        return CommitteeResult(committee, target, market, "error", run_id, report_text, error=error_text, traded=traded)
+
     if not any_placed and trade:
         blocked_note = _blocked_order_note(run_id)
         if blocked_note:
@@ -1723,6 +1886,54 @@ def _post_trade_spec_check(trade: dict, placed_order: dict) -> str:
         f"(src.live.halt.clear_halt) — the committee did not follow the prompt's hardcoded "
         f"order parameters, and this needs human review before further automated trading. "
         f"Close attempt: {closed_note}."
+    )
+
+
+def _post_trade_research_only_violation(trade: dict, placed_order: dict, reason: str) -> str:
+    """D3 (2026-10-06) -- see committee_reporter.py's identical function for
+    the full rationale. A research-only pass's prompt never includes the
+    trading_place_order instructions at all; if the tool fires anyway, this
+    is the code-level backstop -- CLOSE it and trip the kill switch, same
+    severity as a spec violation (arguably worse: an explicit "do not trade
+    this pass" instruction was ignored entirely, not just a parameter)."""
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.live.halt import trip_halt
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.service import get_positions
+
+    actual_symbol = placed_order.get("symbol") or trade["symbol"]
+    target_ticket = str(placed_order.get("order_id") or "").strip()
+    closed: list[str] = []
+    try:
+        positions = get_positions(trade["connection"]).get("positions", [])
+        matches = [
+            p for p in positions
+            if p.get("symbol") == actual_symbol and p.get("magic") == OUR_MAGIC
+            and target_ticket and str(p.get("ticket")) == target_ticket
+        ]
+        if matches:
+            config = _mt5_config_for(trade["connection"])
+            for pos in matches:
+                ticket = pos.get("ticket")
+                result = mt5_sdk.close_position(config, ticket=ticket)
+                closed.append(f"{pos.get('symbol')} ticket {ticket}: {result.get('status')}")
+        elif not target_ticket:
+            closed.append("could not identify the new position's own ticket (order_id missing) -- "
+                           "refusing to blindly close other positions on this symbol; close manually")
+        else:
+            closed.append(f"no open position found with ticket {target_ticket} (already closed/never opened?)")
+    except Exception as exc:
+        closed.append(f"flatten attempt raised: {exc}")
+
+    trip_halt(by="cli", reason=f"research-only pass placed a live order on {trade['symbol']}: {reason}",
+              broker=fn_guard.BROKER)
+    closed_note = "; ".join(closed) if closed else "no position found to close (already flat?)"
+    return (
+        f"\n\n[CRITICAL — RESEARCH-ONLY VIOLATION, AUTO-CLOSED] This pass was research-only ({reason}) "
+        f"and was explicitly told not to call trading_place_order, but did anyway. This position has "
+        f"been closed immediately and {fn_guard.BROKER} trading is now HALTED (kill switch) until "
+        f"manually cleared (src.live.halt.clear_halt) — this needs human review before further "
+        f"automated trading. Close attempt: {closed_note}."
     )
 
 
@@ -2111,7 +2322,10 @@ def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
     return f"\n\n[AUTOMATED CHECK — CORRECTED] {header} — {action} to restore it."
 
 
-def _handle_filled_order(trade: dict, placed_order: dict, trend_allowed: set[str] | None) -> tuple[str, bool]:
+def _handle_filled_order(
+    trade: dict, placed_order: dict, trend_allowed: set[str] | None,
+    *, research_only: bool = False, research_only_reason: str = "",
+) -> tuple[str, bool]:
     """Run every post-fill guardrail against a just-filled order, then journal it.
 
     Real bug found by /code-review (mirrored from the identical fix in
@@ -2132,11 +2346,17 @@ def _handle_filled_order(trade: dict, placed_order: dict, trend_allowed: set[str
     can carry a different, wrong symbol, and recording it under the expected
     symbol would misfile it into the wrong instrument's history.
 
+    research_only=True (D3, 2026-10-06) checked FIRST -- see
+    committee_reporter.py's identical function for the full rationale.
+
     Returns (report note to append, whether this counts as "traded" for
     CommitteeResult/email tagging).
     """
-    spec_note = (_enforce_trend_rule(trade, placed_order, trend_allowed)
-                 or _post_trade_spec_check(trade, placed_order))
+    spec_note = (
+        _post_trade_research_only_violation(trade, placed_order, research_only_reason) if research_only else
+        _enforce_trend_rule(trade, placed_order, trend_allowed)
+        or _post_trade_spec_check(trade, placed_order)
+    )
     floor_note, floor_closed = ("", False) if spec_note else _post_trade_stop_floor_check(trade, placed_order)
     if floor_closed:
         spec_note = floor_note
@@ -2162,7 +2382,8 @@ def _handle_filled_order(trade: dict, placed_order: dict, trend_allowed: set[str
 
 
 def _journal_any_placed_orders(
-    trade: dict | None, run_id: str | None, trend_allowed: set[str] | None
+    trade: dict | None, run_id: str | None, trend_allowed: set[str] | None,
+    *, research_only: bool = False, research_only_reason: str = "",
 ) -> tuple[str, bool, bool]:
     """Run every verified placed order in this run's trace (if any) through
     the full post-fill guardrail chain and journal it. Returns (report notes,
@@ -2171,6 +2392,7 @@ def _journal_any_placed_orders(
     Shared by every return point in run_committee -- see
     committee_reporter.py's identical helper for the full rationale (real
     incident 2026-10-05, found by the daily-repair agent 2026-10-06).
+    research_only is passed straight through to _handle_filled_order.
     `run_id` being None (the CLI's own JSON output failed to parse) returns
     (empty, False, False) -- there is genuinely nothing to recover there.
     """
@@ -2183,7 +2405,10 @@ def _journal_any_placed_orders(
         resolved_price = _resolve_fill_price(trade, placed_order)
         if resolved_price is not None:
             placed_order["fill_price"] = resolved_price
-        note, order_traded = _handle_filled_order(trade, placed_order, trend_allowed)
+        note, order_traded = _handle_filled_order(
+            trade, placed_order, trend_allowed,
+            research_only=research_only, research_only_reason=research_only_reason,
+        )
         notes += note
         traded = traded or order_traded
     return notes, traded, bool(placed_orders)
@@ -2719,6 +2944,11 @@ def main() -> int:
         return 1
 
     if args.loop:
+        # See committee_reporter.py's identical self-test for the full
+        # rationale (mirrored here).
+        if not fn_news.startup_self_test(alert_fn=send_email):
+            logger.critical("news calendar startup self-test failed -- refusing to start the loop")
+            return 1
         next_boundary, next_session = _next_session_boundary(datetime.now(timezone.utc))
         logger.info(
             "starting loop mode, session-gated scheduling (only new_york trades; profit "

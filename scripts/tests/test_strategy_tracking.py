@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import types
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -28,6 +29,51 @@ class TestParseDecision:
     ])
     def test_classifies(self, line, expected) -> None:
         assert st.parse_decision(f"blah\n{line}\nReasoning: x") == expected
+
+
+class TestValidateCommitteeFields:
+    """D4 (2026-10-06, extended for v5.1 in D6): catch the LLM dropping a
+    required field entirely -- something the email/journal pipeline had no
+    way to detect before this."""
+
+    VALID_TRADE = (
+        "DECISION: LONG\nCONFIDENCE: 72\nMODE: LIVE\nDATA_MISSING: none\nNEWS_API_STATUS: OK\n"
+        "EDGE: HTF_TREND_CONTINUATION -- H4/D1 both up\n"
+        "CHECKLIST: 1. yes 2. yes\nORDER: EURUSDm buy 0.01 @ 1.1234\nINVALIDATION: 1.1180\n"
+        "INPUT_PROVENANCE: mt5-live-trade, quote 12:00:00 UTC, pack 12:00:00 UTC\n"
+        "PROPOSAL: none\nREASON FOR PASS: n/a"
+    )
+    VALID_RESEARCH_ONLY = (
+        "DECISION: PASS\nCONFIDENCE: 0\nMODE: RESEARCH_ONLY\nDATA_MISSING: none\nNEWS_API_STATUS: OK\n"
+        "EDGE: none\nCHECKLIST: n/a\n"
+        "ORDER: none\nINVALIDATION: n/a\nINPUT_PROVENANCE: mt5-live-trade, quote 12:00:00 UTC, pack 12:00:00 UTC\n"
+        "PROPOSAL: none\nREASON FOR PASS: news blackout"
+    )
+
+    def test_valid_trade_output_has_no_missing_fields(self) -> None:
+        assert st.validate_committee_fields(self.VALID_TRADE) == []
+
+    def test_valid_research_only_output_has_no_missing_fields(self) -> None:
+        assert st.validate_committee_fields(self.VALID_RESEARCH_ONLY) == []
+
+    def test_missing_single_field_is_reported(self) -> None:
+        text = self.VALID_TRADE.replace("MODE: LIVE\n", "")
+        assert st.validate_committee_fields(text) == ["MODE"]
+
+    def test_missing_multiple_fields_are_all_reported(self) -> None:
+        text = "DECISION: LONG\nCONFIDENCE: 72\n"
+        missing = st.validate_committee_fields(text)
+        assert missing == ["MODE", "DATA_MISSING", "NEWS_API_STATUS", "EDGE", "CHECKLIST", "ORDER",
+                            "INVALIDATION", "INPUT_PROVENANCE", "PROPOSAL", "REASON FOR PASS"]
+
+    def test_empty_report_is_missing_everything(self) -> None:
+        assert st.validate_committee_fields("") == list(st.REQUIRED_COMMITTEE_FIELDS)
+
+    def test_field_must_be_at_start_of_line(self) -> None:
+        # A field name mentioned mid-sentence (not as its own labeled line)
+        # must not count as present.
+        text = "Some prose that mentions MODE: in passing, not as a real field.\n" + self.VALID_TRADE.replace("MODE: LIVE\n", "")
+        assert "MODE" in st.validate_committee_fields(text)
 
 
 class TestTrendRulePrompt:
@@ -167,7 +213,10 @@ class TestPromptCarriesTrendRule:
     def test_trend_block_reaches_prompt(self, monkeypatch) -> None:
         monkeypatch.setattr(cr, "_symbol_position_summary", lambda s, c: {"count": 0, "side": None})
         monkeypatch.setattr(cr, "_symbol_live_quote", lambda s, c: None)
-        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: None)
+        # A real (if fake) path -- None now means "no data pack, hard PASS,
+        # don't invoke the LLM" (D2, 2026-10-06), which isn't what this test
+        # is exercising.
+        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: Path("fake_pack.md"))
         for name in ("_signal_service_activity", "_journal_summary_text", "_session_bias_fact"):
             monkeypatch.setattr(cr, name, lambda *a, **k: "")
         monkeypatch.setattr(cr, "_journal_reconcile_closed", lambda *a, **k: None, raising=False)

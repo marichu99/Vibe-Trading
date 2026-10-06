@@ -139,7 +139,7 @@ class TestFetchCalendarCaching:
     def test_live_fetch_failure_raises_when_no_cache(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
         monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
-        self._patch_throttled_get_json(monkeypatch, lambda **kw: (_ for _ in ()).throw(RuntimeError("timeout")))
+        self._patch_throttled_get_json(monkeypatch, lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("timeout")))
 
         with pytest.raises(fn_news.CalendarUnavailable):
             fn_news.fetch_calendar()
@@ -149,7 +149,147 @@ class TestFetchCalendarCaching:
         monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
         fn_news._write_cache({"fetched_date": "2020-01-01",  # deliberately stale
                                "events": [{"time": "x", "currency": "USD", "impact": "high", "event": "stale"}]})
-        self._patch_throttled_get_json(monkeypatch, lambda **kw: (_ for _ in ()).throw(RuntimeError("timeout")))
+        self._patch_throttled_get_json(monkeypatch, lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("timeout")))
 
         result = fn_news.fetch_calendar()
         assert result == [{"time": "x", "currency": "USD", "impact": "high", "event": "stale"}]
+
+
+class TestRedact:
+    """D1 (2026-10-06): a live fetch failure's exception text embeds the
+    full request URL, token query param included -- confirmed leaking into
+    both logs and the emailed report on 2026-10-02/10-05. _redact strips it
+    before the string is ever constructed into a message."""
+
+    def test_strips_token_query_param(self) -> None:
+        url = "https://finnhub.io/api/v1/calendar/economic?from=2026-10-03&to=2026-10-07&token=abc123secret"
+        redacted = fn_news._redact(url)
+        assert "abc123secret" not in redacted
+        assert "token=***REDACTED***" in redacted
+        assert "from=2026-10-03" in redacted  # non-secret params survive
+
+    def test_case_insensitive_and_leading_ampersand(self) -> None:
+        redacted = fn_news._redact("...&TOKEN=SuperSecret123&other=1")
+        assert "SuperSecret123" not in redacted
+
+    def test_leaves_token_free_text_unchanged(self) -> None:
+        assert fn_news._redact("Finnhub fetch failed: timeout") == "Finnhub fetch failed: timeout"
+
+    def test_calendar_unavailable_message_is_already_redacted(self, tmp_path, monkeypatch) -> None:
+        """Regression for the actual incident: raise with a fake token in
+        the underlying exception and confirm it never reaches the raised
+        CalendarUnavailable's own message."""
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
+        fake_url_error = RuntimeError(
+            "403 Client Error: Forbidden for url: "
+            "https://finnhub.io/api/v1/calendar/economic?from=2026-10-03&to=2026-10-07&token=dam5dqhr01live"
+        )
+        import sys
+        sys.path.insert(0, str(fn_news.AGENT_DIR))
+        import backtest.loaders._http as http_mod
+        monkeypatch.setattr(http_mod, "throttled_get_json", lambda *a, **kw: (_ for _ in ()).throw(fake_url_error))
+
+        with pytest.raises(fn_news.CalendarUnavailable) as exc_info:
+            fn_news.fetch_calendar()
+        assert "dam5dqhr01live" not in str(exc_info.value)
+        assert "token=***REDACTED***" in str(exc_info.value)
+
+
+class TestMaskSecretsFilter:
+    def test_masks_token_in_log_message_args(self, caplog) -> None:
+        import logging as _logging
+        logger = _logging.getLogger("test_mask_secrets")
+        logger.addFilter(fn_news.mask_secrets())
+        with caplog.at_level(_logging.WARNING, logger="test_mask_secrets"):
+            logger.warning("news blackout for %s: %s", "EURUSD", "...&token=leakedsecret99 failed")
+        assert "leakedsecret99" not in caplog.text
+        assert "token=***REDACTED***" in caplog.text
+
+    def test_does_not_choke_on_non_string_args(self, caplog) -> None:
+        import logging as _logging
+        logger = _logging.getLogger("test_mask_secrets_nonstring")
+        logger.addFilter(fn_news.mask_secrets())
+        with caplog.at_level(_logging.INFO, logger="test_mask_secrets_nonstring"):
+            logger.info("count=%s", 42)  # must not raise on a non-str arg
+        assert "count=42" in caplog.text
+
+
+class TestStartupSelfTest:
+    def test_true_when_no_key_configured(self, monkeypatch) -> None:
+        # A missing key is an already-known, deliberate "fails closed every
+        # pass" state -- not what this self-test exists to catch.
+        monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+        called = []
+        assert fn_news.startup_self_test(alert_fn=lambda *a: called.append(a)) is True
+        assert called == []
+
+    def test_true_when_live_fetch_succeeds(self, monkeypatch) -> None:
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "_fetch_live_events", lambda api_key: [])
+        called = []
+        assert fn_news.startup_self_test(alert_fn=lambda *a: called.append(a)) is True
+        assert called == []
+
+    def test_false_and_alerts_when_live_fetch_fails(self, monkeypatch, caplog) -> None:
+        import logging as _logging
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(
+            fn_news, "_fetch_live_events",
+            lambda api_key: (_ for _ in ()).throw(RuntimeError("403 Forbidden ...&token=livesecret")),
+        )
+        alerts = []
+        with caplog.at_level(_logging.CRITICAL):
+            result = fn_news.startup_self_test(alert_fn=lambda subject, body: alerts.append((subject, body)))
+
+        assert result is False
+        assert len(alerts) == 1
+        assert "CRITICAL" in alerts[0][0]
+        # The token must not reach the alert email either.
+        assert "livesecret" not in alerts[0][1]
+        assert "livesecret" not in caplog.text
+
+    def test_false_when_alert_fn_itself_raises(self, monkeypatch) -> None:
+        # An alert-sending failure (e.g. SMTP down too) must not mask the
+        # real self-test failure as a crash -- still returns False cleanly.
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "_fetch_live_events", lambda api_key: (_ for _ in ()).throw(RuntimeError("down")))
+
+        def _broken_alert(subject, body):
+            raise ConnectionError("SMTP also down")
+
+        assert fn_news.startup_self_test(alert_fn=_broken_alert) is False
+
+    def test_false_with_no_alert_fn_given(self, monkeypatch) -> None:
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "_fetch_live_events", lambda api_key: (_ for _ in ()).throw(RuntimeError("down")))
+        assert fn_news.startup_self_test(alert_fn=None) is False
+
+
+class TestNewsApiStatus:
+    """D6/v5.1 (2026-10-06): feeds the committee prompt's NEWS_API_STATUS
+    field -- no extra network call, derived from the existing cache."""
+
+    def test_unavailable_when_no_key(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+        monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
+        assert fn_news.news_api_status() == "UNAVAILABLE"
+
+    def test_ok_when_cache_is_fresh_today(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        fn_news._write_cache({"fetched_date": today, "events": []})
+        assert fn_news.news_api_status() == "OK"
+
+    def test_stale_when_cache_is_from_a_prior_day(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
+        fn_news._write_cache({"fetched_date": "2020-01-01", "events": [{"time": "x", "currency": "USD",
+                                                                          "impact": "high", "event": "old"}]})
+        assert fn_news.news_api_status() == "STALE"
+
+    def test_unavailable_when_key_set_but_no_cache_at_all(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("FINNHUB_API_KEY", "abc123")
+        monkeypatch.setattr(fn_news, "CACHE_PATH", tmp_path / "cache.json")
+        assert fn_news.news_api_status() == "UNAVAILABLE"

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -335,6 +336,26 @@ class TestJournalSummaryText:
         ])
         summary = fr._journal_summary_text("EURUSDm")
         assert summary is not None and "1W/1L" in summary
+
+    def test_reversal_note_does_not_bias_toward_stop_management(self, tmp_path, monkeypatch) -> None:
+        """D5 (2026-10-06): the old wording ("a stop-management issue, not
+        an entry-quality one") biased the committee toward active stop
+        management on exactly the pattern the replay evidence (n=39) shows
+        is negative-expectancy to touch. New wording states the count
+        neutrally and points to entry/stop-sizing discipline instead."""
+        monkeypatch.setattr(fr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        fr._write_journal([
+            {"symbol": "EURUSDm", "status": "closed", "outcome": "loss", "profit": -0.5, "side": "buy",
+             "excursion_tag": "reversal"},
+            {"symbol": "EURUSDm", "status": "closed", "outcome": "win", "profit": 1.0, "side": "sell",
+             "excursion_tag": "clean"},
+        ])
+        summary = fr._journal_summary_text("EURUSDm")
+        assert summary is not None
+        assert "stop-management issue" not in summary
+        assert "1 of last 2 closed trades moved favorably before reversing" in summary
+        assert "negative-expectancy" in summary
+        assert "entry/stop-sizing discipline, not exit management" in summary
 
 
 class TestProfitProtectionCheckSilentLookupFailures:
@@ -741,6 +762,28 @@ class TestHandleFilledOrder:
         assert len(fr._read_journal()) == 1
         assert fn_state.trading_days_count() == 1
 
+    def test_research_only_fill_is_closed_and_journaled_as_violation(self, monkeypatch) -> None:
+        """D3 (2026-10-06) -- see committee_reporter.py's identical test for
+        the full rationale."""
+        journaled = []
+        spec_called = []
+        monkeypatch.setattr(fr, "_post_trade_research_only_violation",
+                             lambda *a, **k: "\n\n[CRITICAL — RESEARCH-ONLY VIOLATION, AUTO-CLOSED] ...")
+        monkeypatch.setattr(fr, "_enforce_trend_rule", lambda *a, **k: spec_called.append(1) or "")
+        monkeypatch.setattr(fr, "_post_trade_spec_check", lambda *a, **k: spec_called.append(1) or "")
+        monkeypatch.setattr(fr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSD", "side": "buy", "quantity": 0.24, "order_id": "4",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+
+        note, traded = fr._handle_filled_order(
+            self.TRADE, order, None, research_only=True, research_only_reason="[NEWS BLACKOUT] ...",
+        )
+
+        assert traded is False
+        assert "RESEARCH-ONLY VIOLATION" in note
+        assert journaled == [("EURUSD", "mt5fn-live-trade", order)]
+        assert spec_called == []
+
 
 class TestJournalAnyPlacedOrders:
     """Real incident 2026-10-05 (FundedNext GBPUSD empty_model_response),
@@ -767,7 +810,7 @@ class TestJournalAnyPlacedOrders:
         order = {"status": "ok", "ticket": "1", "symbol": "EURUSD"}
         monkeypatch.setattr(fr, "_extract_placed_orders", lambda run_id: [order])
         monkeypatch.setattr(fr, "_resolve_fill_price", lambda trade, o: 1.1234)
-        monkeypatch.setattr(fr, "_handle_filled_order", lambda trade, o, trend: ("\n\n[JOURNALED]", True))
+        monkeypatch.setattr(fr, "_handle_filled_order", lambda trade, o, trend, **kw: ("\n\n[JOURNALED]", True))
 
         notes, traded, any_placed = fr._journal_any_placed_orders(self.TRADE, "run-1", None)
 
@@ -780,7 +823,7 @@ class TestJournalAnyPlacedOrders:
         order = {"status": "ok", "ticket": "1", "symbol": "EURUSDx"}
         monkeypatch.setattr(fr, "_extract_placed_orders", lambda run_id: [order])
         monkeypatch.setattr(fr, "_resolve_fill_price", lambda trade, o: None)
-        monkeypatch.setattr(fr, "_handle_filled_order", lambda trade, o, trend: ("\n\n[SPEC VIOLATION]", False))
+        monkeypatch.setattr(fr, "_handle_filled_order", lambda trade, o, trend, **kw: ("\n\n[SPEC VIOLATION]", False))
 
         notes, traded, any_placed = fr._journal_any_placed_orders(self.TRADE, "run-1", None)
 
@@ -795,7 +838,7 @@ class TestJournalAnyPlacedOrders:
         monkeypatch.setattr(fr, "_resolve_fill_price", lambda trade, o: None)
         calls = []
 
-        def _fake_handle(trade, o, trend):
+        def _fake_handle(trade, o, trend, **kw):
             calls.append(o["ticket"])
             return f"\n\n[{o['ticket']}]", o["ticket"] == "2"
 
@@ -903,7 +946,11 @@ class TestExclusiveGroupConflict:
 
         assert note is not None and "could not read" in note
 
-    def test_run_committee_strips_trade_on_conflict(self, monkeypatch) -> None:
+    def test_run_committee_marks_research_only_on_conflict(self, monkeypatch) -> None:
+        # D3 (2026-10-06): a conflict no longer nulls `trade` out -- it stays
+        # populated (symbol/connection/lots preserved) so the research-only
+        # pass still gets the full data-pack-backed v4 prompt; research_only
+        # is what actually prevents a trade now, not a missing trade dict.
         monkeypatch.setattr(fr.fn_guard, "guardrail_check", lambda *a: None)
         monkeypatch.setattr(fr.fn_news, "is_news_blackout", lambda *a, **k: (False, ""))
         self._patch_positions(monkeypatch, {"EURUSD": {"count": 1, "side": "sell"}})
@@ -912,8 +959,10 @@ class TestExclusiveGroupConflict:
         class _Stop(Exception):
             pass
 
-        def _fake_build_prompt(committee, target, market, trade):
+        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
             seen["trade"] = trade
+            seen["research_only"] = research_only
+            seen["research_only_reason"] = research_only_reason
             raise _Stop
 
         monkeypatch.setattr(fr, "_build_prompt", _fake_build_prompt)
@@ -926,7 +975,9 @@ class TestExclusiveGroupConflict:
         except _Stop:
             pass
 
-        assert seen["trade"] is None
+        assert seen["trade"] is not None and seen["trade"]["symbol"] == "GBPUSD"
+        assert seen["research_only"] is True
+        assert "CORRELATION LIMIT" in seen["research_only_reason"]
 
     def test_targets_are_eurusd_and_gbpusd(self) -> None:
         assert [t["trade"]["symbol"] for t in fr.TARGETS] == ["EURUSD", "GBPUSD"]
@@ -1066,3 +1117,231 @@ class TestBrokerTimeToUtc:
     def test_halved_lots(self) -> None:
         lots = {t["trade"]["symbol"]: t["trade"]["lots"] for t in fr.TARGETS}
         assert lots == {"EURUSD": 0.12, "GBPUSD": 0.15}
+
+
+# ---------------------------------------------------------------------------
+# D2 (2026-10-06): no fresh data pack -> hard PASS, LLM never invoked
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPromptDataPackGate:
+    TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
+
+    def _patch_facts(self, monkeypatch) -> None:
+        monkeypatch.setattr(fr, "_symbol_position_summary", lambda s, c: {"count": 0, "side": None})
+        monkeypatch.setattr(fr, "_symbol_live_quote", lambda s, c: None)
+        for name in ("_journal_summary_text", "_session_bias_fact"):
+            monkeypatch.setattr(fr, name, lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_journal_reconcile_closed", lambda *a, **k: None, raising=False)
+        monkeypatch.setattr(fr.fn_guard, "effective_max_loss_usd", lambda c: 4.0)
+        monkeypatch.setattr(fr, "_max_stop_distance", lambda *a, **k: 0.004)
+        monkeypatch.setattr(fr, "_atr_stop_floor", lambda *a, **k: 0.001)
+        monkeypatch.setattr(fr.fn_news, "news_api_status", lambda: "OK")
+
+    def test_returns_none_when_data_pack_unavailable(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(fr.market_data_pack, "write_data_pack", lambda s, c: None)
+        assert fr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE) is None
+
+    def test_returns_a_prompt_when_data_pack_available(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(fr.market_data_pack, "write_data_pack", lambda s, c: Path("fake_pack.md"))
+        prompt = fr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE)
+        assert prompt is not None and "DATA PACK FILE" in prompt
+
+    def test_research_only_pass_is_unaffected(self, monkeypatch) -> None:
+        called = []
+        monkeypatch.setattr(fr.market_data_pack, "write_data_pack", lambda s, c: called.append(1) or None)
+        prompt = fr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", None)
+        assert prompt is not None
+        assert called == []
+
+
+class TestRunCommitteeDataPackGate:
+    TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
+
+    def _patch_pre_checks_inert(self, monkeypatch) -> None:
+        monkeypatch.setattr(fr.fn_guard, "guardrail_check", lambda *a, **k: None)
+        monkeypatch.setattr(fr, "_exclusive_group_conflict", lambda trade: None)
+        monkeypatch.setattr(fr.fn_news, "is_news_blackout", lambda *a, **k: (False, None))
+        monkeypatch.setattr(fr, "TREND_FILTER_ENABLED", False)
+
+    def test_no_llm_subprocess_spawned_when_data_pack_unavailable(self, monkeypatch) -> None:
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(fr, "_build_prompt", lambda *a, **k: None)
+        popen_calls = []
+        monkeypatch.setattr(fr.subprocess, "Popen", lambda *a, **k: popen_calls.append((a, k)) or (_ for _ in ()).throw(AssertionError("Popen must not be called")))
+
+        result = fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert popen_calls == []
+        assert result.status == "success"
+        assert result.traded is False
+        assert "DECISION: PASS" in result.report_text
+        assert "data_pack_unavailable" in result.report_text
+
+
+# ---------------------------------------------------------------------------
+# D3 (2026-10-06) -- see committee_reporter.py's identical test classes for
+# the full rationale.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPromptResearchOnly:
+    TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
+
+    def _patch_facts(self, monkeypatch) -> None:
+        monkeypatch.setattr(fr, "_symbol_position_summary", lambda s, c: {"count": 0, "side": None})
+        monkeypatch.setattr(fr, "_symbol_live_quote", lambda s, c: None)
+        for name in ("_journal_summary_text", "_session_bias_fact"):
+            monkeypatch.setattr(fr, name, lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_journal_reconcile_closed", lambda *a, **k: None, raising=False)
+        monkeypatch.setattr(fr.fn_guard, "effective_max_loss_usd", lambda c: 4.0)
+        monkeypatch.setattr(fr, "_max_stop_distance", lambda *a, **k: 0.004)
+        monkeypatch.setattr(fr, "_atr_stop_floor", lambda *a, **k: 0.001)
+        monkeypatch.setattr(fr.market_data_pack, "write_data_pack", lambda s, c: Path("fake_pack.md"))
+        monkeypatch.setattr(fr.fn_news, "news_api_status", lambda: "OK")
+
+    def test_research_only_prompt_has_mode_and_no_order_instructions(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        prompt = fr._build_prompt(
+            "fx_commodity_day_desk", "EURUSD", "forex", self.TRADE,
+            research_only=True, research_only_reason="[NEWS BLACKOUT] EURUSD unreachable.",
+        )
+        assert prompt is not None
+        assert "DATA PACK FILE" in prompt
+        assert "MODE: RESEARCH_ONLY" in prompt
+        assert "DECISION: PASS" in prompt
+        assert "trading_place_order(\n" not in prompt
+        assert "[NEWS BLACKOUT] EURUSD unreachable." in prompt
+
+    def test_live_prompt_has_mode_live_and_order_instructions(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        prompt = fr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE)
+        assert prompt is not None
+        assert "MODE: LIVE" in prompt
+        assert "trading_place_order(\n" in prompt
+
+    def test_data_pack_gate_still_applies_in_research_only_mode(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(fr.market_data_pack, "write_data_pack", lambda s, c: None)
+        assert fr._build_prompt(
+            "fx_commodity_day_desk", "EURUSD", "forex", self.TRADE, research_only=True,
+        ) is None
+
+    def test_prompt_carries_v51_schema_fields_and_rules(self, monkeypatch) -> None:
+        """D6/v5.1 (2026-10-06) -- see committee_reporter.py's identical
+        test for the full rationale."""
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(fr.fn_news, "news_api_status", lambda: "STALE")
+        prompt = fr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE)
+        assert prompt is not None
+        assert "DATA_MISSING:" in prompt
+        assert "NEWS_API_STATUS:" in prompt
+        assert "INPUT_PROVENANCE:" in prompt
+        assert "NEWS_API_STATUS verified fact: STALE." in prompt
+        assert "INPUT PROVENANCE verified facts" in prompt
+        assert "PASS is a successful outcome" in prompt
+
+
+class TestRunCommitteePreChecksPreserveTrade:
+    TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
+
+    def test_guardrail_trip_keeps_trade_and_sets_research_only(self, monkeypatch) -> None:
+        monkeypatch.setattr(fr.fn_guard, "guardrail_check", lambda *a, **k: "[FUNDEDNEXT DAILY LOSS STOP] ...")
+        seen = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
+            seen["trade"] = trade
+            seen["research_only"] = research_only
+            seen["research_only_reason"] = research_only_reason
+            raise _Stop
+
+        monkeypatch.setattr(fr, "_build_prompt", _fake_build_prompt)
+
+        try:
+            fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        except _Stop:
+            pass
+
+        assert seen["trade"] is not None and seen["trade"]["symbol"] == "EURUSD"
+        assert seen["research_only"] is True
+        assert "FUNDEDNEXT DAILY LOSS STOP" in seen["research_only_reason"]
+
+
+# ---------------------------------------------------------------------------
+# D4 (2026-10-06) -- see committee_reporter.py's identical test class for
+# the full rationale, including the deliberate "a real fill is always
+# journaled even if the report is rejected" interpretation.
+# ---------------------------------------------------------------------------
+
+
+class _FakePopen:
+    def __init__(self, stdout: str, returncode: int = 0) -> None:
+        self._stdout = stdout
+        self.returncode = returncode
+        self.pid = 12345
+
+    def communicate(self, timeout=None):
+        return self._stdout, ""
+
+
+class TestRunCommitteeMalformedOutputGate:
+    TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
+    VALID_REPORT = (
+        "DECISION: PASS\nCONFIDENCE: 50\nMODE: LIVE\nDATA_MISSING: none\nNEWS_API_STATUS: OK\n"
+        "EDGE: none\nCHECKLIST: n/a\n"
+        "ORDER: none\nINVALIDATION: n/a\nINPUT_PROVENANCE: mt5fn-live-trade, quote 12:00:00 UTC, pack 12:00:00 UTC\n"
+        "PROPOSAL: none\nREASON FOR PASS: no setup qualified"
+    )
+
+    def _patch_run(self, monkeypatch, *, report_text: str, placed_orders: list | None = None) -> None:
+        import json as _json
+        monkeypatch.setattr(fr.fn_guard, "guardrail_check", lambda *a, **k: None)
+        monkeypatch.setattr(fr, "_exclusive_group_conflict", lambda trade: None)
+        monkeypatch.setattr(fr.fn_news, "is_news_blackout", lambda *a, **k: (False, None))
+        monkeypatch.setattr(fr, "TREND_FILTER_ENABLED", False)
+        monkeypatch.setattr(fr, "_build_prompt", lambda *a, **k: "fake prompt")
+        payload = _json.dumps({"status": "success", "run_id": "fake-run-1"})
+        monkeypatch.setattr(fr.subprocess, "Popen", lambda *a, **k: _FakePopen(payload))
+        monkeypatch.setattr(fr, "_read_final_answer", lambda run_id: report_text)
+        monkeypatch.setattr(fr, "_extract_placed_orders", lambda run_id: placed_orders or [])
+        monkeypatch.setattr(fr, "_blocked_order_note", lambda run_id: None)
+
+    def test_valid_output_is_accepted(self, monkeypatch) -> None:
+        self._patch_run(monkeypatch, report_text=self.VALID_REPORT)
+        result = fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        assert result.status == "success"
+
+    def test_missing_field_is_rejected(self, monkeypatch) -> None:
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")
+        self._patch_run(monkeypatch, report_text=broken)
+        result = fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        assert result.status == "error"
+        assert "MALFORMED_OUTPUT" in result.error
+        assert "MODE" in result.error
+
+    def test_rejection_with_a_real_fill_still_journals_it(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(fr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        monkeypatch.setattr(fn_state, "STATE_PATH", tmp_path / "state.json")
+        order = {"status": "ok", "ticket": "1", "symbol": "EURUSD", "side": "buy", "quantity": 0.24,
+                 "order_id": "1", "stop_loss": 1.1, "take_profit": 1.2, "order_type": "market"}
+        monkeypatch.setattr(fr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(fr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_resolve_fill_price", lambda trade, o: None)
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")
+        self._patch_run(monkeypatch, report_text=broken, placed_orders=[order])
+
+        result = fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert result.status == "error"
+        assert result.traded is True
+        assert len(fr._read_journal()) == 1

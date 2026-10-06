@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -398,6 +399,48 @@ class TestJournalReadWrite:
         monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", path)
         cr._write_journal([{"ticket": "1"}])
         assert path.exists()
+
+
+# ---------------------------------------------------------------------------
+# _journal_summary_text
+# ---------------------------------------------------------------------------
+
+
+class TestJournalSummaryText:
+    def test_none_when_no_closed_trades(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        cr._write_journal([{"symbol": "EURUSDm", "status": "open"}])
+        assert cr._journal_summary_text("EURUSDm") is None
+
+    def test_reversal_note_does_not_bias_toward_stop_management(self, tmp_path, monkeypatch) -> None:
+        """D5 (2026-10-06): the old wording ("a stop-management issue, not
+        an entry-quality one") biased the committee toward active stop
+        management on exactly the pattern the replay evidence (n=39) shows
+        is negative-expectancy to touch. New wording states the count
+        neutrally and points to entry/stop-sizing discipline instead."""
+        monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        cr._write_journal([
+            {"symbol": "EURUSDm", "status": "closed", "outcome": "loss", "profit": -0.5, "side": "buy",
+             "excursion_tag": "reversal"},
+            {"symbol": "EURUSDm", "status": "closed", "outcome": "win", "profit": 1.0, "side": "sell",
+             "excursion_tag": "clean"},
+        ])
+        summary = cr._journal_summary_text("EURUSDm")
+        assert summary is not None
+        assert "stop-management issue" not in summary
+        assert "1 of last 2 closed trades moved favorably before reversing" in summary
+        assert "negative-expectancy" in summary
+        assert "entry/stop-sizing discipline, not exit management" in summary
+
+    def test_no_reversal_note_when_no_reversals(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        cr._write_journal([
+            {"symbol": "EURUSDm", "status": "closed", "outcome": "win", "profit": 1.0, "side": "buy",
+             "excursion_tag": "clean"},
+        ])
+        summary = cr._journal_summary_text("EURUSDm")
+        assert summary is not None
+        assert "moved favorably before reversing" not in summary
 
 
 # ---------------------------------------------------------------------------
@@ -1984,6 +2027,32 @@ class TestHandleFilledOrder:
         assert journaled == [("EURUSDm", "mt5-live-trade", order)]
         assert order["trend_alignment"] == "with"
 
+    def test_research_only_fill_is_closed_and_journaled_as_violation(self, monkeypatch) -> None:
+        """D3 (2026-10-06): a research-only pass's prompt never offers
+        trading_place_order, but the tool is still technically reachable. If
+        it fires anyway, this is the code-level backstop -- close it, trip
+        the kill switch, journal it as a violation (not a trade), and this
+        takes priority over the normal spec/trend checks, not alongside
+        them (they're never even called)."""
+        journaled = []
+        spec_called = []
+        monkeypatch.setattr(cr, "_post_trade_research_only_violation",
+                             lambda *a, **k: "\n\n[CRITICAL — RESEARCH-ONLY VIOLATION, AUTO-CLOSED] ...")
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: spec_called.append(1) or "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: spec_called.append(1) or "")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDm", "side": "buy", "quantity": 0.01, "order_id": "4",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+
+        note, traded = cr._handle_filled_order(
+            self.TRADE, order, None, research_only=True, research_only_reason="[NEWS BLACKOUT] ...",
+        )
+
+        assert traded is False
+        assert "RESEARCH-ONLY VIOLATION" in note
+        assert journaled == [("EURUSDm", "mt5-live-trade", order)]
+        assert spec_called == []  # normal spec/trend checks never run for a research-only violation
+
 
 class TestJournalAnyPlacedOrders:
     """Real incident 2026-10-05 (FundedNext GBPUSD empty_model_response),
@@ -2022,7 +2091,7 @@ class TestJournalAnyPlacedOrders:
         order = {"status": "ok", "ticket": "1", "symbol": "EURUSDm"}
         monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: [order])
         monkeypatch.setattr(cr, "_resolve_fill_price", lambda trade, o: 1.1234)
-        monkeypatch.setattr(cr, "_handle_filled_order", lambda trade, o, trend: ("\n\n[JOURNALED]", True))
+        monkeypatch.setattr(cr, "_handle_filled_order", lambda trade, o, trend, **kw: ("\n\n[JOURNALED]", True))
 
         notes, traded, any_placed = cr._journal_any_placed_orders(self.TRADE, "run-1", None)
 
@@ -2039,7 +2108,7 @@ class TestJournalAnyPlacedOrders:
         order = {"status": "ok", "ticket": "1", "symbol": "EURUSDcm"}
         monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: [order])
         monkeypatch.setattr(cr, "_resolve_fill_price", lambda trade, o: None)
-        monkeypatch.setattr(cr, "_handle_filled_order", lambda trade, o, trend: ("\n\n[SPEC VIOLATION]", False))
+        monkeypatch.setattr(cr, "_handle_filled_order", lambda trade, o, trend, **kw: ("\n\n[SPEC VIOLATION]", False))
 
         notes, traded, any_placed = cr._journal_any_placed_orders(self.TRADE, "run-1", None)
 
@@ -2054,7 +2123,7 @@ class TestJournalAnyPlacedOrders:
         monkeypatch.setattr(cr, "_resolve_fill_price", lambda trade, o: None)
         calls = []
 
-        def _fake_handle(trade, o, trend):
+        def _fake_handle(trade, o, trend, **kw):
             calls.append(o["ticket"])
             return f"\n\n[{o['ticket']}]", o["ticket"] == "2"
 
@@ -2259,3 +2328,260 @@ class TestWeekendFlattenTiming:
         cr._weekend_flatten_and_notify()
 
         assert len(sent) == 2 and all("Closed BUY" in text for text in sent)
+
+
+# ---------------------------------------------------------------------------
+# D2 (2026-10-06): no fresh data pack -> hard PASS, LLM never invoked
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPromptDataPackGate:
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def _patch_facts(self, monkeypatch) -> None:
+        """Everything _build_prompt's trade branch reads, stubbed inert --
+        only market_data_pack.write_data_pack's return value matters here."""
+        monkeypatch.setattr(cr, "_symbol_position_summary", lambda s, c: {"count": 0, "side": None})
+        monkeypatch.setattr(cr, "_symbol_live_quote", lambda s, c: None)
+        for name in ("_signal_service_activity", "_journal_summary_text", "_session_bias_fact"):
+            monkeypatch.setattr(cr, name, lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_journal_reconcile_closed", lambda *a, **k: None, raising=False)
+        monkeypatch.setattr(cr, "_effective_max_loss_usd", lambda c: 4.0)
+        monkeypatch.setattr(cr, "_max_stop_distance", lambda *a, **k: 0.004)
+        monkeypatch.setattr(cr, "_atr_stop_floor", lambda *a, **k: 0.001)
+        # v5.1 (D6): isolate from this machine's real FINNHUB_API_KEY/cache --
+        # news_api_status() makes no network call but does read real state.
+        monkeypatch.setattr(cr.fn_news, "news_api_status", lambda: "OK")
+
+    def test_returns_none_when_data_pack_unavailable(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: None)
+        assert cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE) is None
+
+    def test_returns_a_prompt_when_data_pack_available(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: Path("fake_pack.md"))
+        prompt = cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE)
+        assert prompt is not None and "DATA PACK FILE" in prompt
+
+    def test_research_only_pass_is_unaffected(self, monkeypatch) -> None:
+        # trade=None never reaches the data-pack gate at all (D3's job, not
+        # D2's) -- write_data_pack must not even be called.
+        called = []
+        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: called.append(1) or None)
+        prompt = cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", None)
+        assert prompt is not None
+        assert called == []
+
+
+class TestRunCommitteeDataPackGate:
+    """The actual deliverable: no fresh data pack -> the LLM subprocess is
+    never spawned at all, and the pass is recorded as a PASS with reason
+    data_pack_unavailable, not an error."""
+
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def _patch_pre_checks_inert(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_live_circuit_breaker_check", lambda trade: None)
+        monkeypatch.setattr(cr, "_exclusive_group_conflict", lambda trade: None)
+        monkeypatch.setattr(cr.fn_news, "is_news_blackout", lambda *a, **k: (False, None))
+        monkeypatch.setattr(cr, "TREND_FILTER_ENABLED", False)
+
+    def test_no_llm_subprocess_spawned_when_data_pack_unavailable(self, monkeypatch) -> None:
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(cr, "_build_prompt", lambda *a, **k: None)
+        popen_calls = []
+        monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: popen_calls.append((a, k)) or (_ for _ in ()).throw(AssertionError("Popen must not be called")))
+
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert popen_calls == []
+        assert result.status == "success"
+        assert result.traded is False
+        assert "DECISION: PASS" in result.report_text
+        assert "data_pack_unavailable" in result.report_text
+
+
+# ---------------------------------------------------------------------------
+# D3 (2026-10-06): research-only passes get the v4 schema + data pack,
+# trading_place_order is never offered, and `trade` is no longer nulled out
+# by a pre-check trip (research_only is its own flag now).
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPromptResearchOnly:
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def _patch_facts(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_symbol_position_summary", lambda s, c: {"count": 0, "side": None})
+        monkeypatch.setattr(cr, "_symbol_live_quote", lambda s, c: None)
+        for name in ("_signal_service_activity", "_journal_summary_text", "_session_bias_fact"):
+            monkeypatch.setattr(cr, name, lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_journal_reconcile_closed", lambda *a, **k: None, raising=False)
+        monkeypatch.setattr(cr, "_effective_max_loss_usd", lambda c: 4.0)
+        monkeypatch.setattr(cr, "_max_stop_distance", lambda *a, **k: 0.004)
+        monkeypatch.setattr(cr, "_atr_stop_floor", lambda *a, **k: 0.001)
+        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: Path("fake_pack.md"))
+        monkeypatch.setattr(cr.fn_news, "news_api_status", lambda: "OK")
+
+    def test_research_only_prompt_has_mode_and_no_order_instructions(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        prompt = cr._build_prompt(
+            "fx_commodity_day_desk", "EURUSD", "forex", self.TRADE,
+            research_only=True, research_only_reason="[NEWS BLACKOUT] EURUSD unreachable.",
+        )
+        assert prompt is not None
+        assert "DATA PACK FILE" in prompt  # still gets the data pack, unlike the old no-trade path
+        assert "MODE: RESEARCH_ONLY" in prompt
+        assert "DECISION: PASS" in prompt
+        assert "trading_place_order(\n" not in prompt  # the order-call template is never offered
+        assert "[NEWS BLACKOUT] EURUSD unreachable." in prompt
+
+    def test_live_prompt_has_mode_live_and_order_instructions(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        prompt = cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE)
+        assert prompt is not None
+        assert "MODE: LIVE" in prompt
+        assert "trading_place_order(\n" in prompt
+
+    def test_data_pack_gate_still_applies_in_research_only_mode(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: None)
+        assert cr._build_prompt(
+            "fx_commodity_day_desk", "EURUSD", "forex", self.TRADE, research_only=True,
+        ) is None
+
+    def test_prompt_carries_v51_schema_fields_and_rules(self, monkeypatch) -> None:
+        """D6/v5.1 (2026-10-06): DATA_MISSING/NEWS_API_STATUS/INPUT_PROVENANCE
+        fields, the verified NEWS_API_STATUS fact echoed from fn_news (not
+        asked of the LLM), and the "PASS is a success" framing rule."""
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(cr.fn_news, "news_api_status", lambda: "STALE")
+        prompt = cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE)
+        assert prompt is not None
+        assert "DATA_MISSING:" in prompt
+        assert "NEWS_API_STATUS:" in prompt
+        assert "INPUT_PROVENANCE:" in prompt
+        assert "NEWS_API_STATUS verified fact: STALE." in prompt
+        assert "INPUT PROVENANCE verified facts" in prompt
+        assert "PASS is a successful outcome" in prompt
+
+
+class TestRunCommitteePreChecksPreserveTrade:
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def test_circuit_breaker_trip_keeps_trade_and_sets_research_only(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_live_circuit_breaker_check", lambda trade: "[LIVE CIRCUIT BREAKER] ...")
+        seen = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
+            seen["trade"] = trade
+            seen["research_only"] = research_only
+            seen["research_only_reason"] = research_only_reason
+            raise _Stop
+
+        monkeypatch.setattr(cr, "_build_prompt", _fake_build_prompt)
+
+        try:
+            cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        except _Stop:
+            pass
+
+        assert seen["trade"] is not None and seen["trade"]["symbol"] == "EURUSDm"
+        assert seen["research_only"] is True
+        assert "LIVE CIRCUIT BREAKER" in seen["research_only_reason"]
+
+
+# ---------------------------------------------------------------------------
+# D4 (2026-10-06): malformed committee output (missing a required field) is
+# rejected as status="error" rather than trusted as a clean decision record.
+# ---------------------------------------------------------------------------
+
+
+class _FakePopen:
+    """Minimal stand-in for subprocess.Popen: communicate() returns a canned
+    (stdout, stderr), matching what run_committee reads via _last_json_line."""
+
+    def __init__(self, stdout: str, returncode: int = 0) -> None:
+        self._stdout = stdout
+        self.returncode = returncode
+        self.pid = 12345
+
+    def communicate(self, timeout=None):
+        return self._stdout, ""
+
+
+class TestRunCommitteeMalformedOutputGate:
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+    VALID_REPORT = (
+        "DECISION: PASS\nCONFIDENCE: 50\nMODE: LIVE\nDATA_MISSING: none\nNEWS_API_STATUS: OK\n"
+        "EDGE: none\nCHECKLIST: n/a\n"
+        "ORDER: none\nINVALIDATION: n/a\nINPUT_PROVENANCE: mt5-live-trade, quote 12:00:00 UTC, pack 12:00:00 UTC\n"
+        "PROPOSAL: none\nREASON FOR PASS: no setup qualified"
+    )
+
+    def _patch_run(self, monkeypatch, *, report_text: str, placed_orders: list | None = None) -> None:
+        import json as _json
+        monkeypatch.setattr(cr, "_live_circuit_breaker_check", lambda trade: None)
+        monkeypatch.setattr(cr, "_exclusive_group_conflict", lambda trade: None)
+        monkeypatch.setattr(cr.fn_news, "is_news_blackout", lambda *a, **k: (False, None))
+        monkeypatch.setattr(cr, "TREND_FILTER_ENABLED", False)
+        monkeypatch.setattr(cr, "_build_prompt", lambda *a, **k: "fake prompt")
+        payload = _json.dumps({"status": "success", "run_id": "fake-run-1"})
+        monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: _FakePopen(payload))
+        monkeypatch.setattr(cr, "_read_final_answer", lambda run_id: report_text)
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: placed_orders or [])
+        monkeypatch.setattr(cr, "_blocked_order_note", lambda run_id: None)
+
+    def test_valid_output_is_accepted(self, monkeypatch) -> None:
+        self._patch_run(monkeypatch, report_text=self.VALID_REPORT)
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        assert result.status == "success"
+
+    def test_missing_field_is_rejected(self, monkeypatch) -> None:
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")  # drop a required field
+        self._patch_run(monkeypatch, report_text=broken)
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        assert result.status == "error"
+        assert "MALFORMED_OUTPUT" in result.error
+        assert "MODE" in result.error
+
+    def test_rejection_with_no_order_placed_journals_nothing(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")
+        self._patch_run(monkeypatch, report_text=broken, placed_orders=[])
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        assert result.status == "error"
+        assert result.traded is False
+        assert cr._read_journal() == []
+
+    def test_rejection_with_a_real_fill_still_journals_it(self, monkeypatch, tmp_path) -> None:
+        """Deliberate: a malformed REPORT still gets rejected as a decision
+        record, but a REAL fill is never dropped because of it -- same
+        principle as the empty_model_response fix (D3/the 2026-10-05
+        incident). Flagged for the user: this is a chosen interpretation of
+        D4's "do NOT write to journal," not a literal block-everything
+        reading, since the latter would reopen the exact gap D3 just closed."""
+        monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        order = {"status": "ok", "ticket": "1", "symbol": "EURUSDm", "side": "buy", "quantity": 0.01,
+                 "order_id": "1", "stop_loss": 1.1, "take_profit": 1.2, "order_type": "market"}
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(cr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_resolve_fill_price", lambda trade, o: None)
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")
+        self._patch_run(monkeypatch, report_text=broken, placed_orders=[order])
+
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert result.status == "error"  # the report itself is still rejected
+        assert "MALFORMED_OUTPUT" in result.error
+        assert result.traded is True  # but the real fill is not lost
+        assert len(cr._read_journal()) == 1

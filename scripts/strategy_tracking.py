@@ -80,6 +80,35 @@ _DECISION_RES = (
     re.compile(r"^\|\W*Side\W*\|\s*([^|]+)\|", re.MULTILINE | re.IGNORECASE),
 )
 
+# D4 (2026-10-06, extended for v5.1 in D6 2026-10-06): the required fields
+# of the v5.1 structured output format both reporters' _REPORT_FORMAT_TRADE
+# / _REPORT_FORMAT_RESEARCH_ONLY emit (committee_reporter.py /
+# fundednext_reporter.py). "REASON FOR PASS" keeps its literal spaces --
+# these are matched against the label exactly as the prompt asks the LLM to
+# print it, not a normalized/underscored name.
+REQUIRED_COMMITTEE_FIELDS = (
+    "DECISION", "CONFIDENCE", "MODE", "DATA_MISSING", "NEWS_API_STATUS", "EDGE", "CHECKLIST", "ORDER",
+    "INVALIDATION", "INPUT_PROVENANCE", "PROPOSAL", "REASON FOR PASS",
+)
+
+
+def validate_committee_fields(report_text: str) -> list[str]:
+    """Return the REQUIRED_COMMITTEE_FIELDS labels missing from report_text
+    (each must appear as "<LABEL>:" at the start of a line). Empty list
+    means every required field is present.
+
+    Deliberately checks presence only, not content -- a field with a junk
+    value ("EDGE: idk") is the committee's own problem to answer honestly,
+    not something code can validate; this exists to catch the LLM dropping
+    a field entirely, which the email/journal pipeline has never been able
+    to detect before this (see run_committee's MALFORMED_OUTPUT handling).
+    """
+    missing = []
+    for field in REQUIRED_COMMITTEE_FIELDS:
+        if not re.search(rf"^{re.escape(field)}:", report_text or "", re.MULTILINE):
+            missing.append(field)
+    return missing
+
 
 # --------------------------------------------------------------------------- #
 # Decision parsing / logging
