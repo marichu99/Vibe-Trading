@@ -94,8 +94,19 @@ REQUIRED_COMMITTEE_FIELDS = (
 
 def validate_committee_fields(report_text: str) -> list[str]:
     """Return the REQUIRED_COMMITTEE_FIELDS labels missing from report_text
-    (each must appear as "<LABEL>:" at the start of a line). Empty list
-    means every required field is present.
+    (each must appear as "<LABEL>:" at the start of a line, tolerating a
+    markdown-bold/punctuation wrapper like "**DECISION:**" -- same \\W*
+    prefix tolerance _DECISION_RES already uses above). Empty list means
+    every required field is present.
+
+    Real incident 2026-10-07: a live report had all 12 fields present and
+    correctly filled in, each one wrapped as "**FIELD: value**" -- the
+    original bare `^{field}:` anchor doesn't match through the leading
+    "**", so every field registered as missing despite the report being
+    entirely well-formed, needlessly tripping run_committee's
+    MALFORMED_OUTPUT path. \\W* matches only punctuation/whitespace, never
+    a digit or letter, so a numbered checklist line like "5. Reward:Risk
+    ..." still can't false-match a field label.
 
     Deliberately checks presence only, not content -- a field with a junk
     value ("EDGE: idk") is the committee's own problem to answer honestly,
@@ -105,7 +116,7 @@ def validate_committee_fields(report_text: str) -> list[str]:
     """
     missing = []
     for field in REQUIRED_COMMITTEE_FIELDS:
-        if not re.search(rf"^{re.escape(field)}:", report_text or "", re.MULTILINE):
+        if not re.search(rf"^\W*{re.escape(field)}:", report_text or "", re.MULTILINE):
             missing.append(field)
     return missing
 

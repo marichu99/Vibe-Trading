@@ -75,6 +75,25 @@ class TestValidateCommitteeFields:
         text = "Some prose that mentions MODE: in passing, not as a real field.\n" + self.VALID_TRADE.replace("MODE: LIVE\n", "")
         assert "MODE" in st.validate_committee_fields(text)
 
+    def test_markdown_bold_wrapped_fields_are_recognized(self) -> None:
+        # Real incident 2026-10-07: a live report had every field correct
+        # and complete but wrapped as "**FIELD: value**" -- the bare ^field:
+        # anchor didn't match through the leading "**", so all 12 fields
+        # registered as missing despite a well-formed report.
+        text = "\n".join(f"**{line}**" for line in self.VALID_TRADE.split("\n"))
+        assert st.validate_committee_fields(text) == []
+
+    def test_numbered_checklist_line_does_not_false_match_a_field(self) -> None:
+        # \W* tolerates punctuation/whitespace prefixes, never a digit --
+        # a checklist line like "5. Reward:Risk 0.91:1" must not satisfy
+        # any real field's presence check.
+        text = self.VALID_TRADE.replace("CHECKLIST: 1. yes 2. yes", "CHECKLIST:\n5. Reward:Risk 0.91:1 below floor")
+        assert st.validate_committee_fields(text) == []
+        # And with CHECKLIST itself genuinely missing, the numbered line
+        # must not be mistaken for it.
+        text_missing = text.replace("CHECKLIST:\n5. Reward:Risk 0.91:1 below floor\n", "5. Reward:Risk 0.91:1 below floor\n")
+        assert "CHECKLIST" in st.validate_committee_fields(text_missing)
+
 
 class TestTrendRulePrompt:
     def test_names_the_forbidden_direction(self) -> None:
