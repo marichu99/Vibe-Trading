@@ -1244,9 +1244,12 @@ _REPORT_FORMAT_TRADE = (
     # stay plain stop+target either way -- that's locked in the preset's own
     # prompt and in STOP_TRAILING_ENABLED, not something this report format
     # needs to restate per trade.
-    "Finally, report in exactly this structure (plain text, these labels verbatim, in this order; max 40 "
-    "lines total -- if the head trader's own answer would exceed that, or stated confidence below 60, or "
-    "left any checklist item unclear, DECISION must be PASS regardless of what was otherwise concluded):\n"
+    "Finally: your ENTIRE final answer must consist of ONLY the labeled lines below -- plain text, these "
+    "labels verbatim, in this order, nothing before or after them. Do NOT use markdown headers (##/###), "
+    "tables, horizontal rules (---), emoji, bullet-point prose, or a narrative write-up of the debate -- "
+    "every fact that matters belongs inside one of these lines, not around them. Max 40 lines total -- if "
+    "the head trader's own answer would exceed that, or stated confidence below 60, or left any checklist "
+    "item unclear, DECISION must be PASS regardless of what was otherwise concluded:\n"
     "DECISION: <LONG / SHORT / PASS>\n"
     "CONFIDENCE: <0-100>\n"
     "MODE: LIVE\n"
@@ -1271,8 +1274,10 @@ _REPORT_FORMAT_TRADE = (
 # DATA_MISSING/NEWS_API_STATUS/INPUT_PROVENANCE added D6 2026-10-06, same as
 # the LIVE format.
 _REPORT_FORMAT_RESEARCH_ONLY = (
-    "Finally, report in exactly this structure (plain text, these labels verbatim, in this order; max 40 "
-    "lines total):\n"
+    "Finally: your ENTIRE final answer must consist of ONLY the labeled lines below -- plain text, these "
+    "labels verbatim, in this order, nothing before or after them. Do NOT use markdown headers (##/###), "
+    "tables, horizontal rules (---), emoji, bullet-point prose, or a narrative write-up of the debate -- "
+    "every fact that matters belongs inside one of these lines, not around them. Max 40 lines total:\n"
     "DECISION: PASS\n"
     "CONFIDENCE: <0-100 -- the debate's own confidence, had this been a live pass>\n"
     "MODE: RESEARCH_ONLY\n"
