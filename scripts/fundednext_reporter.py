@@ -2876,6 +2876,78 @@ def _challenge_progress_lines(account: dict) -> list[str]:
     return lines
 
 
+def _challenge_progress_html(account: dict) -> str:
+    """HTML counterpart to _challenge_progress_lines -- same underlying
+    reads, rendered as a badges/table section matching the styled account
+    block in _status_report_html, instead of plain indented lines."""
+    parts = ['<h3 style="margin:16px 0 4px;font-size:14px;">FundedNext challenge progress</h3>']
+    state = fn_state.get_state()
+    initial = state.get("initial_balance_usd")
+    if not initial:
+        parts.append('<p style="margin:2px 0;color:#555;">Not yet initialized (no pass has run against the live account yet).</p>')
+        return "".join(parts)
+    initial = float(initial)
+    target_pct = fn_state.CHALLENGE_TARGET_PCT
+    passed_date = state.get("passed_date")
+    status_note = f"passed as of {passed_date}" if passed_date else f"target {target_pct:.0f}%"
+    parts.append(
+        '<table style="border-collapse:collapse;font-size:13px;">'
+        f'<tr><td style="padding:2px 12px 2px 0;color:#555;">Start date</td><td><strong>{_esc(state.get("challenge_start_date", "?"))}</strong></td></tr>'
+        f'<tr><td style="padding:2px 12px 2px 0;color:#555;">Initial balance</td><td><strong>${initial:.2f}</strong></td></tr>'
+        f'<tr><td style="padding:2px 12px 2px 0;color:#555;">Status</td><td><strong>{_esc(status_note)}</strong></td></tr>'
+        "</table>"
+    )
+    try:
+        balance = float(account.get("balance") or 0)
+        progress = fn_state.progress_pct(balance)
+        if progress is not None:
+            progress_color = "#2e7d32" if progress >= 0 else "#c62828"
+            parts.append(
+                f'<p style="margin:6px 0 2px;">Progress: <strong style="color:{progress_color};">{progress:+.2f}%</strong> '
+                f'toward the {target_pct:.0f}% target (balance ${balance:.2f})</p>'
+            )
+    except Exception as exc:
+        parts.append(f'<p style="color:#c62828;margin:2px 0;">could not compute progress: {_esc(exc)}</p>')
+
+    days = fn_state.trading_days_count()
+    days_color = "#2e7d32" if days >= fn_state.MIN_TRADING_DAYS else "#555"
+    parts.append(
+        f'<p style="margin:2px 0;color:{days_color};">Trading days logged: '
+        f'<strong>{days}/{fn_state.MIN_TRADING_DAYS}</strong> minimum (non-consecutive OK)</p>'
+    )
+
+    try:
+        baseline = fn_guard._read_daily_baseline()
+        today = fn_state.server_today()
+        if baseline.get("date") == today and baseline.get("equity"):
+            baseline_equity = float(baseline["equity"])
+            equity = float(account.get("equity") or 0)
+            drawdown = (baseline_equity - equity) / baseline_equity if baseline_equity > 0 else 0
+            room = fn_guard.DAILY_LOSS_HALT_PCT - drawdown
+            dd_color = "#c62828" if drawdown >= fn_guard.DAILY_LOSS_HALT_PCT * 0.5 else "#555"
+            parts.append(
+                f'<p style="margin:2px 0;color:{dd_color};">Today\'s drawdown: <strong>{drawdown:.1%}</strong> '
+                f'(self-imposed halt at {fn_guard.DAILY_LOSS_HALT_PCT:.0%}, room remaining {room:.1%})</p>'
+            )
+        else:
+            parts.append('<p style="margin:2px 0;color:#555;">Today\'s drawdown: no baseline recorded yet this server-day</p>')
+    except Exception as exc:
+        parts.append(f'<p style="color:#c62828;margin:2px 0;">could not compute today\'s drawdown: {_esc(exc)}</p>')
+
+    try:
+        static_dd = (initial - float(account.get("equity") or initial)) / initial if initial > 0 else 0
+        static_room = fn_guard.MAX_DRAWDOWN_HALT_PCT - static_dd
+        static_color = "#c62828" if static_dd >= fn_guard.MAX_DRAWDOWN_HALT_PCT * 0.5 else "#555"
+        parts.append(
+            f'<p style="margin:2px 0;color:{static_color};">Life-of-challenge drawdown: <strong>{static_dd:.1%}</strong> '
+            f'(self-imposed halt at {fn_guard.MAX_DRAWDOWN_HALT_PCT:.0%}, room remaining {static_room:.1%})</p>'
+        )
+    except Exception as exc:
+        parts.append(f'<p style="color:#c62828;margin:2px 0;">could not compute life-of-challenge drawdown: {_esc(exc)}</p>')
+
+    return "".join(parts)
+
+
 def _build_status_report() -> str:
     lines: list[str] = ["=== FundedNext fundednext_reporter status ==="]
     running, pid = _status_lock_state()
@@ -2968,18 +3040,153 @@ def _status_header() -> str:
         return ""
 
 
-def _status_header_html() -> str:
-    """Plain-text status wrapped in a <pre> block for the HTML email — the
-    Exness reporter builds a fully separate styled HTML status section;
-    given this account's status report is already compact, reusing the text
-    version here avoids duplicating _challenge_progress_lines et al. in two
-    parallel renderings for a low marginal benefit."""
-    try:
-        text = _build_status_report()
-        return (
-            f'<div style="{_EMAIL_FONT}font-size:13px;color:#222;white-space:pre-wrap;">{_esc(text)}</div>'
-            '<hr style="border:none;border-top:2px solid #ccc;margin:16px 0;">'
+def _status_report_html() -> str:
+    """HTML rendering of the same data _build_status_report() presents as
+    text -- badges/tables/color instead of plain lines, matching
+    committee_reporter.py's styled status section (2026-10-08, at the
+    user's request: this used to reuse the plain-text report wrapped in a
+    <pre> block, which looked visibly plainer than the Exness email).
+    Fails open per-section, same as the text version."""
+    running, pid = _status_lock_state()
+    loop_color = "#2e7d32" if running else "#c62828"
+    loop_text = f"RUNNING (pid {pid})" if running else "NOT RUNNING" + (f" (stale lock, pid {pid})" if pid else "")
+    parts = [
+        f'<div style="{_EMAIL_FONT}font-size:14px;color:#222;">',
+        '<h2 style="margin:0 0 8px;font-size:16px;">FundedNext Status</h2>',
+        f'<p style="margin:2px 0;"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;'
+        f'background:{loop_color};margin-right:6px;"></span>Loop: <strong>{_esc(loop_text)}</strong></p>',
+    ]
+
+    log = _status_log_summary()
+    if log.get("last_result_ts"):
+        tag = log["last_result_tag"]
+        # D16: tag may be "OK, NORMAL" (regime suffix) -- look up color by
+        # the base tag only, so a known status still gets its color.
+        tag_color = _TAG_COLORS.get(tag.split(",", 1)[0], "#555555")
+        parts.append(
+            f'<p style="margin:2px 0;">Last pass: {_esc(log["last_result_ts"])} &rarr; {_esc(log["last_result_desc"])} '
+            f'(<span style="color:{tag_color};font-weight:bold;">{_esc(tag)}</span>)</p>'
         )
+    elif log.get("last_start_ts"):
+        parts.append(f'<p style="margin:2px 0;">Last pass started: {_esc(log["last_start_ts"])} (in progress)</p>')
+    else:
+        parts.append('<p style="margin:2px 0;color:#555;">Last pass: no fundednext_reporter.log data found</p>')
+    parts.append(f'<p style="margin:2px 0;">Next pass due: ~{_esc(_next_pass_due_text(datetime.now(timezone.utc)))}</p>')
+
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.live.halt import halt_flag_set
+    from src.trading.service import get_account, get_open_orders, get_positions
+
+    seen_connections: set[str] = set()
+    for spec in TARGETS:
+        trade = spec.get("trade")
+        if not trade or trade["connection"] in seen_connections:
+            continue
+        seen_connections.add(trade["connection"])
+        connection = trade["connection"]
+        parts.append(f'<h3 style="margin:16px 0 4px;font-size:14px;">Account: {_esc(connection)}</h3>')
+        try:
+            account = get_account(connection)["account"]
+        except Exception as exc:
+            parts.append(f'<p style="color:#c62828;margin:2px 0;">could not read account: {_esc(exc)}</p>')
+            continue
+        parts.append(
+            '<table style="border-collapse:collapse;font-size:13px;">'
+            f'<tr><td style="padding:2px 12px 2px 0;color:#555;">Balance</td><td><strong>{_esc(account.get("balance"))}</strong></td></tr>'
+            f'<tr><td style="padding:2px 12px 2px 0;color:#555;">Equity</td><td><strong>{_esc(account.get("equity"))}</strong></td></tr>'
+            f'<tr><td style="padding:2px 12px 2px 0;color:#555;">Margin level</td><td><strong>{_esc(account.get("margin_level"))}</strong></td></tr>'
+            "</table>"
+        )
+        try:
+            positions = get_positions(connection).get("positions", [])
+        except Exception as exc:
+            parts.append(f'<p style="color:#c62828;margin:2px 0;">could not read positions: {_esc(exc)}</p>')
+            positions = []
+        if not positions:
+            parts.append('<p style="margin:2px 0;color:#555;">Open positions: none</p>')
+        else:
+            rows = []
+            for p in positions:
+                profit = p.get("profit") or 0
+                pnl_color = "#2e7d32" if profit >= 0 else "#c62828"
+                rows.append(
+                    "<tr>"
+                    f'<td style="padding:2px 8px;">{_esc(p.get("side", "?")).upper()}</td>'
+                    f'<td style="padding:2px 8px;">{_esc(p.get("volume"))}</td>'
+                    f'<td style="padding:2px 8px;">{_esc(p.get("symbol"))}</td>'
+                    f'<td style="padding:2px 8px;">{_esc(p.get("price_open"))}</td>'
+                    f'<td style="padding:2px 8px;">{_esc(p.get("stop_loss", "?"))}</td>'
+                    f'<td style="padding:2px 8px;">{_esc(p.get("take_profit", "?"))}</td>'
+                    f'<td style="padding:2px 8px;color:{pnl_color};font-weight:bold;">{_esc(profit)}</td>'
+                    "</tr>"
+                )
+            parts.append(
+                '<table style="border-collapse:collapse;width:100%;font-size:13px;">'
+                '<tr style="color:#555;"><th style="text-align:left;padding:2px 8px;">Side</th>'
+                '<th style="text-align:left;padding:2px 8px;">Vol</th><th style="text-align:left;padding:2px 8px;">Symbol</th>'
+                '<th style="text-align:left;padding:2px 8px;">Open</th><th style="text-align:left;padding:2px 8px;">SL</th>'
+                '<th style="text-align:left;padding:2px 8px;">TP</th><th style="text-align:left;padding:2px 8px;">P&amp;L</th></tr>'
+                + "".join(rows) + "</table>"
+            )
+        try:
+            pending = get_open_orders(connection).get("open_orders", [])
+        except Exception as exc:
+            parts.append(f'<p style="color:#c62828;margin:2px 0;">could not read pending orders: {_esc(exc)}</p>')
+            pending = []
+        if pending:
+            prows = "".join(
+                "<tr>"
+                f'<td style="padding:2px 8px;">{_esc(o.get("side", "?")).upper()}</td>'
+                f'<td style="padding:2px 8px;">{_esc(o.get("quantity"))}</td>'
+                f'<td style="padding:2px 8px;">{_esc(o.get("symbol"))}</td>'
+                f'<td style="padding:2px 8px;">{_esc(o.get("order_type"))}</td>'
+                f'<td style="padding:2px 8px;">{_esc(o.get("limit_price"))}</td>'
+                "</tr>"
+                for o in pending
+            )
+            parts.append(
+                '<p style="margin:6px 0 2px;color:#555;">Pending orders:</p>'
+                '<table style="border-collapse:collapse;width:100%;font-size:13px;">'
+                '<tr style="color:#555;"><th style="text-align:left;padding:2px 8px;">Side</th>'
+                '<th style="text-align:left;padding:2px 8px;">Qty</th><th style="text-align:left;padding:2px 8px;">Symbol</th>'
+                '<th style="text-align:left;padding:2px 8px;">Type</th><th style="text-align:left;padding:2px 8px;">Price</th></tr>'
+                + prows + "</table>"
+            )
+        if connection in LIVE_CONNECTIONS:
+            try:
+                halted = halt_flag_set(fn_guard.BROKER)
+                color = "#c62828" if halted else "#2e7d32"
+                parts.append(f'<p style="margin:4px 0;">Kill switch: <span style="color:{color};font-weight:bold;">'
+                              f'{"TRIPPED" if halted else "clear"}</span></p>')
+            except Exception as exc:
+                parts.append(f'<p style="color:#c62828;margin:2px 0;">could not read kill switch state: {_esc(exc)}</p>')
+            try:
+                parts.append(_challenge_progress_html(account))
+            except Exception as exc:
+                parts.append(f'<p style="color:#c62828;margin:2px 0;">could not build challenge progress: {_esc(exc)}</p>')
+
+    seen_symbols: set[str] = set()
+    for spec in TARGETS:
+        trade = spec.get("trade")
+        if not trade or trade["symbol"] in seen_symbols:
+            continue
+        seen_symbols.add(trade["symbol"])
+        try:
+            _journal_reconcile_closed(trade["symbol"], trade["connection"])
+            summary = _journal_summary_text(trade["symbol"])
+        except Exception as exc:
+            summary = f"could not read journal: {exc}"
+        parts.append(f'<h3 style="margin:16px 0 4px;font-size:14px;">Track record: {_esc(trade["symbol"])}</h3>')
+        parts.append(f'<p style="margin:2px 0;">{_esc(summary or "no closed trades yet")}</p>')
+
+    parts.append("</div>")
+    return "\n".join(parts)
+
+
+def _status_header_html() -> str:
+    """HTML counterpart to _status_header -- same fail-open guarantee."""
+    try:
+        return _status_report_html() + '<hr style="border:none;border-top:2px solid #ccc;margin:16px 0;">'
     except Exception:
         logger.exception("HTML status report build failed; this email will omit it")
         return ""

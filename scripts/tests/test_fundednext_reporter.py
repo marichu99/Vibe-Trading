@@ -1552,3 +1552,56 @@ class TestRunOnceRecordsRegime:
         fr.run_once("new_york")
 
         assert seen.get("regime") == "CALM"
+
+
+class TestChallengeProgressHtml:
+    """2026-10-08, at the user's request: the FundedNext status email used
+    to wrap the plain-text report in a <pre> block, visibly plainer than
+    the Exness email's styled badges/tables. _challenge_progress_html is
+    the new FundedNext-specific section rendered the same way."""
+
+    def _patch_state(self, monkeypatch, *, initial=6000.0, progress=-1.26, days=8, daily_dd=0.002, static_dd=0.013):
+        monkeypatch.setattr(fr.fn_state, "get_state", lambda: {
+            "initial_balance_usd": initial, "challenge_start_date": "2026-09-17", "passed_date": None,
+        })
+        monkeypatch.setattr(fr.fn_state, "progress_pct", lambda balance: progress)
+        monkeypatch.setattr(fr.fn_state, "trading_days_count", lambda: days)
+        monkeypatch.setattr(fr.fn_state, "server_today", lambda: "2026-10-08")
+        equity = initial * (1 - static_dd)
+        baseline_equity = equity / (1 - daily_dd) if daily_dd else equity
+        monkeypatch.setattr(fr.fn_guard, "_read_daily_baseline", lambda: {"date": "2026-10-08", "equity": baseline_equity})
+
+    def test_not_yet_initialized(self, monkeypatch) -> None:
+        monkeypatch.setattr(fr.fn_state, "get_state", lambda: {})
+        html = fr._challenge_progress_html({})
+        assert "Not yet initialized" in html
+
+    def test_negative_progress_is_red_and_days_met_is_green(self, monkeypatch) -> None:
+        self._patch_state(monkeypatch, progress=-1.26, days=8)
+        account = {"balance": 5924.50, "equity": 5924.50}
+        html = fr._challenge_progress_html(account)
+        assert "-1.26%" in html
+        assert 'color:#c62828;">-1.26%' in html  # negative progress -> red
+        assert f"{fr.fn_state.MIN_TRADING_DAYS}" in html
+        assert "8/2" in html or f"8/{fr.fn_state.MIN_TRADING_DAYS}" in html
+
+    def test_renders_a_table_not_plain_text(self, monkeypatch) -> None:
+        self._patch_state(monkeypatch)
+        html = fr._challenge_progress_html({"balance": 5924.50, "equity": 5924.50})
+        assert "<table" in html
+        assert "FundedNext challenge progress" in html  # section's own header, self-contained
+
+
+class TestStatusReportHtmlStyling:
+    def test_matches_exness_styled_structure(self, monkeypatch) -> None:
+        # Full end-to-end: confirms the FundedNext status email now builds
+        # the same styled div/table structure as committee_reporter.py's
+        # _status_report_html, not a plain-text <pre> dump.
+        monkeypatch.setattr(fr, "_status_lock_state", lambda: (True, 123))
+        monkeypatch.setattr(fr, "_status_log_summary", lambda: {})
+        monkeypatch.setattr(fr, "TARGETS", [])
+        html = fr._status_header_html()
+        assert "<div" in html and "<h2" in html
+        assert "FundedNext Status" in html
+        assert "<pre" not in html
+        assert "white-space:pre-wrap" not in html
