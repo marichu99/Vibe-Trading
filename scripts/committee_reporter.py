@@ -1155,6 +1155,7 @@ def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
         "strategy_version": strategy_tracking.STRATEGY_VERSION,
         "stop_adjusted": bool(order.get("stop_adjusted")),
         "trend_alignment": order.get("trend_alignment"),
+        "regime": order.get("regime"),
     })
     _write_journal(entries)
 
@@ -1982,6 +1983,11 @@ class CommitteeResult:
     report_text: str
     traded: bool = False
     error: str | None = None
+    # D16 (2026-10-08): CALM/EXTREME/NORMAL/VOLATILE when known -- set on the
+    # regime gate's own short-circuit and on a normal successful pass, left
+    # None on timeout/crash/malformed-output paths (not meaningfully
+    # regime-tagged). See strategy_tracking.regime_breakdown.
+    regime: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -2267,6 +2273,7 @@ def _build_prompt(
     session_bias_fact = _session_bias_fact(symbol)
     session_bias_block = f"{session_bias_fact}\n\n" if session_bias_fact else ""
     trend_block = trade.get("trend_rule", "")
+    regime_block = trade.get("regime_rule", "")
     strategic_context_block = strategy_tracking.strategic_context_prompt()
 
     if research_only:
@@ -2293,6 +2300,7 @@ def _build_prompt(
             f"{journal_block}"
             f"{session_bias_block}"
             f"{trend_block}"
+            f"{regime_block}"
             f"{_DAY_TRADE_FRAMING}"
             f"THIS PASS IS RESEARCH-ONLY: {research_only_reason} Do NOT call trading_place_order under "
             f"any circumstances this pass, no matter how strong the setup looks. Produce the full debate "
@@ -2317,6 +2325,7 @@ def _build_prompt(
         f"{journal_block}"
         f"{session_bias_block}"
         f"{trend_block}"
+        f"{regime_block}"
         f"{_DAY_TRADE_FRAMING}"
         f"{_RULEBOOK_V51_RULES}"
         f"Then, based ONLY on the swarm's final decision (made by its final decision-maker -- the "
@@ -2438,6 +2447,46 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         logger.info("trend gate for %s: %s", target, trend_reason)
         if trend_allowed:
             trade = {**trade, "trend_rule": strategy_tracking.trend_rule_prompt(trend_allowed, trend_reason)}
+
+    # D12 (2026-10-08) -- see fundednext_reporter.py's identical gate for
+    # the full rationale.
+    if trade and not research_only:
+        regime = strategy_tracking.regime_for_symbol(trade["symbol"], trade["connection"])
+        logger.info(
+            "REGIME_GATE symbol=%s label=%s atr_pct=%.0f action=%s reason=%s",
+            trade["symbol"], regime.label, regime.atr_percentile, regime.action, regime.reason,
+        )
+        # D17 (2026-10-08) -- see fundednext_reporter.py's identical toggle
+        # for the full rationale.
+        skip = (
+            (regime.label == "CALM" and strategy_tracking.REGIME_SKIP_CALM)
+            or (regime.label == "EXTREME" and strategy_tracking.REGIME_SKIP_EXTREME)
+        )
+        if regime.action == "PASS_NO_LLM" and skip:
+            return CommitteeResult(
+                committee, target, market, "success", None,
+                "DECISION: PASS\n"
+                "CONFIDENCE: 0\n"
+                "MODE: LIVE\n"
+                "DATA_MISSING: none\n"
+                f"NEWS_API_STATUS: {fn_news.news_api_status()}\n"
+                "EDGE: none\n"
+                f"CHECKLIST: n/a -- regime gate short-circuit ({regime.label}, atr_percentile="
+                f"{regime.atr_percentile:.0f}), LLM not invoked\n"
+                "ORDER: none\n"
+                "INVALIDATION: n/a\n"
+                "INPUT_PROVENANCE: n/a -- no data pack built, regime computed directly from broker OHLC\n"
+                "PROPOSAL: none\n"
+                f"REASON FOR PASS: {regime.reason} -- ATR percentile {regime.atr_percentile:.0f} outside the "
+                f"tradeable NORMAL/VOLATILE band (code-level regime gate, no LLM invoked).",
+                traded=False,
+                regime=regime.label,
+            )
+        # D13 (2026-10-08) -- see fundednext_reporter.py's identical wiring
+        # for the full rationale (regime_label carried through to the
+        # journal so VOLATILE trades can be excluded from the pooled
+        # NORMAL scale/pause sample).
+        trade = {**trade, "regime_rule": strategy_tracking.regime_rule_prompt(regime), "regime_label": regime.label}
 
     prompt = _build_prompt(
         committee, target, market, trade,
@@ -2586,7 +2635,10 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             report_text = report_text + blocked_note
     if breaker_note:
         report_text = report_text + f"\n\n{breaker_note}"
-    return CommitteeResult(committee, target, market, "success", run_id, report_text, traded=traded)
+    return CommitteeResult(
+        committee, target, market, "success", run_id, report_text, traded=traded,
+        regime=trade.get("regime_label") if trade else None,
+    )
 
 
 def _enforce_trend_rule(trade: dict, placed_order: dict, allowed: set[str] | None) -> str:
@@ -3202,6 +3254,9 @@ def _handle_filled_order(
         # "with" = H4+D1 agreed and the gate allowed only this side; counter-trend
         # fills never get here (closed by _enforce_trend_rule).
         placed_order["trend_alignment"] = "with" if trend_allowed else "neutral"
+        # D13 (2026-10-08) -- see fundednext_reporter.py's identical line
+        # for the full rationale.
+        placed_order["regime"] = trade.get("regime_label", "NORMAL")
         traded = True
     _journal_record_open(placed_order.get("symbol") or trade["symbol"], trade["connection"], placed_order)
     return note, traded
@@ -3456,7 +3511,9 @@ def _status_report_html() -> str:
     log = _status_log_summary()
     if log.get("last_result_ts"):
         tag = log["last_result_tag"]
-        tag_color = _TAG_COLORS.get(tag, "#555555")
+        # D16: tag may now be "OK, NORMAL" (regime suffix) -- look up color
+        # by the base tag only, so a known status still gets its color.
+        tag_color = _TAG_COLORS.get(tag.split(",", 1)[0], "#555555")
         parts.append(
             f'<p style="margin:2px 0;">Last pass: {_esc(log["last_result_ts"])} &rarr; {_esc(log["last_result_desc"])} '
             f'(<span style="color:{tag_color};font-weight:bold;">{_esc(tag)}</span>)</p>'
@@ -3593,7 +3650,8 @@ def _status_report_html() -> str:
 def _format_body_html(result: CommitteeResult, tag: str) -> str:
     """HTML counterpart to _format_body — same content, real tables/bold/color."""
     when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    color = _TAG_COLORS.get(tag, "#555555")
+    # D16: tag may be "OK, NORMAL" (regime suffix) -- color by base tag only.
+    color = _TAG_COLORS.get(tag.split(",", 1)[0], "#555555")
     header = (
         f'<div style="{_EMAIL_FONT}font-size:14px;color:#222;">'
         f'<h2 style="margin:0 0 4px;font-size:16px;">{_esc(result.committee)} &mdash; {_esc(result.target)} '
@@ -4083,6 +4141,7 @@ def run_once(session: str = "new_york") -> None:
                 decision=(strategy_tracking.parse_decision(result.report_text)
                           if result.status == "success" else result.status),
                 traded=result.traded, status=result.status, note=result.error or "",
+                regime=result.regime,
             )
 
         if not trade_enabled and result.status == "success":
@@ -4098,9 +4157,13 @@ def run_once(session: str = "new_york") -> None:
             logger.info("%s on %s: not reportable, skipping email", result.committee, result.target)
             continue
         tag = "TRADED" if result.traded else ("OK" if result.status == "success" else result.status.upper())
-        # session kept OUTSIDE the trailing (tag) parens on purpose --
-        # _LOG_EMAILED_RE parses "... (\w+)$" for last_result_tag, and a
-        # comma/space in there would silently break that match.
+        # D16 (2026-10-08): regime appended inside the SAME parens as a
+        # ", REGIME" suffix -- _LOG_EMAILED_RE's capture group below was
+        # widened to match "tag" or "tag, REGIME" as one piece (see its own
+        # comment; a bare comma/space here used to silently break the match).
+        if result.regime:
+            tag = f"{tag}, {result.regime}"
+        # session kept OUTSIDE the trailing (tag) parens on purpose.
         subject = f"[Vibe-Trading] {session}: {result.committee} — {result.target} ({tag})"
         try:
             html = _wrap_email_html(_status_header_html() + _format_body_html(result, tag))
@@ -4116,7 +4179,9 @@ def run_once(session: str = "new_york") -> None:
 # --------------------------------------------------------------------------- #
 
 _LOG_RUN_START_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO running (.+)$")
-_LOG_EMAILED_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO emailed report: \[Vibe-Trading\] (.+?) \((\w+)\)")
+_LOG_EMAILED_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO emailed report: \[Vibe-Trading\] (.+?) \((\w+(?:, \w+)?)\)"
+)
 
 
 def _status_lock_state() -> tuple[bool, int | None]:
@@ -4331,6 +4396,18 @@ def main() -> int:
         if not fn_news.startup_self_test(alert_fn=send_email):
             logger.critical("news calendar startup self-test failed -- refusing to start the loop")
             return 1
+        # D17 (2026-10-08) -- see fundednext_reporter.py's identical line
+        # for the full rationale.
+        logger.info(
+            "regime config: calm<%.0f, %.0f<=volatile<=%.0f, extreme>%.0f, "
+            "volatile_size=%.1fx, volatile_stop_widen=%.1fx, atr_period=%d, lookback=%d, "
+            "skip_calm=%s, skip_extreme=%s",
+            strategy_tracking.REGIME_CALM_MAX_PERCENTILE, strategy_tracking.REGIME_VOLATILE_MIN_PERCENTILE,
+            strategy_tracking.REGIME_EXTREME_MIN_PERCENTILE, strategy_tracking.REGIME_EXTREME_MIN_PERCENTILE,
+            strategy_tracking.REGIME_VOLATILE_SIZE_MULTIPLIER, strategy_tracking.REGIME_VOLATILE_STOP_WIDEN_FACTOR,
+            strategy_tracking.REGIME_ATR_PERIOD, strategy_tracking.REGIME_LOOKBACK,
+            strategy_tracking.REGIME_SKIP_CALM, strategy_tracking.REGIME_SKIP_EXTREME,
+        )
         next_boundary, next_session = _next_session_boundary(datetime.now(timezone.utc))
         logger.info(
             "starting loop mode, session-gated scheduling (only new_york trades; profit "

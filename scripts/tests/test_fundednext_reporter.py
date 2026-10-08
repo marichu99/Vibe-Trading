@@ -744,6 +744,26 @@ class TestHandleFilledOrder:
         assert traded is True
         assert journaled == [("EURUSD", "mt5fn-live-trade", order)]
         assert order["trend_alignment"] == "with"
+        # D13 (2026-10-08): no regime_label on trade -> defaults to NORMAL,
+        # same fallback classify_regime itself uses for missing data.
+        assert order["regime"] == "NORMAL"
+
+    def test_journals_the_trade_s_regime_label_when_present(self, monkeypatch) -> None:
+        monkeypatch.setattr(fr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(fr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_journal_record_open", lambda symbol, connection, order: None)
+        order = {"symbol": "EURUSD", "side": "buy", "quantity": 0.24, "order_id": "3",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+        trade = {**self.TRADE, "regime_label": "VOLATILE"}
+
+        fr._handle_filled_order(trade, order, {"buy"})
+
+        assert order["regime"] == "VOLATILE"
 
     def test_spec_violation_still_counts_as_a_trading_day(self, tmp_path, monkeypatch) -> None:
         """End-to-end through the REAL _journal_record_open (not a spy): a
@@ -1181,6 +1201,123 @@ class TestRunCommitteeDataPackGate:
         assert "data_pack_unavailable" in result.report_text
 
 
+class TestRunCommitteeRegimeGate:
+    """D12 (2026-10-08): deterministic regime gate runs before _build_prompt
+    for a still-live pass. CALM/EXTREME short-circuit with no subprocess
+    spawned; NORMAL/VOLATILE proceed as before. A pass already downgraded
+    to research-only by an earlier pre-check (guardrail/news/correlation)
+    must not be double-suppressed by the regime gate."""
+
+    TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
+
+    def _patch_pre_checks_inert(self, monkeypatch) -> None:
+        monkeypatch.setattr(fr.fn_guard, "guardrail_check", lambda *a, **k: None)
+        monkeypatch.setattr(fr, "_exclusive_group_conflict", lambda trade: None)
+        monkeypatch.setattr(fr.fn_news, "is_news_blackout", lambda *a, **k: (False, None))
+        monkeypatch.setattr(fr, "TREND_FILTER_ENABLED", False)
+
+    def _regime(self, label, action, size_mult=1.0, pct=50.0, reason="x"):
+        return fr.strategy_tracking.RegimeResult(label, pct, size_mult, action, reason)
+
+    @pytest.mark.parametrize("label,reason", [("CALM", "calm_regime"), ("EXTREME", "extreme_volatility")])
+    def test_pass_no_llm_regime_spawns_no_subprocess(self, monkeypatch, label, reason) -> None:
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: self._regime(label, "PASS_NO_LLM", 0.0, 92.0, reason))
+        monkeypatch.setattr(fr.fn_news, "news_api_status", lambda: "OK")
+        popen_calls = []
+        monkeypatch.setattr(fr.subprocess, "Popen", lambda *a, **k: popen_calls.append((a, k)) or (_ for _ in ()).throw(AssertionError("Popen must not be called")))
+
+        result = fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert popen_calls == []
+        assert result.status == "success"
+        assert result.traded is False
+        assert "DECISION: PASS" in result.report_text
+        assert reason in result.report_text
+
+    @pytest.mark.parametrize("label,size_mult", [("NORMAL", 1.0), ("VOLATILE", 0.5)])
+    def test_invoke_llm_regime_proceeds_to_build_prompt(self, monkeypatch, label, size_mult) -> None:
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: self._regime(label, "INVOKE_LLM", size_mult, 50.0, "x"))
+
+        class _Stop(Exception):
+            pass
+
+        reached = {}
+
+        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
+            reached["called"] = True
+            reached["trade"] = trade
+            raise _Stop
+
+        monkeypatch.setattr(fr, "_build_prompt", _fake_build_prompt)
+
+        with pytest.raises(_Stop):
+            fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert reached.get("called") is True
+        # D13: the regime gate must attach regime_rule to trade before
+        # _build_prompt is called, same mechanism as trend_rule.
+        assert f"regime: {label}" in reached["trade"]["regime_rule"]
+
+    @pytest.mark.parametrize("label,toggle_name", [("CALM", "REGIME_SKIP_CALM"), ("EXTREME", "REGIME_SKIP_EXTREME")])
+    def test_skip_toggle_off_invokes_llm_anyway(self, monkeypatch, label, toggle_name) -> None:
+        # D17 (2026-10-08): flipping the toggle off makes the gate fall
+        # through to _build_prompt even in a regime that would otherwise
+        # short-circuit.
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(fr.strategy_tracking, toggle_name, False)
+        monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: self._regime(label, "PASS_NO_LLM", 0.0, 92.0, "x"))
+
+        class _Stop(Exception):
+            pass
+
+        reached = {}
+        monkeypatch.setattr(fr, "_build_prompt", lambda *a, **k: reached.update(called=True) or (_ for _ in ()).throw(_Stop))
+
+        with pytest.raises(_Stop):
+            fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert reached.get("called") is True
+
+    def test_regime_gate_skipped_when_already_research_only(self, monkeypatch) -> None:
+        monkeypatch.setattr(fr.fn_guard, "guardrail_check", lambda *a, **k: "[FUNDEDNEXT DAILY LOSS STOP] ...")
+        called = []
+        monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: called.append(1) or self._regime("CALM", "PASS_NO_LLM"))
+
+        class _Stop(Exception):
+            pass
+
+        monkeypatch.setattr(fr, "_build_prompt", lambda *a, **k: (_ for _ in ()).throw(_Stop))
+
+        with pytest.raises(_Stop):
+            fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert called == []
+
+    @pytest.mark.parametrize("label,reason", [("CALM", "calm_regime"), ("EXTREME", "extreme_volatility")])
+    def test_regime_short_circuit_satisfies_d4_schema(self, monkeypatch, label, reason) -> None:
+        # D15 (2026-10-08): confirms D12's hand-built PASS report already
+        # satisfies REQUIRED_COMMITTEE_FIELDS on its own -- same pattern as
+        # the pre-existing data_pack_unavailable short-circuit, which never
+        # reaches validate_committee_fields at all (it returns straight
+        # from run_committee before any subprocess call). No no_llm flag or
+        # validator exemption needed.
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: self._regime(label, "PASS_NO_LLM", 0.0, 92.0, reason))
+        monkeypatch.setattr(fr.fn_news, "news_api_status", lambda: "OK")
+        monkeypatch.setattr(fr.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Popen must not be called")))
+
+        result = fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert fr.strategy_tracking.validate_committee_fields(result.report_text) == []
+
+
 # ---------------------------------------------------------------------------
 # D3 (2026-10-06) -- see committee_reporter.py's identical test classes for
 # the full rationale.
@@ -1242,6 +1379,23 @@ class TestBuildPromptResearchOnly:
         assert "NEWS_API_STATUS verified fact: STALE." in prompt
         assert "INPUT PROVENANCE verified facts" in prompt
         assert "PASS is a successful outcome" in prompt
+
+    def test_prompt_carries_regime_rule_when_present(self, monkeypatch) -> None:
+        # D13 (2026-10-08): same mechanism as trend_rule -- embedded in
+        # trade["regime_rule"] by run_committee's regime gate, read here.
+        self._patch_facts(monkeypatch)
+        regime = fr.strategy_tracking.RegimeResult("VOLATILE", 82.0, 0.5, "INVOKE_LLM", "volatile_regime")
+        trade = {**self.TRADE, "regime_rule": fr.strategy_tracking.regime_rule_prompt(regime)}
+        prompt = fr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", trade)
+        assert prompt is not None
+        assert "regime: VOLATILE" in prompt
+        assert "size_multiplier: 0.5" in prompt
+
+    def test_prompt_omits_regime_rule_when_absent(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        prompt = fr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE)
+        assert prompt is not None
+        assert "regime:" not in prompt
 
 
 class TestRunCommitteePreChecksPreserveTrade:
@@ -1345,3 +1499,56 @@ class TestRunCommitteeMalformedOutputGate:
         assert result.status == "error"
         assert result.traded is True
         assert len(fr._read_journal()) == 1
+
+
+class TestLogEmailedRegimeParsing:
+    """D16 (2026-10-08): the "(tag)" email-subject suffix can now be
+    "tag, REGIME" -- _LOG_EMAILED_RE's single capture group was widened to
+    match the whole thing as one string, so last_result_tag (and the
+    "Last pass: ... (OK, NORMAL)" status line) picks it up with no other
+    parsing changes."""
+
+    def test_regex_captures_tag_alone(self) -> None:
+        line = "2026-10-08 15:07:30,927 INFO emailed report: [FundedNext] new_york: fx_commodity_day_desk — EURUSD (OK)"
+        m = fr._LOG_EMAILED_RE.match(line)
+        assert m is not None
+        assert m.group(3) == "OK"
+
+    def test_regex_captures_tag_with_regime_suffix(self) -> None:
+        line = "2026-10-08 15:07:30,927 INFO emailed report: [FundedNext] new_york: fx_commodity_day_desk — EURUSD (PASS, CALM)"
+        m = fr._LOG_EMAILED_RE.match(line)
+        assert m is not None
+        assert m.group(3) == "PASS, CALM"
+
+    def test_status_summary_surfaces_regime_in_last_result_tag(self, monkeypatch, tmp_path) -> None:
+        log_path = tmp_path / "reporter.log"
+        log_path.write_text(
+            "2026-10-08 15:07:30,927 INFO emailed report: [FundedNext] new_york: fx_commodity_day_desk — "
+            "EURUSD (OK, NORMAL)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(fr, "REPORTER_LOG_PATH", log_path)
+        summary = fr._status_log_summary()
+        assert summary["last_result_tag"] == "OK, NORMAL"
+
+
+class TestRunOnceRecordsRegime:
+    def test_record_decision_receives_result_regime(self, monkeypatch) -> None:
+        trade = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
+        monkeypatch.setattr(fr, "TARGETS", [{"target": "EURUSD", "committee": "fx_commodity_day_desk",
+                                              "market": "forex", "trade": trade}])
+        monkeypatch.setattr(fr, "_exclusive_group_conflict", lambda t: None)
+        monkeypatch.setattr(fr, "_rulebook_skip_reason", lambda s: None)
+        fake_result = fr.CommitteeResult(
+            "fx_commodity_day_desk", "EURUSD", "forex", "success", "run1",
+            "DECISION: PASS\n...", traded=False, regime="CALM",
+        )
+        monkeypatch.setattr(fr, "run_committee", lambda **k: fake_result)
+        monkeypatch.setattr(fr, "is_reportable", lambda r: False)  # skip the email branch entirely
+        seen = {}
+        monkeypatch.setattr(fr.strategy_tracking, "record_decision",
+                             lambda *a, **k: seen.update(k))
+
+        fr.run_once("new_york")
+
+        assert seen.get("regime") == "CALM"
