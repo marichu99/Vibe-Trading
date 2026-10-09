@@ -1185,6 +1185,16 @@ class TestRunCommitteeDataPackGate:
         monkeypatch.setattr(fr, "_exclusive_group_conflict", lambda trade: None)
         monkeypatch.setattr(fr.fn_news, "is_news_blackout", lambda *a, **k: (False, None))
         monkeypatch.setattr(fr, "TREND_FILTER_ENABLED", False)
+        # D12 (2026-10-08): without this, run_committee's regime gate makes a
+        # REAL live MT5 call before ever reaching the data-pack gate this
+        # class actually tests -- flaky (depends on real-time market
+        # conditions; caught live 2026-10-09 in committee_reporter.py's
+        # identical gap when the real market happened to classify CALM and
+        # short-circuited before _build_prompt's mock was ever reached).
+        # Force NORMAL so the gate this class is testing is the one that
+        # actually runs.
+        monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: fr.strategy_tracking.RegimeResult("NORMAL", 50.0, 1.0, "INVOKE_LLM", "normal_regime"))
 
     def test_no_llm_subprocess_spawned_when_data_pack_unavailable(self, monkeypatch) -> None:
         self._patch_pre_checks_inert(monkeypatch)
@@ -1458,6 +1468,10 @@ class TestRunCommitteeMalformedOutputGate:
         monkeypatch.setattr(fr, "_exclusive_group_conflict", lambda trade: None)
         monkeypatch.setattr(fr.fn_news, "is_news_blackout", lambda *a, **k: (False, None))
         monkeypatch.setattr(fr, "TREND_FILTER_ENABLED", False)
+        # D12 -- see TestRunCommitteeDataPackGate's identical mock for the
+        # full rationale (without it, this hits real live MT5 and is flaky).
+        monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: fr.strategy_tracking.RegimeResult("NORMAL", 50.0, 1.0, "INVOKE_LLM", "normal_regime"))
         monkeypatch.setattr(fr, "_build_prompt", lambda *a, **k: "fake prompt")
         payload = _json.dumps({"status": "success", "run_id": "fake-run-1"})
         monkeypatch.setattr(fr.subprocess, "Popen", lambda *a, **k: _FakePopen(payload))

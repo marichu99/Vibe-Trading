@@ -123,6 +123,15 @@ TARGETS: list[dict[str, object]] = [
         # verified above — enough headroom past ordinary noise to avoid
         # arming on a whipsaw, but reachable by a real favorable move.
         "committee": "fx_commodity_day_desk", "target": "EURUSD", "market": "forex",
+        # sessions: added 2026-10-09 at the user's explicit request, after a
+        # cost discussion (~$0.30/pass, OpenRouter balance was $3.38 at the
+        # time) -- EURUSD trade-enabled at London open too, not just
+        # new_york, as the smallest-footprint way to test whether trading
+        # London adds anything: one symbol, this account only. GBPUSD (below)
+        # and both FundedNext targets deliberately untouched -- omitting
+        # "sessions" on a TARGETS entry defaults to {"new_york"} only (see
+        # run_once's docstring), so nothing else in TARGETS changed behavior.
+        "sessions": {"new_york", "london"},
         "trade": {
             "symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
             "early_profit_trigger_usd": 1.00,
@@ -4060,12 +4069,20 @@ def _status_header_html() -> str:
 def run_once(session: str = "new_york") -> None:
     """Run one pass over TARGETS for the given session.
 
-    Only "new_york" trades (see _next_session_boundary's docstring for the
-    schedule) -- "asia"/"london" run every spec with its trade dict forced
-    to None regardless of what TARGETS itself configures, so the pass is
-    research-only, and its Decision/Reasoning gets carried forward via
-    _record_session_bias for the NY pass to read back (_session_bias_fact,
-    wired into _build_prompt).
+    Each TARGETS entry may carry a "sessions" set naming which session
+    labels trade-enable IT specifically (default {"new_york"} when absent,
+    preserving the original "only new_york trades" behavior for every
+    target that doesn't opt in). A target not in its own "sessions" set
+    falls back to research-only when RESEARCH_PASSES_ENABLED, or is skipped
+    entirely for that one target when it's off -- independent of every
+    other target's own eligibility. This is per-target rather than a single
+    session-wide flag because of EURUSD's "sessions": {"new_york", "london"}
+    entry below (2026-10-09, user's explicit call after a cost discussion:
+    smallest-footprint way to test whether trading London adds anything --
+    one symbol, this account only, GBPUSD and FundedNext both untouched).
+    A research-only pass's Decision/Reasoning still gets carried forward via
+    _record_session_bias for the next NY pass to read back
+    (_session_bias_fact, wired into _build_prompt).
     """
     # Disabled 2026-09-02 at the user's request: equity crossed the $100
     # milestone on 2026-09-01, and the user already decided (with silver
@@ -4080,21 +4097,24 @@ def run_once(session: str = "new_york") -> None:
     _check_cap_fit_alert()
     _check_llm_balance_alert()
     _log_cap_gap()
-    trade_enabled = session == "new_york"
-    if not trade_enabled and not RESEARCH_PASSES_ENABLED:
-        logger.info("%s pass is research-only and RESEARCH_PASSES_ENABLED is off -- skipping committee runs", session)
-        return
     for spec in TARGETS:
         target = spec.get("target", "?")
+        target_trade_enabled = session in spec.get("sessions", {"new_york"})
+        if not target_trade_enabled and not RESEARCH_PASSES_ENABLED:
+            logger.info(
+                "%s pass for %s is research-only (not in this target's own sessions) and "
+                "RESEARCH_PASSES_ENABLED is off -- skipping", session, target,
+            )
+            continue
         # Never mutate the module-level TARGETS list -- a fresh dict per
         # pass, trade forced to None on research-only sessions.
-        effective_spec = spec if trade_enabled else {**spec, "trade": None}
+        effective_spec = spec if target_trade_enabled else {**spec, "trade": None}
         # Skip the committee outright while a correlated EXCLUSIVE_SYMBOL_GROUP
         # partner is open (2026-09-24, user's call) -- the pass couldn't
         # trade anyway and its report feeds nothing downstream, so running
         # it was ~$0.80 for an email. A one-line email keeps the day's
         # report from going silent.
-        if trade_enabled and spec.get("trade"):
+        if target_trade_enabled and spec.get("trade"):
             conflict = (_exclusive_group_conflict(spec["trade"])
                         or _rulebook_skip_reason(spec["trade"]["symbol"]))
             if conflict:
@@ -4135,7 +4155,7 @@ def run_once(session: str = "new_york") -> None:
                 logger.exception("also failed to send the crash notification email")
             continue
 
-        if trade_enabled and spec.get("trade"):
+        if target_trade_enabled and spec.get("trade"):
             strategy_tracking.record_decision(
                 BOT, spec["trade"]["symbol"], spec["trade"]["connection"],
                 decision=(strategy_tracking.parse_decision(result.report_text)
@@ -4144,7 +4164,7 @@ def run_once(session: str = "new_york") -> None:
                 regime=result.regime,
             )
 
-        if not trade_enabled and result.status == "success":
+        if not target_trade_enabled and result.status == "success":
             trade_spec = spec.get("trade")
             symbol = trade_spec.get("symbol") if isinstance(trade_spec, dict) else None
             if symbol:

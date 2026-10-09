@@ -440,6 +440,68 @@ class TestRunOnceRecordsDecisions:
             ("EURUSDm", "short", True), ("GBPUSDm", "skipped", False)]
 
 
+class TestRunOnceSessionGating:
+    """2026-10-09: EURUSD's "sessions": {"new_york", "london"} TARGETS entry
+    (user's explicit request, after a cost discussion) makes it trade-
+    enabled at London too; every other target (default {"new_york"}) stays
+    new_york-only. Per-target, not a single session-wide flag -- see
+    run_once's own docstring for the full rationale."""
+
+    def _patch_common(self, monkeypatch) -> None:
+        for name in ("_check_trade_drought", "_check_cap_fit_alert", "_check_llm_balance_alert", "_log_cap_gap"):
+            monkeypatch.setattr(cr, name, lambda: None)
+        monkeypatch.setattr(cr, "is_reportable", lambda r: False)
+        monkeypatch.setattr(cr, "send_email", lambda *a, **k: None)
+        monkeypatch.setattr(cr, "_status_header", lambda: "")
+        monkeypatch.setattr(cr, "RESEARCH_PASSES_ENABLED", False)
+        monkeypatch.setattr(cr, "_exclusive_group_conflict", lambda trade: None)
+        monkeypatch.setattr(cr, "_rulebook_skip_reason", lambda symbol: None)
+
+    _TARGETS = [
+        {"committee": "fx_commodity_day_desk", "target": "EURUSD", "market": "forex",
+         "sessions": {"new_york", "london"},
+         "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}},
+        {"committee": "fx_commodity_day_desk", "target": "GBPUSD", "market": "forex",
+         "trade": {"symbol": "GBPUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}},
+    ]
+
+    def test_london_trade_enables_only_the_opted_in_target(self, monkeypatch) -> None:
+        self._patch_common(monkeypatch)
+        monkeypatch.setattr(cr, "TARGETS", self._TARGETS)
+        seen = []
+        monkeypatch.setattr(cr, "run_committee", lambda **kw: seen.append((kw["target"], kw["trade"])) or
+                             cr.CommitteeResult(kw["committee"], kw["target"], kw["market"], "success", "r1",
+                                                 "DECISION: PASS\n...", traded=False))
+
+        cr.run_once("london")
+
+        assert [t for t, _ in seen] == ["EURUSD"]
+        assert seen[0][1] is not None  # trade dict populated -- real trade-enabled pass, not research-only
+
+    def test_new_york_still_trade_enables_every_target_unchanged(self, monkeypatch) -> None:
+        self._patch_common(monkeypatch)
+        monkeypatch.setattr(cr, "TARGETS", self._TARGETS)
+        seen = []
+        monkeypatch.setattr(cr, "run_committee", lambda **kw: seen.append((kw["target"], kw["trade"])) or
+                             cr.CommitteeResult(kw["committee"], kw["target"], kw["market"], "success", "r1",
+                                                 "DECISION: PASS\n...", traded=False))
+
+        cr.run_once("new_york")
+
+        assert [t for t, _ in seen] == ["EURUSD", "GBPUSD"]
+        assert all(trade is not None for _, trade in seen)
+
+    def test_asia_skips_every_target_when_research_disabled(self, monkeypatch) -> None:
+        self._patch_common(monkeypatch)
+        monkeypatch.setattr(cr, "TARGETS", self._TARGETS)
+        called = []
+        monkeypatch.setattr(cr, "run_committee", lambda **kw: called.append(1))
+
+        cr.run_once("asia")
+
+        assert called == []
+
+
 class TestPromptCarriesTrendRule:
     def test_trend_block_reaches_prompt(self, monkeypatch) -> None:
         monkeypatch.setattr(cr, "_symbol_position_summary", lambda s, c: {"count": 0, "side": None})
