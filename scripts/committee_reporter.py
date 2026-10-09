@@ -4114,8 +4114,15 @@ def run_once(session: str = "new_york") -> None:
             )
             continue
         # Never mutate the module-level TARGETS list -- a fresh dict per
-        # pass, trade forced to None on research-only sessions.
-        effective_spec = spec if target_trade_enabled else {**spec, "trade": None}
+        # pass, trade forced to None on research-only sessions. "sessions"
+        # is TARGETS-only metadata (run_committee's own call below does
+        # **effective_spec) -- dropped here, not forwarded, after a real
+        # live crash 2026-10-09 (TypeError: run_committee() got an
+        # unexpected keyword argument 'sessions') the very first time a
+        # TARGETS entry actually carried one.
+        effective_spec = {k: v for k, v in spec.items() if k != "sessions"}
+        if not target_trade_enabled:
+            effective_spec["trade"] = None
         # Skip the committee outright while a correlated EXCLUSIVE_SYMBOL_GROUP
         # partner is open (2026-09-24, user's call) -- the pass couldn't
         # trade anyway and its report feeds nothing downstream, so running

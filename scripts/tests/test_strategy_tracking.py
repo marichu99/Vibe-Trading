@@ -496,13 +496,24 @@ class TestRunOnceSessionGating:
          "trade": {"symbol": "GBPUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}},
     ]
 
+    def _strict_run_committee(self, seen):
+        # Real run_committee(committee, target, market, trade=None) signature
+        # -- deliberately NOT **kw, so a TARGETS-only key accidentally
+        # forwarded into **effective_spec raises TypeError here exactly as
+        # it would against the real function. A **kw mock would have (and
+        # originally did) silently swallow the real 2026-10-09 production
+        # bug ("sessions" forwarded into run_committee's call) instead of
+        # catching it.
+        def _run(committee, target, market, trade=None):
+            seen.append((target, trade))
+            return cr.CommitteeResult(committee, target, market, "success", "r1", "DECISION: PASS\n...", traded=False)
+        return _run
+
     def test_london_trade_enables_only_the_opted_in_target(self, monkeypatch) -> None:
         self._patch_common(monkeypatch)
         monkeypatch.setattr(cr, "TARGETS", self._TARGETS)
         seen = []
-        monkeypatch.setattr(cr, "run_committee", lambda **kw: seen.append((kw["target"], kw["trade"])) or
-                             cr.CommitteeResult(kw["committee"], kw["target"], kw["market"], "success", "r1",
-                                                 "DECISION: PASS\n...", traded=False))
+        monkeypatch.setattr(cr, "run_committee", self._strict_run_committee(seen))
 
         cr.run_once("london")
 
@@ -513,9 +524,7 @@ class TestRunOnceSessionGating:
         self._patch_common(monkeypatch)
         monkeypatch.setattr(cr, "TARGETS", self._TARGETS)
         seen = []
-        monkeypatch.setattr(cr, "run_committee", lambda **kw: seen.append((kw["target"], kw["trade"])) or
-                             cr.CommitteeResult(kw["committee"], kw["target"], kw["market"], "success", "r1",
-                                                 "DECISION: PASS\n...", traded=False))
+        monkeypatch.setattr(cr, "run_committee", self._strict_run_committee(seen))
 
         cr.run_once("new_york")
 
