@@ -1720,7 +1720,19 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         # pooled NORMAL scale/pause sample -- the current SCALE_UP_R/PAUSE_R
         # thresholds were calibrated on uniform NORMAL sizing/stops, and
         # VOLATILE trades use a different stop width and half-size risk.
-        trade = {**trade, "regime_rule": strategy_tracking.regime_rule_prompt(regime), "regime_label": regime.label}
+        # D-repair (2026-10-09): lots must reflect regime.size_multiplier
+        # BEFORE _build_prompt's fixed trading_place_order template and
+        # _post_trade_spec_check's expected-quantity check are built from
+        # it -- otherwise a VOLATILE pass's "half-size risk" is either
+        # unenforceable (following it trips the spec-check halt) or
+        # silently ignored (full-size risk kept). See
+        # strategy_tracking.regime_adjusted_lots for the full rationale.
+        trade = {
+            **trade,
+            "lots": strategy_tracking.regime_adjusted_lots(trade["lots"], regime),
+            "regime_rule": strategy_tracking.regime_rule_prompt(regime),
+            "regime_label": regime.label,
+        }
 
     prompt = _build_prompt(
         committee, target, market, trade,

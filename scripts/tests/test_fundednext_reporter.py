@@ -1271,6 +1271,12 @@ class TestRunCommitteeRegimeGate:
         # D13: the regime gate must attach regime_rule to trade before
         # _build_prompt is called, same mechanism as trend_rule.
         assert f"regime: {label}" in reached["trade"]["regime_rule"]
+        # D-repair (2026-10-09): lots must already be size_multiplier-adjusted
+        # by the time _build_prompt's fixed order template is built -- not
+        # just advertised as a "verified fact" in the prompt text.
+        assert reached["trade"]["lots"] == fr.strategy_tracking.regime_adjusted_lots(
+            self.TRADE["lots"], self._regime(label, "INVOKE_LLM", size_mult, 50.0, "x"),
+        )
 
     @pytest.mark.parametrize("label,toggle_name", [("CALM", "REGIME_SKIP_CALM"), ("EXTREME", "REGIME_SKIP_EXTREME")])
     def test_skip_toggle_off_invokes_llm_anyway(self, monkeypatch, label, toggle_name) -> None:

@@ -2495,7 +2495,14 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         # for the full rationale (regime_label carried through to the
         # journal so VOLATILE trades can be excluded from the pooled
         # NORMAL scale/pause sample).
-        trade = {**trade, "regime_rule": strategy_tracking.regime_rule_prompt(regime), "regime_label": regime.label}
+        # D-repair (2026-10-09) -- see fundednext_reporter.py's identical
+        # wiring for the full rationale (strategy_tracking.regime_adjusted_lots).
+        trade = {
+            **trade,
+            "lots": strategy_tracking.regime_adjusted_lots(trade["lots"], regime),
+            "regime_rule": strategy_tracking.regime_rule_prompt(regime),
+            "regime_label": regime.label,
+        }
 
     prompt = _build_prompt(
         committee, target, market, trade,

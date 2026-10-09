@@ -282,6 +282,37 @@ class TestRegimeRulePrompt:
         assert "size_multiplier: 1.0" in text
 
 
+class TestRegimeAdjustedLots:
+    """D-repair (2026-10-09): lots must actually shrink on a VOLATILE pass --
+    before this fix, trade["lots"] was never multiplied by
+    regime.size_multiplier, so the committee's fixed trading_place_order
+    template and the post-fill spec-check both kept expecting full size,
+    contradicting the yaml preset's "position size MUST be halved" rule."""
+
+    def test_normal_regime_leaves_lots_unchanged(self) -> None:
+        regime = st.RegimeResult("NORMAL", 50.0, 1.0, "INVOKE_LLM", "normal_regime")
+        assert st.regime_adjusted_lots(0.12, regime) == 0.12
+
+    def test_volatile_halves_a_clean_lot_size(self) -> None:
+        regime = st.RegimeResult("VOLATILE", 82.0, 0.5, "INVOKE_LLM", "volatile_regime")
+        assert st.regime_adjusted_lots(0.12, regime) == 0.06
+
+    def test_volatile_rounds_to_broker_lot_step(self) -> None:
+        # 0.15 * 0.5 = 0.075, not a multiple of REGIME_LOT_STEP (0.01) --
+        # must round the same way the broker's own volume-step rounding
+        # would (round(0.075 / 0.01) * 0.01 == 0.08), not just truncate to
+        # two decimals (which would silently drift to 0.07 and mismatch
+        # whatever the broker actually fills at).
+        regime = st.RegimeResult("VOLATILE", 82.0, 0.5, "INVOKE_LLM", "volatile_regime")
+        assert st.regime_adjusted_lots(0.15, regime) == 0.08
+
+    def test_volatile_floors_at_the_lot_step_instead_of_zero(self) -> None:
+        # Already-minimum lots (0.01) can't be halved to 0.005 -- a broker
+        # has no such size, so the floor must hold instead of rounding to 0.
+        regime = st.RegimeResult("VOLATILE", 82.0, 0.5, "INVOKE_LLM", "volatile_regime")
+        assert st.regime_adjusted_lots(0.01, regime) == 0.01
+
+
 class TestRecordAndOutcomes:
     def test_record_appends_versioned_row(self) -> None:
         st.record_decision("exness", "EURUSDm", "mt5-live-trade", decision="wait", traded=False, status="success")

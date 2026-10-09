@@ -142,6 +142,17 @@ REGIME_VOLATILE_SIZE_MULTIPLIER = 0.5
 REGIME_VOLATILE_STOP_WIDEN_FACTOR = 1.3
 REGIME_ATR_PERIOD = 14
 REGIME_LOOKBACK = 100
+# Lot-step granularity for every live instrument in either bot's TARGETS list
+# (live-verified symbol_info: volume_min = volume_step = 0.01 -- see
+# committee_reporter.py's identical comment). Used only by
+# regime_adjusted_lots below, to round a VOLATILE-regime half-size lot down
+# to a value the broker will actually accept, matching the same
+# round-to-step, floor-at-minimum logic _resolve_volume applies server-side
+# (agent/src/trading/connectors/mt5/sdk.py) -- so the reporter's own fixed
+# trading_place_order template and post-fill spec-check agree with what the
+# broker will record, instead of drifting from it by a step and
+# self-triggering a false spec-violation halt.
+REGIME_LOT_STEP = 0.01
 # When True (default), a CALM/EXTREME regime short-circuits to a no-LLM PASS
 # (run_committee's regime gate). Set False to still invoke the LLM in that
 # regime -- useful for A/B-style comparison without touching the gate logic
@@ -509,6 +520,36 @@ def regime_rule_prompt(regime: RegimeResult) -> str:
         f"atr_percentile: {regime.atr_percentile:.0f}\n"
         f"size_multiplier: {regime.size_multiplier}\n\n"
     )
+
+
+def regime_adjusted_lots(lots: float, regime: RegimeResult) -> float:
+    """Apply `regime.size_multiplier` to `lots`, rounded to REGIME_LOT_STEP
+    the same way the broker-side order sizer rounds a quantity (see
+    REGIME_LOT_STEP's comment above).
+
+    Fixes a bug where the committee's fixed trading_place_order template
+    (see _build_prompt in committee_reporter.py/fundednext_reporter.py) and
+    the post-fill spec-check both kept using the full, un-adjusted `lots`
+    even on a VOLATILE pass -- directly contradicting the REGIME ADAPTATION
+    instruction in fx_commodity_day_desk.yaml ("your position size MUST be
+    this account's standard size multiplied by the size_multiplier verified
+    fact"). A committee that followed that instruction got its fill force-
+    closed and the account halted as a "spec violation"; a committee that
+    instead followed the fixed template's "EXACTLY these arguments" clause
+    silently kept full-size risk during elevated volatility -- the opposite
+    of the regime gate's purpose either way. Callers must set `trade["lots"]`
+    to this adjusted value before the template/spec-check are built, so both
+    read the same already-adjusted size.
+
+    Floors at REGIME_LOT_STEP (never zero) -- a multiplier below 1.0 applied
+    to a `lots` already at the broker's minimum has no smaller valid size to
+    round down to.
+    """
+    if regime.size_multiplier == 1.0:
+        return lots
+    adjusted = lots * regime.size_multiplier
+    stepped = round(adjusted / REGIME_LOT_STEP) * REGIME_LOT_STEP
+    return max(round(stepped, 8), REGIME_LOT_STEP)
 
 
 # --------------------------------------------------------------------------- #

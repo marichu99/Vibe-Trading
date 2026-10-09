@@ -2486,6 +2486,14 @@ class TestRunCommitteeRegimeGate:
 
         assert reached.get("called") is True
         assert f"regime: {label}" in reached["trade"]["regime_rule"]
+        # D-repair (2026-10-09) -- see fundednext_reporter.py's identical
+        # test for the full rationale. At this account's 0.01-lot minimum,
+        # a VOLATILE 0.5x multiplier floors back to 0.01 (no smaller size
+        # exists), but it must still be computed via regime_adjusted_lots
+        # rather than silently left untouched.
+        assert reached["trade"]["lots"] == cr.strategy_tracking.regime_adjusted_lots(
+            self.TRADE["lots"], self._regime(label, "INVOKE_LLM", size_mult, 50.0, "x"),
+        )
 
     @pytest.mark.parametrize("label,toggle_name", [("CALM", "REGIME_SKIP_CALM"), ("EXTREME", "REGIME_SKIP_EXTREME")])
     def test_skip_toggle_off_invokes_llm_anyway(self, monkeypatch, label, toggle_name) -> None:
