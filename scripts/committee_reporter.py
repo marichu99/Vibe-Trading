@@ -1932,9 +1932,23 @@ def _profit_protection_check() -> None:
                     trade["symbol"], exc,
                 )
                 size = None
-            if size and size > 0 and trade["lots"] > 0:
+            # Real position volume, NOT trade["lots"] -- the regime gate
+            # (strategy_tracking.regime_adjusted_lots) can fill a VOLATILE
+            # pass at half of TARGETS' configured lots, so the static spec
+            # value silently diverges from what's actually on the broker.
+            # Using the static value here understated the real per-point $
+            # value on a halved FundedNext position (0.12/0.15 lots, well
+            # above the lot-step floor that keeps this latent on Exness'
+            # 0.01-lot targets), so the trail armed at half the intended
+            # real profit -- cutting a winner's stop in long before it
+            # actually earned early_profit_trigger_usd.
+            try:
+                position_lots = float(pos.get("volume") or 0)
+            except (TypeError, ValueError):
+                position_lots = 0.0
+            if size and size > 0 and position_lots > 0:
                 trigger_usd = trade.get("early_profit_trigger_usd", EARLY_PROFIT_TRIGGER_USD)
-                trigger_distance = trigger_usd / (size * trade["lots"])
+                trigger_distance = trigger_usd / (size * position_lots)
                 gained = (price - entry) if is_buy else (entry - price)
                 if gained >= trigger_distance:
                     atr_distance = _atr_stop_floor(trade["symbol"], trade["connection"])
