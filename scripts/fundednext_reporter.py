@@ -1165,9 +1165,18 @@ def _profit_protection_check() -> None:
                     trade["symbol"], exc,
                 )
                 size = None
-            if size and size > 0 and trade["lots"] > 0:
+            # Real position volume, NOT trade["lots"] -- see
+            # committee_reporter.py's identical fix for the full rationale
+            # (the regime gate can fill a VOLATILE pass at half of TARGETS'
+            # configured lots, well above this account's 0.12/0.15-lot
+            # targets' lot-step floor).
+            try:
+                position_lots = float(pos.get("volume") or 0)
+            except (TypeError, ValueError):
+                position_lots = 0.0
+            if size and size > 0 and position_lots > 0:
                 trigger_usd = trade.get("early_profit_trigger_usd", EARLY_PROFIT_TRIGGER_USD)
-                trigger_distance = trigger_usd / (size * trade["lots"])
+                trigger_distance = trigger_usd / (size * position_lots)
                 gained = (price - entry) if is_buy else (entry - price)
                 if gained >= trigger_distance:
                     atr_distance = _atr_stop_floor(trade["symbol"], trade["connection"])
