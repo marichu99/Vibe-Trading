@@ -221,7 +221,28 @@ def _normalize_notional(intent: OrderIntent, connector_module: Any, config: Any)
     before HK/CN are promoted past the structural asset-class gate.
     """
     if intent.quantity is None:
-        return intent
+        if intent.stop_loss is None or intent.notional_usd is None:
+            return intent
+        # Notional-sized order with a stop attached (e.g. MT5's `notional=`
+        # sizing, per trading_place_order's "give exactly one of quantity or
+        # notional" contract): max_loss_usd still needs computing from an
+        # implied quantity, or a mandate's max_loss_per_order_usd cap always
+        # fail-closed denies this order as if it had no stop at all.
+        price = _quote_price(intent, connector_module, config)
+        if price is None:
+            return None
+        multiplier = _contract_multiplier(connector_module, config, intent.symbol)
+        if multiplier is None or price * multiplier <= 0:
+            return None
+        implied_quantity = intent.notional_usd / (price * multiplier)
+        max_loss_usd = abs(price - intent.stop_loss) * multiplier * implied_quantity
+        if max_loss_usd != max_loss_usd:  # NaN
+            max_loss_usd = None
+        return OrderIntent(
+            symbol=intent.symbol, side=intent.side, notional_usd=intent.notional_usd,
+            quantity=None, instrument_type=intent.instrument_type, asset_class=intent.asset_class,
+            stop_loss=intent.stop_loss, max_loss_usd=max_loss_usd,
+        )
     price = _quote_price(intent, connector_module, config)
     if price is None:
         return None
