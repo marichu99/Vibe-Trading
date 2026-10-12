@@ -106,6 +106,23 @@ class TestMaxStop:
         assert mod._post_trade_max_stop_check({"symbol": "EURUSD", "connection": "c"}, order) == ""
         assert calls == []
 
+    def test_tightening_never_goes_below_noise_floor(self, monkeypatch, mod) -> None:
+        """Regression: tightening to MAX_STOP_PRICE_FRACTION must not undo a
+        wider noise floor (e.g. a volatility spike). Without this, a stop
+        _post_trade_stop_floor_check just widened to clear the floor could
+        get tightened straight back inside it, re-exposing the position to
+        the exact ordinary-noise stop-out the floor check exists to prevent.
+        """
+        calls = self._setup(monkeypatch, mod)
+        monkeypatch.setattr(mod, "_atr_stop_floor", lambda symbol, connection: 0.0150)  # 150 pips, > the 110-pip ceiling
+        monkeypatch.setattr(mod, "_spread_stop_floor", lambda quote: None)
+        monkeypatch.setattr(mod, "_symbol_live_quote", lambda symbol, connection: {"bid": 1.0999, "ask": 1.1001})
+        order = {"side": "buy", "order_id": "9", "stop_loss": 1.0800, "take_profit": 1.1300}  # 200 pips away
+        note = mod._post_trade_max_stop_check({"symbol": "EURUSD", "connection": "c"}, order)
+        assert "STOP TIGHTENED" in note
+        assert calls == [pytest.approx(1.0850)]  # tightened to the 150-pip floor, not the 110-pip ceiling
+        assert order["stop_loss"] == pytest.approx(1.0850)
+
 
 @pytest.mark.parametrize("mod", [cr, fr], ids=["exness", "fundednext"])
 def test_rulebook_skip_reason_benches_and_persists_review_pass(monkeypatch, mod) -> None:

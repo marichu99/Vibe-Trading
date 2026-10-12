@@ -2157,8 +2157,15 @@ def _post_trade_stop_floor_check(trade: dict, placed_order: dict) -> tuple[str, 
 def _post_trade_max_stop_check(trade: dict, placed_order: dict) -> str:
     """Rulebook (2026-09-30): a stop farther than MAX_STOP_PRICE_FRACTION of price is tightened to it.
 
-    Tightening only ever reduces risk, so no budget check is needed. Returns
-    a report note, or "" when the stop is within bounds / data is missing.
+    Tightening only ever reduces risk, so no budget check is needed -- except
+    it must never tighten past the noise floor (the same ATR/spread floor
+    _post_trade_stop_floor_check enforces as a minimum). Without this, a stop
+    that floor check just widened to clear the noise floor could get
+    tightened straight back inside it whenever the floor itself exceeds
+    MAX_STOP_PRICE_FRACTION (e.g. a volatility spike), undoing that
+    correction and re-exposing the position to an ordinary-noise stop-out --
+    the opposite of what the floor check exists to prevent. Returns a report
+    note, or "" when the stop is within bounds / data is missing.
     """
     side = placed_order.get("side")
     entry = _resolve_fill_price(trade, placed_order)
@@ -2167,7 +2174,10 @@ def _post_trade_max_stop_check(trade: dict, placed_order: dict) -> str:
         return ""
     entry, sl = float(entry), float(sl)
     is_buy = side == "buy"
-    max_distance = entry * MAX_STOP_PRICE_FRACTION
+    symbol, connection = trade["symbol"], trade["connection"]
+    quote = _symbol_live_quote(symbol, connection)
+    floor_distance = max(_atr_stop_floor(symbol, connection) or 0.0, _spread_stop_floor(quote) or 0.0)
+    max_distance = max(entry * MAX_STOP_PRICE_FRACTION, floor_distance)
     if ((entry - sl) if is_buy else (sl - entry)) <= max_distance:
         return ""
     new_sl = entry - max_distance if is_buy else entry + max_distance
