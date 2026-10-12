@@ -291,7 +291,7 @@ class LiveOrderGuardTool(MCPRemoteTool):
         for remote in self._read_tools("quote", _QUOTE_TOOLS):
             try:
                 result = self._adapter.call_tool(
-                    remote, {"symbol": symbol}, local_name=remote
+                    remote, self._quote_arguments(symbol), local_name=remote
                 )
             except Exception as exc:
                 logger.warning("broker quote tool %s failed: %s", remote, exc)
@@ -302,6 +302,23 @@ class LiveOrderGuardTool(MCPRemoteTool):
             if price is not None:
                 return price
         return None
+
+    def _quote_arguments(self, symbol: str) -> dict[str, Any]:
+        """Return the quote-tool call arguments in the broker's expected shape.
+
+        ``_read_tools`` already resolves the broker-specific remote tool name
+        (e.g. Robinhood's ``get_equity_quotes``); the argument shape must match
+        that tool, not a generic default. Robinhood's own ``remote_arguments``
+        mapping (used by the plain read path in ``src.trading.service``) requires
+        a ``symbols`` list, not a singular ``symbol`` — sending the wrong shape
+        here made every broker-quote lookup fail silently and fall back to the
+        (possibly stale) data-loader price instead of the broker's own quote.
+        """
+        if self.broker == "robinhood":
+            from src.trading.connectors.robinhood.mcp import remote_arguments
+
+            return remote_arguments("quote", {"symbol": symbol})
+        return {"symbol": symbol}
 
     # -- decision helpers ---------------------------------------------------
 

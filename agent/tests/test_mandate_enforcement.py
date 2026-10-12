@@ -471,7 +471,13 @@ class _QuoteAdapter:
             return {"equity": self._balance, "status": "ok"}
         if remote_name == "get_equity_quotes":
             self.quote_calls.append({"arguments": arguments})
-            return {"status": "ok", "symbol": arguments.get("symbol"), "price": self._price}
+            # Mirrors the real Robinhood remote tool: it keys off "symbols"
+            # (a list), not a singular "symbol" — the shape the connector's
+            # own `remote_arguments("quote", ...)` mapping produces.
+            symbols = arguments.get("symbols") or []
+            if not symbols:
+                return {"status": "error", "error": "missing symbols"}
+            return {"status": "ok", "symbol": symbols[0], "price": self._price}
         self.order_calls.append({"remote": remote_name, "arguments": arguments})
         return {"status": "ok", "order_id": "rh_test_1", "state": "accepted"}
 
