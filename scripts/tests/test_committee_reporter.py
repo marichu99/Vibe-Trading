@@ -1116,7 +1116,7 @@ class TestProfitProtectionCheckTimeDecay:
         pos = {
             "ticket": ticket, "symbol": self.SYMBOL, "magic": cr.OUR_MAGIC, "side": side,
             "price_open": entry, "stop_loss": sl, "take_profit": tp, "price_current": price,
-            "time": opened, "profit": profit,
+            "time": opened, "profit": profit, "volume": 0.01,  # matches _trade's default lots
         }
         pos.update(overrides)
         return pos
@@ -1320,6 +1320,28 @@ class TestProfitProtectionCheckTimeDecay:
         assert calls["close"] == []
         assert calls["modify"] == []
 
+    def test_trail_trigger_sizes_off_real_position_volume_not_stale_trade_lots(self, monkeypatch) -> None:
+        """Regression: the regime gate (strategy_tracking.regime_adjusted_lots)
+        can fill a VOLATILE pass at HALF of TARGETS' configured lots. The
+        trail's $ trigger must size off the position's own real volume
+        (0.01 here), not the stale, larger static trade["lots"] (0.02) --
+        otherwise it understates the real per-point $ value and arms the
+        trail before the position has actually earned early_profit_
+        trigger_usd. trigger_distance at the real 0.01-lot fill: 1.00 /
+        (100_000 * 0.01) = 0.0010; at the stale 0.02 TARGETS lots it would
+        be half that (0.0005). gained=0.0007 sits strictly between the
+        two -- the bug would arm here, the fix must not."""
+        pos = self._position(hours_open=1.0, ticket="T14", side="buy", entry=1.1600, sl=1.1580, tp=1.2000,
+                              price=1.1607, volume=0.01)
+        calls = self._patch_broker(monkeypatch, positions=[pos], atr_floor=0.0010)
+        trade = self._trade(lots=0.02, early_profit_trigger_usd=1.00)
+        monkeypatch.setattr(cr, "TARGETS", [{"committee": "x", "target": "x", "market": "forex", "trade": trade}])
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == []
+        assert calls["modify"] == []
+
     def test_close_position_error_status_does_not_raise(self, monkeypatch) -> None:
         pos = self._position(hours_open=cr.MAX_HOLD_HOURS + 1, ticket="T9")
         self._patch_broker(monkeypatch, positions=[pos], close_result={"status": "error", "error": "broker rejected"})
@@ -1421,7 +1443,7 @@ class TestProfitProtectionCheckSilentLookupFailures:
         return {
             "ticket": ticket, "symbol": self.SYMBOL, "magic": cr.OUR_MAGIC, "side": side,
             "price_open": entry, "stop_loss": sl, "take_profit": tp, "price_current": price,
-            "time": opened, "profit": profit,
+            "time": opened, "profit": profit, "volume": 0.01,  # matches _trade's default lots
         }
 
     def _patch_broker(self, monkeypatch, *, positions, atr_floor=0.0010, modify_result=None, trade_overrides=None) -> dict:

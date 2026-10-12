@@ -382,7 +382,7 @@ class TestProfitProtectionCheckSilentLookupFailures:
         return {
             "ticket": ticket, "symbol": self.SYMBOL, "magic": fr.OUR_MAGIC, "side": side,
             "price_open": entry, "stop_loss": sl, "take_profit": tp, "price_current": price,
-            "time": opened, "profit": profit,
+            "time": opened, "profit": profit, "volume": 0.24,  # matches _trade's default lots
         }
 
     def _patch_broker(self, monkeypatch, *, positions, atr_floor=0.0010, modify_result=None, trade_overrides=None) -> dict:
@@ -462,6 +462,27 @@ class TestProfitProtectionCheckSilentLookupFailures:
 
         assert any("contract_size lookup failed" in r.message for r in caplog.records)
         assert calls["modify"], "breakeven rule should still have protected the position"
+
+    def test_trail_trigger_sizes_off_real_position_volume_not_stale_trade_lots(self, monkeypatch) -> None:
+        """Regression: see committee_reporter.py's identical test for the
+        full rationale -- a VOLATILE-regime fill can land at half of
+        TARGETS' configured lots (real here: 0.12; stale TARGETS lots:
+        0.24). trigger_distance at the real fill: 1.00 / (100_000 * 0.12) =
+        0.00008333; at the stale, doubled lots it would be half that
+        (0.00004167). gained=0.00006 sits strictly between the two -- the
+        bug would arm here, the fix must not."""
+        pos = self._position(hours_open=1.0, ticket="T6", side="buy", entry=1.1600, sl=1.1580, tp=1.2000,
+                              price=1.16006)
+        pos["volume"] = 0.12
+        calls = self._patch_broker(
+            monkeypatch, positions=[pos], atr_floor=0.0010,
+            trade_overrides={"lots": 0.24, "early_profit_trigger_usd": 1.00},
+        )
+
+        fr._profit_protection_check()
+
+        assert calls["close"] == []
+        assert calls["modify"] == []
 
 
 class TestPostTradeSpecCheck:
