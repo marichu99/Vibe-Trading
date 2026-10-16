@@ -5,6 +5,7 @@ Run once per connection (MT5 attaches to one terminal per process).
 Broker server UTC offsets as of 2026-09: Exness (mt5-live-trade) 0, FundedNext
 (mt5fn-live-trade) 3. First used 2026-09-28 to justify STOP_TRAILING_ENABLED=False.
 """
+import bisect
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -32,9 +33,13 @@ MAX_HOLD_H, DECAY_START = 40.0, 0.75
 WEEKEND_CUTOFF_H = 20
 DEFAULT_TRIGGER = 8.0
 # early_profit_trigger_usd per symbol as currently configured in TARGETS.
+# EURUSD/GBPUSD updated 2026-10-13 (found by /code-review): these two were
+# halved to 12.00/15.00 in fundednext_reporter.py on 2026-09-28 (same day
+# this file's TRIGGERS dict was written) but this copy was never updated,
+# so a replay run was understating how early the trail arms in production.
 TRIGGERS = {
     "EURUSDm": 1.00, "AUDUSDm": 0.75, "GBPUSDm": 1.00, "XAUUSDm": DEFAULT_TRIGGER,
-    "EURUSD": 24.00, "AUDUSD": 24.75, "GBPUSD": 30.00, "XAUUSD": 30.00,
+    "EURUSD": 12.00, "AUDUSD": 24.75, "GBPUSD": 15.00, "XAUUSD": 30.00,
 }
 
 cfg = mt5_sdk.build_config(profile_by_id(conn).config, {})
@@ -49,8 +54,18 @@ def bar_utc(epoch):
     return datetime.fromtimestamp(int(epoch), timezone.utc) - OFFSET
 
 
-def atr_at(symbol, t_utc, m15):
-    prior = [b for b in m15 if bar_utc(b["time"]) + timedelta(minutes=15) <= t_utc][-(ATR_BARS + 1):]
+def m15_cutoffs_for(m15):
+    """Precomputed once per trade's m15 bar list -- atr_at's own argument used
+    to be recomputed AND the whole list rescanned from the start on every
+    call (up to 3x per M5 bar, across 13 RULES + 4 entry-delay variants per
+    trade); found by /code-review 2026-10-13. m15 is chronological, so a
+    bisect on these cutoffs replaces that full rescan with O(log n)."""
+    return [bar_utc(b["time"]) + timedelta(minutes=15) for b in m15]
+
+
+def atr_at(t_utc, m15, cutoffs):
+    idx = bisect.bisect_right(cutoffs, t_utc)
+    prior = m15[max(0, idx - (ATR_BARS + 1)):idx]
     if len(prior) < 2:
         return None
     trs = [max(prior[i]["high"] - prior[i]["low"], abs(prior[i]["high"] - prior[i - 1]["close"]),
@@ -64,7 +79,7 @@ def weekend_cutoff(t):
     return fri if fri > t else fri + timedelta(days=7)
 
 
-def simulate(tr, bars, m15, info, rule):
+def simulate(tr, bars, m15, m15_cutoffs, info, rule):
     """Return realized move in price units per full position (partials blended)."""
     buy = tr["side"] == "buy"
     sgn = 1 if buy else -1
@@ -118,7 +133,7 @@ def simulate(tr, bars, m15, info, rule):
                 return realized + remaining * (close_px - entry) * sgn, "streak-exit"
         cands = []
         if rule.get("atr_trail_start_r") and gained >= rule["atr_trail_start_r"] * risk:
-            a = atr_at(tr["symbol"], t + timedelta(minutes=5), m15)
+            a = atr_at(t + timedelta(minutes=5), m15, m15_cutoffs)
             if a:
                 cands.append(close_px - sgn * (a / ATR_MULT) * rule["atr_trail_mult"])
         if rule.get("be_tp_fraction") and gained >= abs(tp - entry) * rule["be_tp_fraction"]:
@@ -126,7 +141,7 @@ def simulate(tr, bars, m15, info, rule):
         if rule.get("be_at_r") and gained >= rule["be_at_r"] * risk:
             cands.append(entry - sgn * BE_BUFFER_POINTS * point)
         if rule.get("usd_trail") and gained >= TRIGGERS.get(tr["symbol"], DEFAULT_TRIGGER) / (size * lots):
-            a = atr_at(tr["symbol"], t + timedelta(minutes=5), m15)
+            a = atr_at(t + timedelta(minutes=5), m15, m15_cutoffs)
             if a:
                 cands.append(close_px - sgn * a)
         if rule.get("r_trail_start") and gained >= rule["r_trail_start"] * risk:
@@ -134,7 +149,7 @@ def simulate(tr, bars, m15, info, rule):
         if rule.get("decay"):
             elapsed = (t + timedelta(minutes=5) - opened).total_seconds() / 3600
             if elapsed >= MAX_HOLD_H * DECAY_START:
-                a = atr_at(tr["symbol"], t + timedelta(minutes=5), m15)
+                a = atr_at(t + timedelta(minutes=5), m15, m15_cutoffs)
                 if a:
                     cands.append(close_px - sgn * a)
         if cands:
@@ -189,12 +204,13 @@ for tr in journal:
         continue
     m5 = [dict(zip(m5.dtype.names, r)) for r in m5]
     m15 = [dict(zip(m15.dtype.names, r)) for r in m15] if m15 is not None else []
+    m15_cutoffs = m15_cutoffs_for(m15)
     risk_px = abs(tr["entry_price"] - tr["stop_loss"])
     usd_per_px = info.trade_contract_size * tr["lots"]
     row = {"ticket": tr["ticket"], "symbol": tr["symbol"], "side": tr["side"], "opened_at": tr["opened_at"],
            "risk_usd": risk_px * usd_per_px, "actual_usd": tr.get("profit"), "results": {}}
     for name, rule in RULES.items():
-        move, how = simulate(tr, m5, m15, info, rule)
+        move, how = simulate(tr, m5, m15, m15_cutoffs, info, rule)
         row["results"][name] = {"R": move / risk_px, "usd": move * usd_per_px, "exit": how}
     # Entry-timing variants (added 2026-09-28): same decision and the same
     # stop/target DISTANCES, but entered at the close of the M5 bar
@@ -211,7 +227,7 @@ for tr in journal:
         shifted = {**tr, "entry_price": new_entry, "opened_at": (bar_utc(bar["time"]) + timedelta(minutes=5)).isoformat(),
                    "stop_loss": new_entry + (tr["stop_loss"] - tr["entry_price"]),
                    "take_profit": new_entry + (tr["take_profit"] - tr["entry_price"])}
-        move, how = simulate(shifted, m5, m15, info, RULES["static"])
+        move, how = simulate(shifted, m5, m15, m15_cutoffs, info, RULES["static"])
         row["results"][f"static_entry+{delay}m"] = {"R": move / risk_px, "usd": move * usd_per_px, "exit": how}
     rows.append(row)
 
