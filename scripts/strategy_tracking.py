@@ -851,3 +851,167 @@ def openrouter_balance_usd() -> float | None:
         return float(data["total_credits"]) - float(data["total_usage"])
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Shared reporter utilities (both bots). Moved here 2026-10-13 (found by
+# /code-review): these 4 were byte-for-byte duplicated between
+# committee_reporter.py and fundednext_reporter.py, so a correctness fix
+# applied to one copy wouldn't propagate to the other. Each is either pure
+# or depends only on constants/paths already identical across both files
+# (AGENT_DIR above). _resolve_fill_price (also duplicated) deliberately
+# stays file-local: it reads each bot's own OUR_MAGIC as a module global,
+# and this file's own module-global state (DECISION_LOG_PATH-style paths,
+# a singleton lock in committee_reporter.py) is exactly the kind of
+# per-account state fundednext_reporter.py's own docstring says NOT to
+# share -- OUR_MAGIC differs (20260000 vs 20260001) by the same logic.
+# ---------------------------------------------------------------------------
+from zoneinfo import ZoneInfo  # noqa: E402
+
+ATR_PERIOD = "15m"
+ATR_LOOKBACK_BARS = 14
+ATR_STOP_MULTIPLE = 1.5
+
+_DECISION_LINE_RE = re.compile(r"^Decision:\s*(.+)$", re.MULTILINE)
+_REASONING_LINE_RE = re.compile(r"^Reasoning:\s*(.+)$", re.MULTILINE)
+
+
+def _mt5_config_for(connection: str):
+    """Resolve the actual MT5Config (incl. terminal_path) for a connection id.
+
+    Real bug found 2026-09-18 (originally caught and fixed on
+    fundednext_reporter.py first): a call with NO config defaults to
+    load_config() (the global ~/.vibe-trading/mt5.json), which is
+    non-deterministic once a second, separately-installed terminal
+    (FundedNext) is running alongside the first (Exness) on the same
+    machine. Every call needs the correct profile's config explicitly.
+    """
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.profiles import profile_by_id
+
+    profile = profile_by_id(connection)
+    return mt5_sdk.build_config(profile.config, {})
+
+
+def _atr_stop_floor(symbol: str, connection: str) -> float | None:
+    """Minimum stop-loss distance (price units) to sit outside normal noise, or None if unavailable.
+
+    ATR_STOP_MULTIPLE x ATR(ATR_LOOKBACK_BARS) on ATR_PERIOD bars, computed
+    from the most recent real bars -- pure historical-bar math, zero LLM cost.
+    Fails open (returns None) on any read error; a pass this can't compute
+    for just proceeds without the floor rather than blocking trading over a
+    transient data-feed hiccup.
+    """
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+
+    try:
+        config = _mt5_config_for(connection)
+        bars = mt5_sdk.get_historical_bars(symbol, config=config, period=ATR_PERIOD, limit=ATR_LOOKBACK_BARS + 1)["bars"]
+    except Exception:
+        return None
+
+    bars = [b for b in bars if b.get("high") is not None and b.get("low") is not None and b.get("close") is not None]
+    if len(bars) < 2:
+        return None
+
+    true_ranges = [
+        max(
+            bars[i]["high"] - bars[i]["low"],
+            abs(bars[i]["high"] - bars[i - 1]["close"]),
+            abs(bars[i]["low"] - bars[i - 1]["close"]),
+        )
+        for i in range(1, len(bars))
+    ]
+    atr = sum(true_ranges) / len(true_ranges)
+    return atr * ATR_STOP_MULTIPLE if atr > 0 else None
+
+
+# Added 2026-10-14: both bots' logs show a recurring (every few days, not
+# constant) MT5ConnectionError -- "Authorization failed" (-6) or "IPC
+# timeout" (-10005) -- specifically from _profit_protection_check's and
+# _weekend_flatten_and_notify's get_positions() call, the two risk-
+# management ticks that run between committee passes (every
+# BREAKEVEN_POLL_SECONDS, no LLM involved). Both already fail soft (log +
+# skip that target this tick), which is correct -- but a skip here means a
+# profit-protection ratchet or a weekend flatten silently did not happen on
+# an otherwise-real trigger. "IPC timeout" in particular is often transient
+# (the terminal was just slow to respond, not actually down), so a couple of
+# short retries meaningfully narrows that silent-skip window at near-zero
+# cost -- these ticks are not latency-sensitive, and a position already
+# fine stays fine for a few extra seconds either way.
+GET_POSITIONS_RETRY_ATTEMPTS = 3
+GET_POSITIONS_RETRY_DELAY_SECONDS = 2.0
+
+
+def _get_positions_retrying(connection: str) -> list[dict]:
+    """get_positions(connection)'s "positions" list, retrying on a transient
+    MT5 connection error before giving up. Re-raises the LAST attempt's
+    exception on total failure, so callers' existing fail-open try/except
+    around this call is unchanged -- only the window where one blip causes
+    a silent skip gets narrower.
+    """
+    import time
+
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.service import get_positions
+
+    last_exc: Exception = RuntimeError("unreachable")  # attempts >= 1 always assigns before re-raise
+    for attempt in range(GET_POSITIONS_RETRY_ATTEMPTS):
+        try:
+            return get_positions(connection).get("positions", [])
+        except Exception as exc:
+            last_exc = exc
+            if attempt < GET_POSITIONS_RETRY_ATTEMPTS - 1:
+                time.sleep(GET_POSITIONS_RETRY_DELAY_SECONDS)
+    raise last_exc
+
+
+def _next_session_boundary(now: datetime) -> tuple[datetime, str]:
+    """Return the next (UTC datetime, session label) boundary strictly after now.
+
+    Three deliberation passes/day, anchored to session opens -- only the
+    "new_york" pass ever trades:
+      - "asia": 00:00 UTC. Tokyo has no DST (always UTC+9), so this is a
+        fixed constant -- no ZoneInfo needed.
+      - "london": 08:00 Europe/London local time (07:00 UTC in BST / 08:00
+        UTC in GMT).
+      - "new_york": 08:00 America/New_York local time (12:00 UTC in EDT /
+        13:00 UTC in EST) -- the FX "New York session" convention (catches
+        the London/NY overlap), not the 9:30am ET NYSE cash-equities open.
+
+    Both DST-observing boundaries are computed fresh from `now`'s own date
+    via zoneinfo, never a hardcoded UTC offset -- so this stays correct
+    across DST transitions without needing its own twice-a-year fix.
+    """
+    day = now.date()
+    asia = datetime(day.year, day.month, day.day, 0, 0, tzinfo=timezone.utc)
+    london = datetime(day.year, day.month, day.day, 8, 0, tzinfo=ZoneInfo("Europe/London")).astimezone(timezone.utc)
+    new_york = datetime(day.year, day.month, day.day, 8, 0, tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+
+    for boundary, label in sorted([(asia, "asia"), (london, "london"), (new_york, "new_york")]):
+        if boundary > now:
+            return boundary, label
+
+    # Every boundary today has already passed -- roll to tomorrow's Asia open.
+    tomorrow = day + timedelta(days=1)
+    return datetime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, tzinfo=timezone.utc), "asia"
+
+
+def _parse_decision_reasoning(report_text: str) -> tuple[str, str] | None:
+    """Extract the Decision/Reasoning lines from a research-only pass's report.
+
+    Matched the old (pre-D3, pre-2026-10-06) free-text no-trade report
+    format -- returns None (not an exception) on anything that doesn't
+    parse, since a missed carry-over note is a minor quality loss, never
+    worth crashing the loop over. Research-only passes now use the v4/v5
+    structured schema (DECISION:/MODE:/etc., no "Reasoning:" line at all),
+    so this regex will no longer match even if Asia/London is ever
+    re-enabled.
+    """
+    decision_match = _DECISION_LINE_RE.search(report_text)
+    reasoning_match = _REASONING_LINE_RE.search(report_text)
+    if not decision_match or not reasoning_match:
+        return None
+    return decision_match.group(1).strip(), reasoning_match.group(1).strip()

@@ -60,7 +60,6 @@ from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT_DIR = REPO_ROOT / "agent"
@@ -212,7 +211,12 @@ TARGETS: list[dict[str, object]] = [
 ]
 
 # Symbols of which at most one may hold an open position at a time
-# (2026-09-24, added with GBPUSD). EURUSD/GBPUSD move together (0.84
+# (2026-09-24, added with GBPUSD; mirrors committee_reporter.py's own
+# EXCLUSIVE_SYMBOL_GROUP -- the two are hand-kept in sync, not derived from a
+# shared correlation source, so re-enabling a paused correlated symbol (e.g.
+# AUDUSD) here or there must also update the OTHER file's set, or the
+# concentration-risk guard silently does nothing for the new pair; flagged
+# by /code-review 2026-10-13). EURUSD/GBPUSD move together (0.84
 # correlation), so a position in both is effectively one doubled USD bet --
 # too much concentration against FundedNext's daily-loss limit. While one is
 # open, the other's pass runs research-only (same fallback as the guardrail
@@ -251,9 +255,11 @@ MIN_REWARD_RISK_RATIO = 1.5
 EXCURSION_BAR_PERIOD = "15m"
 REVERSAL_THRESHOLD_FRACTION = 0.5
 
-ATR_PERIOD = "15m"
-ATR_LOOKBACK_BARS = 14
-ATR_STOP_MULTIPLE = 1.5
+# Moved to strategy_tracking.py 2026-10-13 (found by /code-review): these
+# were byte-for-byte duplicated with committee_reporter.py's copy.
+ATR_PERIOD = strategy_tracking.ATR_PERIOD
+ATR_LOOKBACK_BARS = strategy_tracking.ATR_LOOKBACK_BARS
+ATR_STOP_MULTIPLE = strategy_tracking.ATR_STOP_MULTIPLE
 MIN_STOP_TO_SPREAD_RATIO = 8.0
 
 LOCK_PATH = REPO_ROOT / "logs" / "fundednext_reporter.lock"
@@ -261,6 +267,11 @@ REPORTER_LOG_PATH = REPO_ROOT / "logs" / "fundednext_reporter.log"
 
 WEEKEND_CUTOFF_UTC_HOUR = 20
 WEEKEND_STATE_PATH = REPO_ROOT / "logs" / "fundednext_weekend_state.json"
+# Mirrored from committee_reporter.py's identical fix (found by /code-review
+# 2026-10-13): a close that keeps failing all weekend must not go completely
+# unmentioned after its first failure email -- re-notify on a standing
+# failure after this many hours of silence.
+WEEKEND_FAILURE_RENOTIFY_HOURS = 6
 
 # Session-gated trading (2026-09-21) -- mirrored from committee_reporter.py's
 # identical feature, see that file's own comment for the full rationale.
@@ -328,8 +339,10 @@ NEWS_BLACKOUT_WINDOW_MINUTES = 120
 # (instead of just deleting this and falling through to agent/.env) so this
 # account's model choice stays independently controllable -- originally
 # deepseek-v4-pro over flash for this account's tighter 3%/6% self-imposed
-# error budget; same reasoning would apply again if/when the account's
-# cost budget allows Sonnet over Haiku specifically for this account.
+# error budget, then Haiku for cost. 2026-10-14: briefly tried Sonnet for
+# this account, reverted same day back to Haiku (matches
+# Exness/committee_reporter.py's agent/.env default) over the ~3x per-call
+# cost increase.
 LLM_MODEL_OVERRIDE = {"LANGCHAIN_PROVIDER": "openrouter", "LANGCHAIN_MODEL_NAME": "anthropic/claude-haiku-4-5"}
 
 
@@ -446,33 +459,11 @@ def _symbol_currencies(symbol: str) -> set[str]:
     return {letters[:3], letters[3:6]}
 
 
-def _mt5_config_for(connection: str):
-    """Resolve the actual MT5Config (incl. terminal_path) for a connection id.
-
-    Real bug found 2026-09-17: several call sites below used to call
-    mt5_sdk.contract_size()/get_historical_bars() with NO config at all,
-    which defaults to load_config() (the GLOBAL ~/.vibe-trading/mt5.json,
-    which doesn't even exist -- bare MT5Config() defaults, terminal_path="").
-    With only one MT5 terminal ever running (the Exness setup this was
-    originally built against), that accidentally worked -- there was only
-    one terminal for the ambiguous "whatever's already attached" call to
-    find. Now that mt5fn-live-trade runs a SEPARATE terminal alongside the
-    Exness one, an unpathed call silently connects to the wrong terminal
-    (or whichever one the process's MT5 handle happens to be attached to),
-    returning None for a symbol name that only exists on the other broker.
-    This silently zeroed out the ATR/volatility-floor guidance in the
-    prompt ("size the stop-loss at or beyond 0.000 price units from entry")
-    during the 2026-09-17 EURUSDm/0.25-lot incident -- likely a contributing
-    factor, not just a coincidence. Every call needs the CORRECT profile's
-    config explicitly, same as _symbol_live_quote/_flatten_positions
-    already do via profile_by_id + build_config.
-    """
-    sys.path.insert(0, str(AGENT_DIR))
-    from src.trading.connectors.mt5 import sdk as mt5_sdk
-    from src.trading.profiles import profile_by_id
-
-    profile = profile_by_id(connection)
-    return mt5_sdk.build_config(profile.config, {})
+# Moved to strategy_tracking.py 2026-10-13 (found by /code-review): was
+# byte-for-byte duplicated with committee_reporter.py's copy. See that
+# module's docstring for the full history/rationale (the 2026-09-17
+# EURUSDm/0.25-lot incident this was originally built to fix).
+_mt5_config_for = strategy_tracking._mt5_config_for
 
 
 def _max_stop_distance(symbol: str, lots: float, budget_usd: float, connection: str) -> float | None:
@@ -489,30 +480,9 @@ def _max_stop_distance(symbol: str, lots: float, budget_usd: float, connection: 
     return budget_usd / (size * lots)
 
 
-def _atr_stop_floor(symbol: str, connection: str) -> float | None:
-    sys.path.insert(0, str(AGENT_DIR))
-    from src.trading.connectors.mt5 import sdk as mt5_sdk
-
-    try:
-        config = _mt5_config_for(connection)
-        bars = mt5_sdk.get_historical_bars(symbol, config=config, period=ATR_PERIOD, limit=ATR_LOOKBACK_BARS + 1)["bars"]
-    except Exception:
-        return None
-
-    bars = [b for b in bars if b.get("high") is not None and b.get("low") is not None and b.get("close") is not None]
-    if len(bars) < 2:
-        return None
-
-    true_ranges = [
-        max(
-            bars[i]["high"] - bars[i]["low"],
-            abs(bars[i]["high"] - bars[i - 1]["close"]),
-            abs(bars[i]["low"] - bars[i - 1]["close"]),
-        )
-        for i in range(1, len(bars))
-    ]
-    atr = sum(true_ranges) / len(true_ranges)
-    return atr * ATR_STOP_MULTIPLE if atr > 0 else None
+# Moved to strategy_tracking.py 2026-10-13 (found by /code-review): was
+# byte-for-byte duplicated with committee_reporter.py's copy.
+_atr_stop_floor = strategy_tracking._atr_stop_floor
 
 
 def _spread_stop_floor(quote: dict | None) -> float | None:
@@ -808,24 +778,9 @@ def _in_weekend_window(now: datetime) -> bool:
     return now.weekday() == 4 and now.hour >= WEEKEND_CUTOFF_UTC_HOUR
 
 
-def _next_session_boundary(now: datetime) -> tuple[datetime, str]:
-    """Return the next (UTC datetime, session label) boundary strictly after now.
-
-    Mirrored from committee_reporter.py's identical function -- see that
-    file's own docstring for the full schedule/DST rationale. Only
-    "new_york" trades; "asia"/"london" are research-only.
-    """
-    day = now.date()
-    asia = datetime(day.year, day.month, day.day, 0, 0, tzinfo=timezone.utc)
-    london = datetime(day.year, day.month, day.day, 8, 0, tzinfo=ZoneInfo("Europe/London")).astimezone(timezone.utc)
-    new_york = datetime(day.year, day.month, day.day, 8, 0, tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
-
-    for boundary, label in sorted([(asia, "asia"), (london, "london"), (new_york, "new_york")]):
-        if boundary > now:
-            return boundary, label
-
-    tomorrow = day + timedelta(days=1)
-    return datetime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, tzinfo=timezone.utc), "asia"
+# Moved to strategy_tracking.py 2026-10-13 (found by /code-review): was
+# byte-for-byte duplicated with committee_reporter.py's copy.
+_next_session_boundary = strategy_tracking._next_session_boundary
 
 
 def _next_pass_due_text(now: datetime) -> str:
@@ -834,22 +789,9 @@ def _next_pass_due_text(now: datetime) -> str:
     return f"{boundary.strftime('%Y-%m-%d %H:%M:%S')} UTC ({session})"
 
 
-_DECISION_LINE_RE = re.compile(r"^Decision:\s*(.+)$", re.MULTILINE)
-_REASONING_LINE_RE = re.compile(r"^Reasoning:\s*(.+)$", re.MULTILINE)
-
-
-def _parse_decision_reasoning(report_text: str) -> tuple[str, str] | None:
-    """Extract the Decision/Reasoning lines from a research-only pass's report.
-
-    Mirrored from committee_reporter.py's identical function -- see its
-    docstring (D3, 2026-10-06) for why this no longer matches the current
-    research-only report format, and why that's left as-is.
-    """
-    decision_match = _DECISION_LINE_RE.search(report_text)
-    reasoning_match = _REASONING_LINE_RE.search(report_text)
-    if not decision_match or not reasoning_match:
-        return None
-    return decision_match.group(1).strip(), reasoning_match.group(1).strip()
+# Moved to strategy_tracking.py 2026-10-13 (found by /code-review): was
+# byte-for-byte duplicated with committee_reporter.py's copy.
+_parse_decision_reasoning = strategy_tracking._parse_decision_reasoning
 
 
 def _read_session_bias() -> dict:
@@ -928,9 +870,17 @@ def _weekly_report_text() -> str:
 def _weekend_flatten_and_notify() -> None:
     """See module docstring: weekend-flatten stays ON for this account even
     though FundedNext itself permits weekend holding — the tighter
-    self-imposed daily/static-drawdown margins here can't absorb gap risk."""
-    week_key = datetime.now(timezone.utc).strftime("%G-W%V")
-    already_notified = _read_weekend_state().get("week") == week_key
+    self-imposed daily/static-drawdown margins here can't absorb gap risk.
+
+    A close that is STILL failing re-notifies every WEEKEND_FAILURE_RENOTIFY_
+    HOURS instead of staying silent for the rest of the weekend (found by
+    /code-review 2026-10-13 — mirrored from committee_reporter.py's identical
+    fix)."""
+    now = datetime.now(timezone.utc)
+    week_key = now.strftime("%G-W%V")
+    weekend_state = _read_weekend_state()
+    already_notified = weekend_state.get("week") == week_key
+    last_notified_at = weekend_state.get("last_notified_at")
 
     closed_lines: list[str] = []
     for spec in TARGETS:
@@ -941,10 +891,13 @@ def _weekend_flatten_and_notify() -> None:
         sys.path.insert(0, str(AGENT_DIR))
         from src.trading.connectors.mt5 import sdk as mt5_sdk
         from src.trading.profiles import profile_by_id
-        from src.trading.service import get_positions
 
         try:
-            positions = get_positions(trade["connection"]).get("positions", [])
+            # Retrying (strategy_tracking._get_positions_retrying, added
+            # 2026-10-14): this exact call is what's recurringly hit the
+            # transient MT5 "IPC timeout"/"Authorization failed" errors in
+            # production -- see that function's comment.
+            positions = strategy_tracking._get_positions_retrying(trade["connection"])
         except Exception:
             logger.exception("weekend flatten: could not read positions for %s", trade["symbol"])
             continue
@@ -982,11 +935,23 @@ def _weekend_flatten_and_notify() -> None:
                 closed_lines.append(f"FAILED to close ticket {ticket} on {trade['symbol']}: {result.get('error')}")
                 logger.error("weekend flatten: close_position failed for ticket %s: %s", ticket, result.get("error"))
 
-    # Only a successful close is new information worth an extra email --
-    # a close that keeps failing (e.g. market already shut) retries every
-    # tick all weekend and must not email every BREAKEVEN_POLL_SECONDS.
-    if already_notified and not any(line.startswith("Closed ") for line in closed_lines):
-        return
+    # Only a successful close, or a still-standing failure after the
+    # re-notify interval, is new information worth an extra email -- a
+    # close that keeps failing (e.g. market already shut) retries every
+    # tick all weekend and must not email every BREAKEVEN_POLL_SECONDS, but
+    # it also must not go completely silent for the rest of the weekend.
+    has_new_close = any(line.startswith("Closed ") for line in closed_lines)
+    has_standing_failure = any(line.startswith("FAILED ") for line in closed_lines)
+    if already_notified and not has_new_close:
+        renotify_due = False
+        if has_standing_failure and last_notified_at:
+            try:
+                elapsed = now - datetime.fromisoformat(last_notified_at)
+            except ValueError:
+                elapsed = timedelta.max
+            renotify_due = elapsed >= timedelta(hours=WEEKEND_FAILURE_RENOTIFY_HOURS)
+        if not renotify_due:
+            return
 
     body_lines = ["Market closed for the weekend — no FundedNext committee runs until Monday (UTC)."]
     if closed_lines:
@@ -1001,7 +966,7 @@ def _weekend_flatten_and_notify() -> None:
     except Exception:
         logger.exception("failed to send weekend status email")
 
-    _write_weekend_state({"week": week_key})
+    _write_weekend_state({"week": week_key, "last_notified_at": now.isoformat()})
 
 
 def _broker_time_to_utc(raw) -> datetime | None:
@@ -1072,10 +1037,13 @@ def _profit_protection_check() -> None:
         sys.path.insert(0, str(AGENT_DIR))
         from src.trading.connectors.mt5 import sdk as mt5_sdk
         from src.trading.profiles import profile_by_id
-        from src.trading.service import get_positions
 
         try:
-            positions = get_positions(trade["connection"]).get("positions", [])
+            # Retrying (strategy_tracking._get_positions_retrying, added
+            # 2026-10-14): this exact call is what's recurringly hit the
+            # transient MT5 "IPC timeout"/"Authorization failed" errors in
+            # production -- see that function's comment.
+            positions = strategy_tracking._get_positions_retrying(trade["connection"])
         except Exception:
             logger.exception("profit protection check: could not read positions for %s", trade["symbol"])
             continue
@@ -2298,7 +2266,12 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
         positions = get_positions(trade["connection"]).get("positions", [])
     except Exception:
         return None
-    symbol = placed_order.get("symbol") or trade["symbol"]
+    # .get, not trade["symbol"]: _journal_record_open calls this with a
+    # minimal {"connection": ...} trade dict that has no "symbol" key at
+    # all (found by /code-review 2026-10-13) -- currently dormant since MT5
+    # sdk.place_order() always sets placed_order["symbol"] on success, but
+    # a KeyError here would otherwise drop the fill from the journal.
+    symbol = placed_order.get("symbol") or trade.get("symbol")
     target_ticket = str(placed_order.get("order_id") or "").strip()
     candidates = [
         pos for pos in positions
