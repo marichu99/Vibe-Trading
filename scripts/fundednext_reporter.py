@@ -1237,7 +1237,7 @@ _REPORT_FORMAT_TRADE = (
     "DATA_MISSING: <comma-separated list of any verified fact above that was unavailable (e.g. "
     "\"live quote\", \"ATR\"), or \"none\">\n"
     "NEWS_API_STATUS: <echo the NEWS_API_STATUS verified fact above exactly: OK / STALE / UNAVAILABLE>\n"
-    "EDGE: <one of HTF_TREND_CONTINUATION / HTF_LEVEL_REJECTION / SESSION_RANGE_BREAKOUT, then one sentence why>\n"
+    "EDGE: <one of HTF_TREND_CONTINUATION / HTF_LEVEL_REJECTION / SESSION_RANGE_BREAKOUT / NEWS_MOMENTUM, then one sentence why>\n"
     "CHECKLIST: <the head trader's ten numbered answers, one short line each>\n"
     "ORDER: <if placed: symbol, side, type, fill price, stop_loss, take_profit, lots and net R:R, confirmed "
     "from trading_place_order's own response (not just what the head trader said); if not placed: none>\n"
@@ -1264,7 +1264,7 @@ _REPORT_FORMAT_RESEARCH_ONLY = (
     "MODE: RESEARCH_ONLY\n"
     "DATA_MISSING: <comma-separated list of any verified fact above that was unavailable, or \"none\">\n"
     "NEWS_API_STATUS: <echo the NEWS_API_STATUS verified fact above exactly: OK / STALE / UNAVAILABLE>\n"
-    "EDGE: <one of HTF_TREND_CONTINUATION / HTF_LEVEL_REJECTION / SESSION_RANGE_BREAKOUT, then one sentence "
+    "EDGE: <one of HTF_TREND_CONTINUATION / HTF_LEVEL_REJECTION / SESSION_RANGE_BREAKOUT / NEWS_MOMENTUM, then one sentence "
     "why, or \"none\" if no setup qualified>\n"
     "CHECKLIST: <the head trader's ten numbered answers, one short line each>\n"
     "ORDER: none (research-only pass -- trading_place_order must not be called under any circumstances)\n"
@@ -1487,6 +1487,7 @@ def _build_prompt(
     session_bias_block = f"{session_bias_fact}\n\n" if session_bias_fact else ""
     trend_block = trade.get("trend_rule", "")
     regime_block = trade.get("regime_rule", "")
+    news_momentum_block = trade.get("news_momentum_rule", "")
     strategic_context_block = strategy_tracking.strategic_context_prompt()
 
     if research_only:
@@ -1507,6 +1508,7 @@ def _build_prompt(
             f"{session_bias_block}"
             f"{trend_block}"
             f"{regime_block}"
+            f"{news_momentum_block}"
             f"{_challenge_framing(connection)}"
             f"THIS PASS IS RESEARCH-ONLY: {research_only_reason} Do NOT call trading_place_order under "
             f"any circumstances this pass, no matter how strong the setup looks. Produce the full debate "
@@ -1531,6 +1533,7 @@ def _build_prompt(
         f"{session_bias_block}"
         f"{trend_block}"
         f"{regime_block}"
+        f"{news_momentum_block}"
         f"{_challenge_framing(connection)}"
         f"{_RULEBOOK_V51_RULES}"
         f"Then, based ONLY on the swarm's final decision (made by its final decision-maker -- the "
@@ -1626,9 +1629,19 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         currencies = _symbol_currencies(trade["symbol"])
         in_blackout, why = fn_news.is_news_blackout(currencies, window_minutes=NEWS_BLACKOUT_WINDOW_MINUTES)
         if in_blackout:
-            breaker_note = f"[NEWS BLACKOUT] {trade['symbol']} pass run research-only: {why}."
-            logger.warning("news blackout for %s: %s", target, why)
-            research_only = True
+            # 2026-10-17: narrow carve-out -- a pass inside the wider
+            # blackout but also inside the 15-60min post-release momentum
+            # window stays trade-enabled, restricted to the NEWS_MOMENTUM
+            # edge only (see strategy_tracking.news_momentum_rule_prompt).
+            # Every other edge stays blacked out exactly as before.
+            in_momentum, momentum_why = fn_news.news_momentum_window(currencies)
+            if in_momentum:
+                trade = {**trade, "news_momentum_rule": strategy_tracking.news_momentum_rule_prompt(momentum_why)}
+                logger.info("news momentum window for %s: %s -- NEWS_MOMENTUM edge only this pass", target, momentum_why)
+            else:
+                breaker_note = f"[NEWS BLACKOUT] {trade['symbol']} pass run research-only: {why}."
+                logger.warning("news blackout for %s: %s", target, why)
+                research_only = True
 
     if trade and not research_only:
         conflict = _exclusive_group_conflict(trade)

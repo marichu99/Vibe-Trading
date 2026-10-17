@@ -409,3 +409,56 @@ def is_news_blackout(currencies: set[str], now: datetime | None = None, window_m
                 f"({event['event'] or 'scheduled event'} at {event_time.isoformat()})"
             )
     return False, None
+
+
+def news_momentum_window(
+    currencies: set[str], now: datetime | None = None,
+    settle_minutes: int = 15, cutoff_minutes: int = 60,
+) -> tuple[bool, str | None]:
+    """True if ``now`` is strictly AFTER a high-impact release for any of
+    ``currencies`` by between ``settle_minutes`` and ``cutoff_minutes``.
+
+    2026-10-17: this is the narrow post-release carve-out that lets the
+    NEWS_MOMENTUM edge (fx_commodity_day_desk.yaml's head_trader) trade
+    despite still being inside the wider NEWS_BLACKOUT_WINDOW_MINUTES
+    blackout. Only the caller decides what that carve-out means for
+    research_only -- this function only answers "are we in the window."
+
+    Deliberately excludes the release itself and the first ``settle_minutes``
+    after it (the spread-widening/slippage chaos window) and anything before
+    it -- that is exactly what the general blackout exists to protect
+    against for the other three edges, and this carve-out must never weaken
+    that for them. This also never evaluates the economic print itself (no
+    actual/forecast/previous values are parsed anywhere in this module --
+    see _normalize_events' docstring): the NEWS_MOMENTUM edge is grounded in
+    price's own confirmed post-release reaction from the data pack, not an
+    interpretation of the number, since that's the only verified signal
+    available here.
+
+    Fails CLOSED like is_news_blackout, but to "no window" rather than a
+    blackout -- an unreadable calendar here just means no carve-out is
+    offered, which leaves the pass under the normal (wider) blackout from
+    is_news_blackout, the safe default.
+    """
+    now = now or datetime.now(timezone.utc)
+    try:
+        events = fetch_calendar()
+    except CalendarUnavailable:
+        return False, None
+    for event in events:
+        if event["currency"] not in currencies:
+            continue
+        try:
+            event_time = datetime.fromisoformat(event["time"].replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=timezone.utc)
+        age_minutes = (now - event_time).total_seconds() / 60.0
+        if settle_minutes <= age_minutes <= cutoff_minutes:
+            return True, (
+                f"{settle_minutes:.0f}-{cutoff_minutes:.0f}min post-release momentum window for a high-impact "
+                f"{event['currency']} release ({event['event'] or 'scheduled event'} at {event_time.isoformat()}, "
+                f"{age_minutes:.0f}min ago)"
+            )
+    return False, None

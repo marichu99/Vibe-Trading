@@ -386,6 +386,25 @@ def trend_gate(symbol: str, connection: str) -> tuple[set[str] | None, str]:
     return None, f"H4 {labels['H4']}, D1 {labels['D1']}: no direction restriction"
 
 
+def news_momentum_rule_prompt(reason: str) -> str:
+    """2026-10-17: the committee INPUT line carrying the news-momentum
+    carve-out's verdict -- only ever called when fn_news.news_momentum_window
+    returned True (the pass is inside the narrow post-release window, still
+    inside the wider blackout otherwise forcing research-only). Same
+    mechanism as trend_rule_prompt/regime_rule_prompt: embedded into
+    trade["news_momentum_rule"] and read by _build_prompt via
+    trade.get("news_momentum_rule", ""), alongside the trend/regime blocks.
+    """
+    return (
+        f"NEWS MOMENTUM WINDOW (verified fact, computed in code before you were invoked): {reason}. "
+        f"This pass is still inside the general news blackout for every OTHER edge -- "
+        f"HTF_TREND_CONTINUATION, HTF_LEVEL_REJECTION, and SESSION_RANGE_BREAKOUT are NOT available this "
+        f"pass regardless of how clean they look; the only edge this pass may use is NEWS_MOMENTUM, under "
+        f"its own rules in the Prop-firm rulebook. If NEWS_MOMENTUM's own setup requirements aren't met, "
+        f"the decision is PASS, same as any other pass where the checklist doesn't clear.\n\n"
+    )
+
+
 def trend_rule_prompt(allowed: set[str], reason: str) -> str:
     side = next(iter(allowed))
     forbidden = "long/buy" if side == "sell" else "short/sell"
