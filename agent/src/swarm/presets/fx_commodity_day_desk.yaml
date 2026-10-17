@@ -21,11 +21,11 @@ agents:
       ## Analytical dimensions
 
       ### Intraday & short-term technicals
-      - Use load_skill("technical-basic") and load_skill("minute-analysis") for methodology
+      - Use load_skill("technical-basic"), load_skill("minute-analysis"), and load_skill("price-action-basics") for methodology
       - Trend on the relevant intraday timeframes (15m/1h/4h) -- MA5/MA20/MA60 stack, not weekly/monthly structure
-      - Session support/resistance, recent swing highs/lows
+      - Session support/resistance, recent swing highs/lows -- grade any level + candle against price-action-basics' rejection-setup checklist before citing it
       - Momentum: RSI regime, MACD histogram on the intraday timeframe
-      - Where this sits in the current session (Asia/London/NY overlap) -- does the setup fit that session's usual volatility profile?
+      - Where this sits in the current session (Asia/London/NY overlap) -- does the setup fit that session's usual volatility profile? Check price-action-basics' session table
 
       ### Macro & rate-differential tailwind
       - Use load_skill("macro-analysis") and load_skill("global-macro") for framework
@@ -47,7 +47,7 @@ agents:
 
       Use factor_analysis for quant support where useful.
     tools: [bash, read_file, write_file, load_skill, get_market_data, factor_analysis]
-    skills: [technical-basic, minute-analysis, macro-analysis, global-macro, correlation-analysis]
+    skills: [technical-basic, minute-analysis, price-action-basics, macro-analysis, global-macro, correlation-analysis]
     max_iterations: 10
     timeout_seconds: 1800
     max_retries: 1
@@ -66,8 +66,8 @@ agents:
       ## Analytical dimensions
 
       ### Intraday & short-term technical breakdown
-      - Use load_skill("technical-basic") and load_skill("minute-analysis") for methodology
-      - Failed breakouts, rejection at resistance, bearish divergence (price up, RSI/MACD not confirming) on the intraday timeframe
+      - Use load_skill("technical-basic"), load_skill("minute-analysis"), and load_skill("price-action-basics") for methodology
+      - Failed breakouts, rejection at resistance, bearish divergence (price up, RSI/MACD not confirming) on the intraday timeframe -- grade any rejection candle against price-action-basics' checklist before citing it
       - Session resistance, recent swing highs, where momentum is actually fading vs. just consolidating
       - Death-cross-style intraday MA breaks
 
@@ -91,7 +91,7 @@ agents:
 
       Use factor_analysis for quant support where useful.
     tools: [bash, read_file, write_file, load_skill, get_market_data, factor_analysis]
-    skills: [technical-basic, minute-analysis, macro-analysis, global-macro, correlation-analysis]
+    skills: [technical-basic, minute-analysis, price-action-basics, macro-analysis, global-macro, correlation-analysis]
     max_iterations: 10
     timeout_seconds: 1800
     max_retries: 1
