@@ -40,8 +40,18 @@ $Action = New-ScheduledTaskAction -Execute "powershell.exe" `
 
 # Same AtLogOn race + settle delay as register-startup-task.ps1 -- see that
 # script's comment for the full 0xC000013A rationale.
-$Trigger = New-ScheduledTaskTrigger -AtLogOn
-$Trigger.Delay = "PT45S"
+$LogonTrigger = New-ScheduledTaskTrigger -AtLogOn
+$LogonTrigger.Delay = "PT45S"
+
+# 2026-10-17: AtStartup trigger added alongside AtLogOn -- see
+# register-startup-task.ps1's comment for the full rationale (this box has
+# been losing power roughly daily with no UPS, and AtLogOn alone leaves the
+# loop down until a human physically logs back in). Only closes the gap
+# once Windows auto-logon is configured for this account; harmless no-op
+# until then.
+$StartupTrigger = New-ScheduledTaskTrigger -AtStartup
+$StartupTrigger.Delay = "PT60S"
+$Trigger = @($LogonTrigger, $StartupTrigger)
 
 $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
     -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2)
