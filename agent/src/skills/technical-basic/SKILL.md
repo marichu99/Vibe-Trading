@@ -22,6 +22,8 @@ Three-dimensional voting mechanism:
 - **Short**: trend is bearish + RSI is not oversold + OBV is falling
 - **Stand aside**: mixed signals
 
+**Spot FX caveat**: a broker-sourced FX data pack (e.g. the live day-desk's `DATA PACK FILE`) does not include true traded volume, and MT5 "volume" where available is tick count, not executed size -- a different proxy from equity volume. If no volume field was actually provided, don't estimate or invent one for the OBV/volume-ratio dimension; drop that dimension and vote on trend + mean-reversion (EMA/ADX + BB/RSI) only, and say explicitly that volume confirmation was unavailable.
+
 ## Key Implementation Details
 
 - RSI and ADX use **Wilder EWM** (`ewm(alpha=1/period)`), not a rolling mean
