@@ -2670,12 +2670,23 @@ def _wrap_email_html(inner: str) -> str:
 def run_once(session: str = "new_york") -> None:
     """Run one pass over TARGETS for the given session.
 
-    Mirrored from committee_reporter.py's identical function -- only
-    "new_york" trades; "asia"/"london" run every spec with trade forced to
-    None and record their Decision/Reasoning via _record_session_bias for
-    the NY pass to read back (_session_bias_fact, wired into _build_prompt).
+    Mirrored from committee_reporter.py's identical function -- "new_york"
+    and "london" trade (2026-10-17: London added -- this account only had
+    one trade-enabled pass/day, and a run of machine downtime plus the
+    news-blackout window repeatedly voided that single daily shot this
+    past week; London adds a second, independent real opportunity on the
+    same two pairs, which the price-action-basics skill's own session
+    notes already flag as their best-volume window alongside NY. "asia"
+    still runs every spec with trade forced to None and records its
+    Decision/Reasoning via _record_session_bias for the NY pass to read
+    back (_session_bias_fact, wired into _build_prompt) -- unlike
+    committee_reporter.py, which already gained a per-target "sessions"
+    override on 2026-10-09 (EURUSD only, Exness account, as a smaller-
+    footprint pilot), this file still applies one session list to every
+    TARGETS entry; split it into a per-target override here too if a
+    future target needs different session treatment than EURUSD/GBPUSD.
     """
-    trade_enabled = session == "new_york"
+    trade_enabled = session in {"new_york", "london"}
     if not trade_enabled and not RESEARCH_PASSES_ENABLED:
         logger.info("%s pass is research-only and RESEARCH_PASSES_ENABLED is off -- skipping committee runs", session)
         return
@@ -3260,7 +3271,7 @@ def main() -> int:
         )
         next_boundary, next_session = _next_session_boundary(datetime.now(timezone.utc))
         logger.info(
-            "starting loop mode, session-gated scheduling (only new_york trades; profit "
+            "starting loop mode, session-gated scheduling (new_york and london trade; profit "
             "protection checked every %ss) — next scheduled pass: %s (%s)",
             BREAKEVEN_POLL_SECONDS, next_boundary.isoformat(), next_session,
         )
