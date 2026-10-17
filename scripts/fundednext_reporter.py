@@ -1678,6 +1678,32 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         # behavior, since CALM/EXTREME never reach it under the default
         # config -- flipping a toggle off is a deliberate escape hatch, not
         # something this gate needs to further prompt-engineer for.
+        if regime.label == "EXTREME" and trade.get("news_momentum_rule"):
+            # 2026-10-17: don't let the regime gate silently eat the one
+            # window NEWS_MOMENTUM exists for -- a genuine post-release spike
+            # is exactly what reads as EXTREME on the ATR percentile, so
+            # this gate running unconditionally after the news-momentum
+            # check would neuter that edge right when it matters. Bypass the
+            # EXTREME skip here, but downgrade the EFFECTIVE regime to
+            # VOLATILE (the same size_multiplier/stop-widen the LLM is
+            # already told to force unconditionally for this edge -- see
+            # NEWS_MOMENTUM's own rules in fx_commodity_day_desk.yaml)
+            # rather than passing EXTREME through as-is: regime_rule_prompt's
+            # REGIME ADAPTATION text only defines NORMAL/VOLATILE behavior,
+            # and regime_adjusted_lots would otherwise floor this trade to 0
+            # lots (EXTREME's own size_multiplier is 0.0, since EXTREME was
+            # never meant to reach that call before today). CALM is NOT
+            # bypassed here -- a real news reaction should raise volatility,
+            # not suppress it, so CALM plus an active momentum window still
+            # means there's nothing to trade.
+            logger.info(
+                "REGIME_GATE override: EXTREME (atr_pct=%.0f) bypassed for %s -- active news-momentum "
+                "window, treated as VOLATILE for sizing/prompt purposes", regime.atr_percentile, target,
+            )
+            regime = strategy_tracking.RegimeResult(
+                "VOLATILE", regime.atr_percentile, strategy_tracking.REGIME_VOLATILE_SIZE_MULTIPLIER,
+                "INVOKE_LLM", "extreme_regime_news_momentum_override",
+            )
         skip = (
             (regime.label == "CALM" and strategy_tracking.REGIME_SKIP_CALM)
             or (regime.label == "EXTREME" and strategy_tracking.REGIME_SKIP_EXTREME)

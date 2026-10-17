@@ -63,6 +63,18 @@ at all:
   observation window itself (SCALE_MIN_TRADES etc.) is unaffected: a
   CALM/EXTREME no-LLM PASS never places an order, so it can't touch the
   pooled sample either way.
+- 2026-10-17: the EXTREME skip is bypassed in fundednext_reporter.py's
+  run_committee when trade["news_momentum_rule"] is set (an active
+  NEWS_MOMENTUM window -- see fundednext_news_calendar.news_momentum_window)
+  -- a real post-release spike is exactly what reads as EXTREME on the ATR
+  percentile, so running this gate unconditionally after the news-momentum
+  check would silently eat the one window that edge exists for. The
+  bypass downgrades the EFFECTIVE regime passed downstream to VOLATILE
+  (same size_multiplier/stop-widen), not EXTREME as-is, since EXTREME's own
+  size_multiplier (0.0) and the REGIME ADAPTATION prompt text (NORMAL/
+  VOLATILE only) were never meant to reach this path. CALM is NOT bypassed
+  the same way -- a real news reaction should raise volatility, not
+  suppress it.
 """
 from __future__ import annotations
 
