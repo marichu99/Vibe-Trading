@@ -1678,7 +1678,7 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         # behavior, since CALM/EXTREME never reach it under the default
         # config -- flipping a toggle off is a deliberate escape hatch, not
         # something this gate needs to further prompt-engineer for.
-        if regime.label == "EXTREME" and trade.get("news_momentum_rule"):
+        if regime.label in ("EXTREME", "NORMAL") and trade.get("news_momentum_rule"):
             # 2026-10-17: don't let the regime gate silently eat the one
             # window NEWS_MOMENTUM exists for -- a genuine post-release spike
             # is exactly what reads as EXTREME on the ATR percentile, so
@@ -1696,13 +1696,24 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             # bypassed here -- a real news reaction should raise volatility,
             # not suppress it, so CALM plus an active momentum window still
             # means there's nothing to trade.
+            # D-repair (2026-10-18): NORMAL needs the exact same downgrade --
+            # the rolling ATR percentile usually hasn't caught up to a fresh
+            # release yet, so NORMAL (size_multiplier 1.0) is actually the
+            # *common* regime during an active news-momentum window, not the
+            # rare one. Leaving it alone meant trade["lots"] stayed full-size
+            # while fx_commodity_day_desk.yaml's NEWS_MOMENTUM rule told the
+            # LLM to size at 0.5x "regardless of what the REGIME verified
+            # fact says" -- a committee that followed that instruction got
+            # its fill flagged as a spec-check violation and force-closed
+            # (same failure mode the 2026-10-09 daily-repair fixed for
+            # ordinary VOLATILE passes, reopened here by this new edge).
             logger.info(
-                "REGIME_GATE override: EXTREME (atr_pct=%.0f) bypassed for %s -- active news-momentum "
-                "window, treated as VOLATILE for sizing/prompt purposes", regime.atr_percentile, target,
+                "REGIME_GATE override: %s (atr_pct=%.0f) bypassed for %s -- active news-momentum "
+                "window, treated as VOLATILE for sizing/prompt purposes", regime.label, regime.atr_percentile, target,
             )
             regime = strategy_tracking.RegimeResult(
                 "VOLATILE", regime.atr_percentile, strategy_tracking.REGIME_VOLATILE_SIZE_MULTIPLIER,
-                "INVOKE_LLM", "extreme_regime_news_momentum_override",
+                "INVOKE_LLM", "news_momentum_regime_override",
             )
         skip = (
             (regime.label == "CALM" and strategy_tracking.REGIME_SKIP_CALM)
