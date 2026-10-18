@@ -227,17 +227,29 @@ class TestRunOnceSessionGating:
         assert calls[0]["trade"] == {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
         assert recorded == []
 
-    def test_research_passes_disabled_skips_committee_on_asia_and_london(self, monkeypatch) -> None:
+    def test_research_passes_disabled_skips_committee_on_asia_only(self, monkeypatch) -> None:
         calls = self._patch(monkeypatch)
         monkeypatch.setattr(fr, "RESEARCH_PASSES_ENABLED", False)
         recorded = []
         monkeypatch.setattr(fr, "_record_session_bias", lambda *a: recorded.append(a))
 
         fr.run_once("asia")
-        fr.run_once("london")
 
         assert calls == []
         assert recorded == []
+
+    def test_research_passes_disabled_still_runs_london(self, monkeypatch) -> None:
+        # London became a second trade-enabled session (2026-10-17), so it
+        # must keep running even with RESEARCH_PASSES_ENABLED off -- only
+        # "asia" is gated by that flag.
+        calls = self._patch(monkeypatch)
+        monkeypatch.setattr(fr, "RESEARCH_PASSES_ENABLED", False)
+        monkeypatch.setattr(fr, "_record_session_bias", lambda *a: None)
+
+        fr.run_once("london")
+
+        assert len(calls) == 1
+        assert calls[0]["trade"] is not None
 
     def test_research_passes_disabled_still_runs_new_york(self, monkeypatch) -> None:
         calls = self._patch(monkeypatch)
@@ -1297,6 +1309,44 @@ class TestRunCommitteeRegimeGate:
         # just advertised as a "verified fact" in the prompt text.
         assert reached["trade"]["lots"] == fr.strategy_tracking.regime_adjusted_lots(
             self.TRADE["lots"], self._regime(label, "INVOKE_LLM", size_mult, 50.0, "x"),
+        )
+
+    @pytest.mark.parametrize("label,pct,action,size_mult", [
+        ("EXTREME", 92.0, "PASS_NO_LLM", 0.0),
+        ("NORMAL", 50.0, "INVOKE_LLM", 1.0),
+    ])
+    def test_news_momentum_overrides_regime_to_volatile_sizing(self, monkeypatch, label, pct, action, size_mult) -> None:
+        # D-repair (2026-10-18): fx_commodity_day_desk.yaml's NEWS_MOMENTUM
+        # edge mandates 0.5x sizing "regardless of what the REGIME verified
+        # fact says this pass" -- trade["lots"] must be halved to match
+        # whenever a news-momentum window is active, whatever the underlying
+        # regime label. The EXTREME case was already fixed (2026-10-17); this
+        # guards NORMAL too -- the regime most likely to still be in effect
+        # right after a release, before the rolling ATR percentile catches
+        # up, which previously left lots at full size while the LLM was told
+        # to size at half.
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: self._regime(label, action, size_mult, pct, "x"))
+
+        class _Stop(Exception):
+            pass
+
+        reached = {}
+
+        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
+            reached["trade"] = trade
+            raise _Stop
+
+        monkeypatch.setattr(fr, "_build_prompt", _fake_build_prompt)
+        trade = {**self.TRADE, "news_momentum_rule": fr.strategy_tracking.news_momentum_rule_prompt("x")}
+
+        with pytest.raises(_Stop):
+            fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=trade)
+
+        assert "regime: VOLATILE" in reached["trade"]["regime_rule"]
+        assert reached["trade"]["lots"] == fr.strategy_tracking.regime_adjusted_lots(
+            self.TRADE["lots"], self._regime("VOLATILE", "INVOKE_LLM", 0.5, pct, "x"),
         )
 
     @pytest.mark.parametrize("label,toggle_name", [("CALM", "REGIME_SKIP_CALM"), ("EXTREME", "REGIME_SKIP_EXTREME")])
