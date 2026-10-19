@@ -40,14 +40,14 @@ def test_regime_skeptic_block_present_before_output_format() -> None:
     prompt = _head_trader_prompt()
     assert "REGIME SKEPTIC" in prompt
     skeptic_pos = prompt.index("REGIME SKEPTIC")
-    output_pos = prompt.index("Output, in this order")
-    assert skeptic_pos < output_pos, "REGIME SKEPTIC must come before the OUTPUT FORMAT line"
+    output_pos = prompt.index("## Machine-readable summary")
+    assert skeptic_pos < output_pos, "REGIME SKEPTIC must come before the machine-readable output block"
 
 
 def test_regime_skeptic_is_not_a_new_output_field() -> None:
-    # D14 explicitly must not add a new output field -- the Output line's
-    # own field list must be unchanged from v5.1 (still ends at REASON FOR
-    # PASS, no REGIME_SKEPTIC-named field inserted).
+    # D14 explicitly must not add a new output field -- the machine-readable
+    # block's own field lines must be unchanged from v5.1 (still ends at
+    # REASON FOR PASS, no REGIME_SKEPTIC-named field inserted).
     prompt = _head_trader_prompt()
-    output_line = next(line for line in prompt.splitlines() if line.strip().startswith("Output, in this order"))
-    assert "REGIME" not in output_line
+    block = prompt[prompt.index("## Machine-readable summary"):]
+    assert "REGIME" not in block
