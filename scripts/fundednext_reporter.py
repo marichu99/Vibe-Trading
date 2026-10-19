@@ -52,6 +52,7 @@ import logging
 import os
 import re
 import smtplib
+import socket
 import subprocess
 import sys
 import time
@@ -2589,11 +2590,23 @@ def send_email(subject: str, body: str, html_body: str | None = None) -> None:
     if cc:
         msg["Cc"] = ", ".join(cc)
 
-    with smtplib.SMTP(host, port, timeout=30) as smtp:
-        smtp.starttls()
-        smtp.login(user, password)
-        smtp.sendmail(sender, [recipient, *cc], msg.as_string())
-    logger.info("emailed report: %s (cc: %s)", subject, ", ".join(cc) or "none")
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            with smtplib.SMTP(host, port, timeout=30) as smtp:
+                smtp.starttls()
+                smtp.login(user, password)
+                smtp.sendmail(sender, [recipient, *cc], msg.as_string())
+            logger.info("emailed report: %s (cc: %s)", subject, ", ".join(cc) or "none")
+            return
+        except (socket.gaierror, OSError, smtplib.SMTPException) as exc:
+            if attempt == attempts:
+                raise
+            logger.warning(
+                "send_email attempt %d/%d failed (%s), retrying in %ds",
+                attempt, attempts, exc, attempt * 5,
+            )
+            time.sleep(attempt * 5)
 
 
 def _format_body(result: CommitteeResult) -> str:
