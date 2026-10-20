@@ -51,6 +51,50 @@ class TestIndicators:
         assert series[1] > series[0]
 
 
+def _vbar(high, low, close, volume=100):
+    return {"high": high, "low": low, "close": close, "volume": volume}
+
+
+def _uptrend_with_dip(dip_low, impulse_vol=200, dip_vol=100):
+    """Rally 1.00 -> 1.10 (10 bars), then a dip down to `dip_low` (4 bars)."""
+    rally = [_vbar(1.0 + i * 0.01 + 0.002, 1.0 + i * 0.01 - 0.002, 1.0 + i * 0.01, impulse_vol)
+             for i in range(11)]
+    rally[0] = _vbar(1.002, 1.0, 1.001, impulse_vol)
+    rally[-1] = _vbar(1.10, 1.096, 1.098, impulse_vol)
+    dip = [_vbar(1.095, dip_low + 0.004, dip_low + 0.006, dip_vol) for _ in range(3)]
+    dip.append(_vbar(dip_low + 0.006, dip_low, dip_low + 0.003, dip_vol))
+    return rally + dip
+
+
+class TestPullbackStructure:
+    def test_half_retracement_on_light_volume_is_gartley_zone(self) -> None:
+        p = mdp.pullback_structure(_uptrend_with_dip(1.05), "up")
+        assert p["origin"] == pytest.approx(1.0) and p["extreme"] == pytest.approx(1.10)
+        assert p["retrace"] == pytest.approx(0.5) and p["zone"] == "gartley"
+        assert p["volume_ratio"] == pytest.approx(0.5)
+
+    @pytest.mark.parametrize("dip_low,zone", [(1.08, "shallow"), (1.025, "deep"),
+                                              (1.01, "too deep"), (0.99, "past origin")])
+    def test_depth_zones(self, dip_low, zone) -> None:
+        assert mdp.pullback_structure(_uptrend_with_dip(dip_low), "up")["zone"] == zone
+
+    def test_downtrend_is_the_mirror_image(self) -> None:
+        mirrored = [{"high": 2 - b["low"], "low": 2 - b["high"], "close": 2 - b["close"],
+                     "volume": b["volume"]} for b in _uptrend_with_dip(1.05)]
+        p = mdp.pullback_structure(mirrored, "down")
+        assert p["origin"] == pytest.approx(1.0) and p["extreme"] == pytest.approx(0.90)
+        assert p["reaction_extreme"] == pytest.approx(0.95) and p["zone"] == "gartley"
+
+    def test_heavier_pullback_volume_is_flagged(self) -> None:
+        lines = mdp.pullback_lines(_uptrend_with_dip(1.05, dip_vol=400), "up", "up", 5, 0.0001)
+        assert any("expanding" in line for line in lines)
+
+    def test_not_computed_without_htf_alignment(self) -> None:
+        lines = mdp.pullback_lines(_uptrend_with_dip(1.05), "up", "mixed", 5, 0.0001)
+        assert any("not computed" in line for line in lines)
+        assert mdp.pullback_structure(_uptrend_with_dip(1.05), "mixed") is None
+
+
 class TestSwarmInstruction:
     def test_pack_line_is_verbatim_and_first(self) -> None:
         text = mdp.swarm_instruction("fx_commodity_day_desk", "EURUSD", "forex", Path("C:/a/b.md"))

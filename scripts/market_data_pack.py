@@ -101,6 +101,64 @@ def swing_levels(bars: list[dict], width: int = 2) -> tuple[list[float], list[fl
     return highs, lows
 
 
+GARTLEY_MIN_RETRACE = 1 / 3
+GARTLEY_MAX_RETRACE = 2 / 3
+DEEP_RETRACE_LIMIT = 0.786
+
+
+def pullback_structure(bars: list[dict], direction: str) -> dict | None:
+    """Measure the current pullback against the last impulse in `direction` ('up'/'down').
+
+    Gartley's 1935 trend-continuation setup (Profits in the Stock Market, p.222):
+    an impulse X->A, then a reaction that retraces a portion (roughly 1/3-2/3)
+    of it on dwindling activity, never going back past the origin X.
+    """
+    if direction not in ("up", "down") or len(bars) < 10:
+        return None
+    sign = 1 if direction == "up" else -1
+    extreme_key, origin_key = ("high", "low") if sign == 1 else ("low", "high")
+    pick = max if sign == 1 else min
+    ia = pick(range(len(bars)), key=lambda i: bars[i][extreme_key])
+    if ia == 0:
+        return None
+    ix = (min if sign == 1 else max)(range(ia), key=lambda i: bars[i][origin_key])
+    x, a = bars[ix][origin_key], bars[ia][extreme_key]
+    leg = abs(a - x)
+    if leg == 0:
+        return None
+    after = bars[ia + 1:]
+    if after:
+        b = (min if sign == 1 else max)(bar[origin_key] for bar in after)
+    else:
+        b = a
+    retrace = abs(a - b) / leg
+    current = abs(a - bars[-1]["close"]) / leg
+
+    if (b - x) * sign <= 0:
+        zone = "past origin"
+    elif retrace < GARTLEY_MIN_RETRACE:
+        zone = "shallow"
+    elif retrace <= GARTLEY_MAX_RETRACE:
+        zone = "gartley"
+    elif retrace <= DEEP_RETRACE_LIMIT:
+        zone = "deep"
+    else:
+        zone = "too deep"
+
+    def _avg_volume(seg: list[dict]) -> float | None:
+        vols = [bar["volume"] for bar in seg if bar.get("volume") is not None]
+        return sum(vols) / len(vols) if vols else None
+
+    impulse_vol, reaction_vol = _avg_volume(bars[ix:ia + 1]), _avg_volume(after)
+    volume_ratio = reaction_vol / impulse_vol if impulse_vol and reaction_vol is not None else None
+    return {
+        "origin": x, "extreme": a, "reaction_extreme": b,
+        "retrace": retrace, "current_retrace": current, "zone": zone,
+        "bars_since_extreme": len(after), "volume_ratio": volume_ratio,
+        "origin_at_window_start": ix == 0,
+    }
+
+
 def synthetic_dxy(closes_by_pair: dict[str, list[float]]) -> list[float]:
     """DXY series from aligned component closes (same length, oldest first)."""
     n = min(len(v) for v in closes_by_pair.values())
@@ -182,6 +240,7 @@ def build_data_pack(symbol: str, connection: str, *, now: datetime | None = None
               "| --- | ---: | ---: | ---: | --- | ---: | ---: |"]
     daily: list[dict] = []
     h1: list[dict] = []
+    trends: dict[str, str] = {}
     for period, label in TIMEFRAMES:
         try:
             bars = _bars(mt5_sdk, config, symbol, period, TREND_BARS)
@@ -193,6 +252,7 @@ def build_data_pack(symbol: str, connection: str, *, now: datetime | None = None
             price = closes[-1]
         e20, e50 = ema(closes, 20), ema(closes, 50)
         r, a = rsi(closes), atr(bars)
+        trends[label] = trend_label(closes)
         lines.append(
             f"| {label} | {_fmt(closes[-1], digits)} | {_fmt(e20[-1], digits)} | {_fmt(e50[-1], digits)} | "
             f"{trend_label(closes)} | {r:.0f} | {a / pip:.1f} |" if r is not None and a is not None and e50
@@ -237,6 +297,8 @@ def build_data_pack(symbol: str, connection: str, *, now: datetime | None = None
                      f"{', '.join(_fmt(x, digits) for x in below) or 'none in last 3 days'}")
     lines.append("")
 
+    lines += pullback_lines(h1, trends.get("H4"), trends.get("D1"), digits, pip)
+
     # Dollar & cross-asset
     lines.append("## Dollar and cross-asset (daily closes, same broker)")
     try:
@@ -274,6 +336,52 @@ def build_data_pack(symbol: str, connection: str, *, now: datetime | None = None
         lines.append(f"- calendar unavailable ({exc})")
     lines.append("")
     return "\n".join(lines)
+
+
+_ZONE_TEXT = {
+    "shallow": "SHALLOW (under 1/3) -- not yet a pullback; entering here is chasing the impulse",
+    "gartley": "GARTLEY ZONE (1/3 to 2/3) -- the classic continuation pullback depth",
+    "deep": "DEEP (2/3 to 0.786) -- still a valid pullback, but weaker",
+    "too deep": "TOO DEEP (over 0.786) -- the impulse is failing; no continuation read",
+    "past origin": "PAST ORIGIN -- the reaction broke the impulse start; the continuation setup is void",
+}
+
+
+def pullback_lines(h1: list[dict], h4_trend: str | None, d1_trend: str | None,
+                   digits: int, pip: float) -> list[str]:
+    """Markdown section reading the H1 pullback against the aligned H4/D1 trend."""
+    lines = ["## H1 pullback structure (Gartley 1/3-2/3 retracement check)"]
+    if not h1:
+        return lines + ["- unavailable: no H1 bars", ""]
+    if h4_trend != d1_trend or h4_trend not in ("up", "down"):
+        return lines + [f"- not computed: H4 ({h4_trend or 'n/a'}) and D1 ({d1_trend or 'n/a'}) are not "
+                        f"both up or both down, so there is no HTF trend to pull back against", ""]
+    p = pullback_structure(h1, h4_trend)
+    if p is None:
+        return lines + ["- not computed: no measurable H1 impulse in the window", ""]
+    word = "rally" if h4_trend == "up" else "decline"
+    react = "low" if h4_trend == "up" else "high"
+    leg_pips = abs(p["extreme"] - p["origin"]) / pip
+    lines += [
+        f"- Impulse ({word}, in the H4/D1 trend direction): origin {_fmt(p['origin'], digits)} -> "
+        f"extreme {_fmt(p['extreme'], digits)} ({leg_pips:.1f} pips)"
+        + (" -- origin is at the start of the 120-bar window, so the true impulse may be longer"
+           if p["origin_at_window_start"] else ""),
+        f"- Pullback so far: reaction {react} {_fmt(p['reaction_extreme'], digits)} = "
+        f"{p['retrace'] * 100:.0f}% retracement; price now at {p['current_retrace'] * 100:.0f}%; "
+        f"{p['bars_since_extreme']} H1 bars since the extreme",
+        f"- Depth: {_ZONE_TEXT[p['zone']]}",
+    ]
+    if p["volume_ratio"] is None:
+        lines.append("- Tick volume: unavailable")
+    else:
+        verdict = ("contracting -- reaction is on dwindling activity (supports continuation)"
+                   if p["volume_ratio"] < 1 else
+                   "expanding -- counter-trend activity is heavier than the impulse (warning)")
+        lines.append(f"- Tick volume, pullback vs impulse (avg per bar): {p['volume_ratio']:.2f}x, {verdict}")
+    lines += [f"- Continuation thesis is void beyond the impulse origin {_fmt(p['origin'], digits)}; "
+              f"the reaction {react} {_fmt(p['reaction_extreme'], digits)} is the nearest structure for a stop", ""]
+    return lines
 
 
 def write_data_pack(symbol: str, connection: str, *, now: datetime | None = None) -> Path | None:
