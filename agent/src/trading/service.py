@@ -18,6 +18,11 @@ _SDK_CONNECTOR_MODULES = {
     "longbridge": "src.trading.connectors.longbridge.sdk",
     "alpaca": "src.trading.connectors.alpaca.sdk",
     "mt5": "src.trading.connectors.mt5.sdk",
+    # Same connector module as "mt5" -- a distinct broker key so the FundedNext
+    # challenge account gets its own mandate/HALT/daily-count under
+    # <runtime_root>/live/mt5fn/ instead of sharing mt5-live-trade's (see
+    # _order_classification below, which also needs to recognize this key).
+    "mt5fn": "src.trading.connectors.mt5.sdk",
     "okx": "src.trading.connectors.okx.sdk",
     "binance": "src.trading.connectors.binance.sdk",
     "futu": "src.trading.connectors.futu.sdk",
@@ -252,7 +257,7 @@ def _order_classification(connector: str, symbol: str):
     """
     from src.live.mandate.model import AssetClass, InstrumentType
 
-    if connector == "mt5":
+    if connector in ("mt5", "mt5fn"):
         return InstrumentType.CFD, _mt5_asset_class(symbol)
 
     instrument_name, asset_name = _CONNECTOR_INSTRUMENT.get(connector, ("equity", None))
@@ -268,6 +273,23 @@ def _order_classification(connector: str, symbol: str):
     if token.startswith(("CN.", "SH.", "SZ.")) or token.endswith((".SH", ".SS", ".SZ")):
         return instrument, AssetClass.CN_EQUITY
     return instrument, None
+
+
+def _apply_symbol_suffix(profile: Any, symbol: str) -> str:
+    """Append the profile's broker symbol suffix (e.g. Exness "m") if missing.
+
+    Real miss 2026-09-29: the Exness committee decided to SELL and called
+    trading_place_order with symbol "EURUSD" instead of the prompt's exact
+    "EURUSDm"; the terminal has no "EURUSD", so the mandate gate couldn't
+    price the notional and denied it twice (fail-closed), and the move it
+    missed paid +2.2R on the FundedNext account. Only applies to profiles
+    that set ``config["symbol_suffix"]``.
+    """
+    suffix = str((getattr(profile, "config", None) or {}).get("symbol_suffix") or "")
+    clean = str(symbol or "").strip()
+    if suffix and clean and not clean.endswith(suffix):
+        return clean + suffix
+    return clean
 
 
 def place_order(
@@ -303,6 +325,7 @@ def place_order(
         return _unsupported(profile, "orders.place")
     if profile.readonly:
         return _unsupported(profile, "orders.place")
+    symbol = _apply_symbol_suffix(profile, symbol)
 
     module = _sdk_module(profile.connector)
     config = module.build_config(profile.config, overrides)

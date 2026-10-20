@@ -453,7 +453,15 @@ def _match_preset(prompt: str) -> str:
     return "equity_research_team"
 
 
-_PRESET_NAMES = {preset_name for preset_name, _, _ in _PRESET_KEYWORDS}
+# Every bundled preset is a valid EXPLICIT preset_name, not only those with a
+# keyword-routing entry above. Real bug 2026-09-28: fx_commodity_day_desk had
+# a YAML but no _PRESET_KEYWORDS entry, so run_swarm(preset_name=
+# "fx_commodity_day_desk") returned "Unknown preset_name" and the calling
+# agent retried without a name -- keyword auto-routing then silently ran
+# investment_committee on one bot and derivatives_strategy_desk on the other.
+_PRESET_NAMES = {preset_name for preset_name, _, _ in _PRESET_KEYWORDS} | {
+    path.stem for path in (Path(__file__).resolve().parents[1] / "swarm" / "presets").glob("*.yaml")
+}
 _CONTINUATION_PATTERNS = (
     r"^\s*continue\b",
     r"^\s*resume\b",
@@ -668,6 +676,7 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
         "geopolitical_war_room": {"crisis": g, "market": market},
         "pairs_research_lab": {"market": market, "sector": _extract_sector(prompt)},
         "investment_committee": {"target": g, "market": market},
+        "fx_commodity_day_desk": {"target": g, "market": market},
         "value_investing_committee": {"company": g, "market": market},
         "macro_strategy_forum": {"market": market, "horizon": "quarterly"},
         "statistical_arbitrage_desk": {"market": market, "goal": g, "sector": _extract_sector(prompt)},

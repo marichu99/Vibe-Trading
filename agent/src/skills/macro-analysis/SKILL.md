@@ -108,6 +108,29 @@ Interprets macroeconomic data and central-bank policy, identifies the current ec
 **Core variables**: HICP (harmonized CPI), Eurozone PMI, Germany-France yield spread
 **Special feature**: large divergence among member economies, creating a "one size fits all" problem
 
+### Bank of England (BOE)
+
+**Sequence to watch**: MPC rate decision → vote split (e.g. 7-2) → minutes → Governor press conference
+**Core variables**: UK CPI/core CPI, UK wage growth (AWE), services PMI, gilt yields
+
+| Signal | Hawkish (tightening) | Dovish (easing) |
+|------|-------------|-------------|
+| Vote split | Majority or unanimous for hold/hike | Multiple dissents voting for a cut |
+| Inflation | "inflation persistence" / sticky services inflation | "inflation returning to target sustainably" |
+| Wages | Wage growth still outpacing target-consistent levels | Wage growth cooling toward target |
+| Forward guidance | "further tightening may be required" | "gradual" or "careful" easing language |
+
+**Special feature**: the BOE is unusually transparent about internal disagreement (published vote counts), so the split itself is often a faster tell than the statement language.
+
+## FX Rate-Differential Quick Read (session/next-session horizon)
+
+For a same-session or next-session EUR/USD or GBP/USD trade, the macro question is narrower than a full cycle call: **which central bank is currently repricing more hawkish/dovish relative to the other side, and is that priced in yet?**
+
+1. **Identify the policy-divergence direction**: compare the most recent Fed signal against the ECB (for EUR/USD) or BOE (for GBP/USD) signal using the tables above. Whichever side is hawkish relative to the other supports strength in its currency.
+2. **Check if it's already priced**: a well-telegraphed hold/hike/cut rarely moves price on the day; an outcome or vote split that surprises relative to consensus is what drives a session-horizon move.
+3. **Flag anything inside the holding window**: a rate decision, CPI/NFP print, or scheduled central-bank speech between now and the trade's expected resolution can invalidate the setup outright — treat this as a hard flag, not a footnote, per the day-desk checklist.
+4. **Don't over-fit precision**: this read supports or fights a technical setup; it is not, by itself, a reason to size up or override a level-based invalidation.
+
 ## Analysis Framework
 
 ### Step 1: Data Collection and Current-State Description

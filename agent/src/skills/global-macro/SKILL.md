@@ -23,6 +23,7 @@ Policy-rate changes → government bond yield curve → credit spreads → finan
 |------|---------|---------|---------|
 | Federal Reserve (Fed) | FFR, dot plot, SEP | CME FedWatch probabilities | nonfarm payrolls / CPI / PCE |
 | European Central Bank (ECB) | Main refinancing rate | Eurozone PMI, HICP | credit growth |
+| Bank of England (BOE) | Bank rate, MPC vote split | Gilt yields, swap-implied rate path | UK CPI / wage growth (AWE) |
 | Bank of Japan (BOJ) | YCC band, policy rate | JPY exchange rate, JGB yields | core CPI |
 
 **Historical transmission of Fed hiking / cutting cycles to China A-shares (empirical):**
@@ -45,6 +46,12 @@ Policy-rate changes → government bond yield curve → credit spreads → finan
 - China-US 10Y spread < -150bp: rising depreciation pressure on the RMB
 - Net FX settlement surplus / deficit: directly reflects conversion direction of corporates and households
 - PBOC fixing vs market expectation: signal that the countercyclical factor has been activated
+
+**EUR/USD and GBP/USD practical checklist (session/next-session horizon):**
+- 2Y yield differential (not 10Y) is the sharper short-horizon UIP driver for G10 pairs — it tracks near-term policy expectations rather than long-run growth/inflation
+- Widening US-EU or US-UK 2Y spread in the US's favor = USD strength tailwind (bearish EUR/USD, GBP/USD); narrowing = tailwind for the European/UK currency
+- DXY direction is a faster real-time proxy than recomputing the yield spread intraday — see the data pack's synthetic DXY figure
+- A scheduled CPI/NFP/rate decision inside the holding window can snap the spread discontinuously; this is event risk, not drift, and should be flagged as such rather than extrapolated
 
 ### 3. Geopolitical Risk Assessment
 

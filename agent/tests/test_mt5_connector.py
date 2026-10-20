@@ -286,6 +286,31 @@ def test_mt5_executions_carry_magic_and_comment(fake_terminal) -> None:
     assert executions[0]["comment"] == "signal-ea"
 
 
+def test_mt5_get_open_orders_forwards_executions_lookback_days(fake_terminal, monkeypatch) -> None:
+    """Regression: get_open_orders used to hardcode _recent_deals' 7-day
+    default with no way for a caller to widen it. A caller checking for a
+    LONGER drought (committee_reporter.py's trade-drought alert) needs a
+    window wider than the drought threshold it's testing, or the deal
+    proving the drought falls outside the fetch window entirely and looks
+    like "never traded" -- see that module's _check_trade_drought."""
+    from datetime import datetime, timedelta, timezone
+
+    captured: dict = {}
+
+    def _history_deals_get(date_from, date_to):
+        captured["date_from"] = date_from
+        return ()
+
+    monkeypatch.setattr(fake_terminal, "history_deals_get", _history_deals_get)
+
+    cfg = mt5.MT5Config(profile="paper")
+    mt5.get_open_orders(cfg, include_executions=True, executions_lookback_days=30)
+
+    # Default _recent_deals(days=7) would have looked back ~7 days + the 14h
+    # skew guard; 30 days back must be noticeably further than that.
+    assert captured["date_from"] < datetime.now(timezone.utc) - timedelta(days=29)
+
+
 def test_mt5_executions_carry_position_id_and_entry(fake_terminal) -> None:
     """Regression: a closing deal's `order` field is 0 in practice (no usable
     back-reference to the opening order) — only `position_id` reliably links

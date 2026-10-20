@@ -78,6 +78,30 @@ def test_requesty_capabilities_mirror_openrouter() -> None:
     assert requesty.send_reasoning_content is False
 
 
+def test_prompt_caching_only_for_claude_via_openrouter() -> None:
+    """Caching is model-dependent even within openrouter -- non-Claude models
+    routed through openrouter must NOT get cache_control injected (it's a
+    no-op or worse for providers that don't understand it), and requesty
+    stays off entirely since its Claude-routing caching behavior is
+    unverified (see capabilities.py's get_provider_capabilities comment)."""
+    claude_via_openrouter = get_provider_capabilities("openrouter", "anthropic/claude-sonnet-5")
+    claude_bare_name = get_provider_capabilities("openrouter", "claude-haiku-4-5")
+    deepseek_via_openrouter = get_provider_capabilities("openrouter", "deepseek/deepseek-v4-pro")
+    native_deepseek = get_provider_capabilities("deepseek", "deepseek-v4-pro")
+    claude_via_requesty = get_provider_capabilities("requesty", "anthropic/claude-sonnet-5")
+
+    assert claude_via_openrouter.prompt_caching is True
+    assert claude_bare_name.prompt_caching is True
+    assert deepseek_via_openrouter.prompt_caching is False
+    assert native_deepseek.prompt_caching is False
+    assert claude_via_requesty.prompt_caching is False
+
+    # The base openrouter capability object itself must stay unmutated --
+    # get_provider_capabilities returns a per-call dataclasses.replace()
+    # copy for Claude models, never mutating the shared _PROVIDERS entry.
+    assert get_provider_capabilities("openrouter", "deepseek/deepseek-v4-pro").prompt_caching is False
+
+
 def test_reasoning_effort_extra_body_is_openrouter_only() -> None:
     """LANGCHAIN_REASONING_EFFORT should not leak into official DeepSeek payloads."""
     import src.providers.llm as llm_mod

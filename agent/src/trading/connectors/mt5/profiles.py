@@ -19,6 +19,20 @@ the app's other live brokers — it is denied unless a committed mandate exists
 for broker key ``"mt5"`` (see ``scripts/commit_mt5_mandate.py``) authorizing
 the ``CFD`` instrument type and the order's asset class (``forex``/
 ``commodity``/``us_index`` — ``src.trading.service._mt5_asset_class``).
+
+``mt5fn-live-trade`` is the same connector module under a distinct connector
+key (``"mt5fn"``) for a separate prop-firm challenge account (FundedNext).
+Runs alongside ``mt5-live-trade`` on the SAME machine (as of 2026-09-16) via
+its own SEPARATE terminal instance (this profile's ``config["terminal_path"]``
+points at an independently-installed copy of the terminal, since one terminal
+process can only be signed into one account at a time — see ``sdk.py``'s
+``MT5Config.terminal_path`` docstring on multi-terminal setups) — it never
+shares a live IPC session with the ``mt5`` profiles above regardless of
+whether that second terminal lives on this machine or a separate one. Using a
+different connector key (rather than just a different profile id) gives it a
+fully independent mandate/kill-switch/daily-count under
+``<runtime_root>/live/mt5fn/`` — see ``scripts/commit_fundednext_mandate.py``
+and ``src.trading.service._SDK_CONNECTOR_MODULES``/``_order_classification``.
 """
 
 from __future__ import annotations
@@ -60,13 +74,69 @@ MT5_PROFILES: tuple[TradingProfile, ...] = (
         transport="broker_sdk",
         capabilities=READ_CAPABILITIES + ("orders.place",),
         readonly=False,
-        config={"profile": "live-trade"},
+        config={
+            "profile": "live-trade",
+            # Pinned 2026-09-24: with no terminal_path, MetaTrader5.initialize()
+            # attaches to whichever terminal the library picks by default, and
+            # once the FundedNext terminal (mt5fn-live-trade below) was running
+            # on the same machine, that became the FundedNext one after a
+            # reboot -- this profile read FundedNext's account (login 14243509)
+            # and wrote its $5,947 equity into logs/live_baseline.json as the
+            # Exness baseline. Pinning the Exness install makes the routing
+            # explicit on both sides.
+            "terminal_path": r"C:\Program Files\ExnessKE MT5 Terminal\terminal64.exe",
+            # Exness names symbols with an "m" suffix (EURUSDm). service.place_order
+            # appends it when an order arrives without it -- added 2026-09-29 after
+            # a committee sent "EURUSD" and the order was denied as unpriceable.
+            "symbol_suffix": "m",
+        },
         notes=(
             "Places REAL orders against whatever account is signed into your local "
             "MT5 terminal. Refuses to trade if that account is a demo account. "
             "Every order is gated by the committed mt5 mandate (hard caps, kill "
             "switch, audit log) before it reaches the broker — see "
             "scripts/commit_mt5_mandate.py."
+        ),
+    ),
+    TradingProfile(
+        id="mt5fn-live-trade",
+        connector="mt5fn",
+        label="MetaTrader 5 · FundedNext Challenge Trade",
+        environment="live",
+        transport="broker_sdk",
+        capabilities=READ_CAPABILITIES + ("orders.place",),
+        readonly=False,
+        config={
+            "profile": "live-trade",
+            "magic": 20260001,
+            # Runs alongside mt5-live-trade on the SAME machine (2026-09-16,
+            # after VPS RDP issues) -- a single terminal can only be signed
+            # into one account at a time, so this points at a SEPARATE
+            # terminal process. NOTE: an earlier attempt copied the Exness
+            # terminal folder to C:\MT5-FundedNext, but that copy's local
+            # broker-server registry didn't have FundedNext's servers
+            # correctly registered (caused "Invalid account" on login --
+            # likely resolved to a wrong/differently-named server entry). A
+            # fresh OFFICIAL MetaTrader 5 install (via mt5setup.exe from
+            # metatrader5.com, NOT a copy) at the default path below
+            # connected correctly on the first real attempt -- use a fresh
+            # official install for any future terminal, not a copy, to avoid
+            # this class of bug.
+            "terminal_path": r"C:\Program Files\MetaTrader 5\terminal64.exe",
+        },
+        notes=(
+            "Places REAL orders against the FundedNext Stellar 1-Step challenge "
+            "account signed into a SEPARATE MT5 terminal instance at "
+            "C:\\Program Files\\MetaTrader 5 (not the mt5-live-trade account's "
+            "terminal -- MT5 only supports one signed-in account per terminal "
+            "process, so this is a distinct, independently-installed terminal "
+            "running alongside it). Refuses to trade if that account is a demo "
+            "account. Uses the distinct 'mt5fn' broker key so its "
+            "mandate/kill-switch/daily-count (hard caps, self-imposed "
+            "daily-loss and max-drawdown circuit breakers, audit log) are fully "
+            "independent of the mt5-live-trade account — see "
+            "scripts/commit_fundednext_mandate.py and "
+            "scripts/fundednext_guardrails.py."
         ),
     ),
 )

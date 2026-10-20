@@ -10,6 +10,8 @@ category: strategy
 Retrieve minute-level candlestick data through data-source APIs and calculate intraday indicators (VWAP, TWAP, volume distribution, and more).
 Supports minute-level backtesting: set `"interval": "5m"` in `config.json` and use the `backtest` tool to run intraday strategies.
 
+**If you were told to read a `DATA PACK FILE` for your target instrument first (the live FX day-desk committees do this), do not use this skill's APIs (OKX/Tushare/yfinance) to fetch additional minute bars for that same instrument** — none of those sources carry this account's broker feed (e.g. MT5 `EURUSDm`), the data pack is the mandated ground truth, and a mismatched external source can actively disagree with the broker's own prices. This skill's data-fetching sections are for other strategies/backtesting work, not for re-fetching data already provided in a data pack.
+
 ## Backtest Configuration
 
 For minute-level backtests, simply add the `interval` field in `config.json`:

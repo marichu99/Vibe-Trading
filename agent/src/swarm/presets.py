@@ -278,4 +278,5 @@ def build_run_from_preset(preset_name: str, user_vars: dict[str, str]) -> SwarmR
         agents=agents,
         tasks=tasks,
         created_at=now.isoformat(),
+        grounding_enabled=bool(data.get("grounding", True)),
     )

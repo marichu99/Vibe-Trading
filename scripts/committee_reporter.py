@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import smtplib
+import socket
 import subprocess
 import sys
 import time
@@ -44,6 +45,10 @@ from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+
+import fundednext_news_calendar as fn_news  # noqa: E402  (shared calendar, not FundedNext-specific)
+import market_data_pack  # same scripts/ directory
+import strategy_tracking  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT_DIR = REPO_ROOT / "agent"
@@ -70,6 +75,11 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("committee_reporter")
+# Defense-in-depth (D1, 2026-10-06) -- see fn_news.mask_secrets' own
+# docstring for why this is a backstop, not the primary fix, and does not
+# cover the emailed report body.
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(fn_news.mask_secrets())
 
 # --------------------------------------------------------------------------- #
 # What to run each pass — add/remove targets freely.
@@ -112,41 +122,76 @@ TARGETS: list[dict[str, object]] = [
         # own ~0.00076-price-unit (~7.6-pip, ~$0.76) 15m-ATR stop floor
         # verified above — enough headroom past ordinary noise to avoid
         # arming on a whipsaw, but reachable by a real favorable move.
-        "committee": "investment_committee", "target": "EURUSD", "market": "forex",
+        "committee": "fx_commodity_day_desk", "target": "EURUSD", "market": "forex",
+        # sessions: added 2026-10-09 at the user's explicit request, after a
+        # cost discussion (~$0.30/pass, OpenRouter balance was $3.38 at the
+        # time) -- EURUSD trade-enabled at London open too, not just
+        # new_york, as the smallest-footprint way to test whether trading
+        # London adds anything: one symbol, this account only. GBPUSD (below)
+        # and both FundedNext targets deliberately untouched -- omitting
+        # "sessions" on a TARGETS entry defaults to {"new_york"} only (see
+        # run_once's docstring), so nothing else in TARGETS changed behavior.
+        "sessions": {"new_york", "london"},
         "trade": {
             "symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
             "early_profit_trigger_usd": 1.00,
         },
     },
     {
-        # LIVE — added 2026-09-04 at the user's request, as a genuine
-        # diversifier alongside EURUSD rather than a third same-bet pair.
-        # Checked real 60-day daily-return correlation against EURUSDm before
-        # adding: AUDUSD 0.61 (best of the USD-quoted candidates) vs. GBPUSD
-        # 0.83 and NZDUSD 0.76 (too correlated — mostly doubling the same
-        # EUR-bloc-vs-USD bet, not real diversification). USDCAD/USDJPY were
-        # more negatively correlated (-0.69 / -0.52) but were NOT added: MT5
-        # contract_size() returns raw units, so _max_stop_distance's
-        # MAX_LOSS_PER_ORDER_USD / (contract_size * lots) formula is only
-        # correct in USD terms when the QUOTE currency is USD (true for
-        # AUDUSD/EURUSD/GBPUSD, false for USDCAD/USDJPY where the quote
-        # currency is CAD/JPY) — using those today would silently mis-price
-        # the dollar risk cap without an added currency-conversion step.
-        # Verified read-only before enabling: AUDUSDm contract_size=100000,
-        # 15m-ATR stop floor ~$0.54 at 0.01 lots — comfortably inside the $4
-        # cap (see MAX_LOSS_PER_ORDER_USD above). max_stack=1: same
-        # no-pyramiding policy as the other live targets.
-        #
-        # early_profit_trigger_usd: same 2026-09-09 fix as EURUSDm above,
-        # same reasoning — $0.75 is ~1.4x this pair's own $0.54 ATR-floor
-        # figure verified above (the module default's ~80-pip requirement is
-        # unreachable at 0.01 lots).
-        "committee": "investment_committee", "target": "AUDUSD", "market": "forex",
+        # LIVE — added 2026-09-24 at the user's request, mirroring the
+        # FundedNext bot's EURUSD/GBPUSD setup: paired with EURUSDm in
+        # EXCLUSIVE_SYMBOL_GROUP below, so at most one of the two is ever
+        # open (0.84 correlation -- both open is one doubled USD bet).
+        # Live-verified before enabling: USD-quoted (so _max_stop_distance's
+        # USD math holds), contract_size 100,000, 15m-ATR stop floor ~0.00076
+        # -> ~$0.76 risk at 0.01 lots vs. the $4 cap; ~$1,320 notional vs.
+        # the mandate's $6,000 -- no mandate change needed ("forex" already
+        # authorized). Note Exness's GBPUSDm spread (~1 pip) is ~13% of that
+        # stop floor vs. ~7% for EURUSDm -- tradable, but a real cost gap.
+        # early_profit_trigger_usd $1.00 = 10 pips at 0.01 lots, the same
+        # arming distance as EURUSDm's.
+        "committee": "fx_commodity_day_desk", "target": "GBPUSD", "market": "forex",
         "trade": {
-            "symbol": "AUDUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
-            "early_profit_trigger_usd": 0.75,
+            "symbol": "GBPUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
+            "early_profit_trigger_usd": 1.00,
         },
     },
+    # PAUSED 2026-09-24 at the user's request, purely to halve LLM spend:
+    # each committee pass (lead + bull/bear/risk-officer sub-agents) costs
+    # ~$0.80 on OpenRouter, ~$3.20/NY day across both bots' two pairs, vs.
+    # this account's total trading P&L of +$2.41 to date. Kept EURUSD
+    # because it is where all of this account's profit came from (15 trades,
+    # +$11.33, 12W/3L) while AUDUSD was net negative (13 trades, -$1.69).
+    # No mandate change needed to re-enable -- just uncomment this block.
+    # {
+    #     # LIVE — added 2026-09-04 at the user's request, as a genuine
+    #     # diversifier alongside EURUSD rather than a third same-bet pair.
+    #     # Checked real 60-day daily-return correlation against EURUSDm before
+    #     # adding: AUDUSD 0.61 (best of the USD-quoted candidates) vs. GBPUSD
+    #     # 0.83 and NZDUSD 0.76 (too correlated — mostly doubling the same
+    #     # EUR-bloc-vs-USD bet, not real diversification). USDCAD/USDJPY were
+    #     # more negatively correlated (-0.69 / -0.52) but were NOT added: MT5
+    #     # contract_size() returns raw units, so _max_stop_distance's
+    #     # MAX_LOSS_PER_ORDER_USD / (contract_size * lots) formula is only
+    #     # correct in USD terms when the QUOTE currency is USD (true for
+    #     # AUDUSD/EURUSD/GBPUSD, false for USDCAD/USDJPY where the quote
+    #     # currency is CAD/JPY) — using those today would silently mis-price
+    #     # the dollar risk cap without an added currency-conversion step.
+    #     # Verified read-only before enabling: AUDUSDm contract_size=100000,
+    #     # 15m-ATR stop floor ~$0.54 at 0.01 lots — comfortably inside the $4
+    #     # cap (see MAX_LOSS_PER_ORDER_USD above). max_stack=1: same
+    #     # no-pyramiding policy as the other live targets.
+    #     #
+    #     # early_profit_trigger_usd: same 2026-09-09 fix as EURUSDm above,
+    #     # same reasoning — $0.75 is ~1.4x this pair's own $0.54 ATR-floor
+    #     # figure verified above (the module default's ~80-pip requirement is
+    #     # unreachable at 0.01 lots).
+    #     "committee": "investment_committee", "target": "AUDUSD", "market": "forex",
+    #     "trade": {
+    #         "symbol": "AUDUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1,
+    #         "early_profit_trigger_usd": 0.75,
+    #     },
+    # },
     # Re-enabled 2026-09-08, at the user's request — the milestone reminder
     # (_check_silver_milestone) had been firing every pass since equity first
     # crossed $100, and the original 2026-09-01 pause rationale (a clean,
@@ -209,6 +254,17 @@ TARGETS: list[dict[str, object]] = [
     # {"committee": "risk_committee", "target": "XAUUSD", "market": "commodity/forex"},
 ]
 
+# Symbols of which at most one may hold an open position at a time
+# (2026-09-24, added with GBPUSDm; mirrors fundednext_reporter.py's
+# EXCLUSIVE_SYMBOL_GROUP -- the two are hand-kept in sync, not derived from a
+# shared correlation source, so re-enabling a paused correlated symbol (e.g.
+# AUDUSDm) here or there must also update the OTHER file's set, or the
+# concentration-risk guard silently does nothing for the new pair; flagged
+# by /code-review 2026-10-13). While one is open, run_once skips the other's
+# committee entirely (no LLM cost) and sends a one-line (SKIPPED) email;
+# run_committee also falls back to research-only as defense in depth.
+EXCLUSIVE_SYMBOL_GROUP = frozenset({"EURUSDm", "GBPUSDm"})
+
 # This caps the WRAPPING agent's own loop (run_swarm once, check positions,
 # maybe place an order, write the report) — a handful of iterations is
 # normally enough for that. It does NOT cap each swarm sub-agent's own
@@ -265,7 +321,12 @@ SIGNAL_ACTIVITY_MAX_LINES = 5
 # subprocess). Deliberately terse (one line, not full reasoning replay/an
 # extra LLM call) — the whole point was minimum added token cost, not a
 # richer feedback mechanism.
-TRADE_JOURNAL_PATH = REPO_ROOT / "logs" / "trade_journal.json"
+# Aliased from strategy_tracking's own copy (not redefined independently)
+# so there is one source of truth for this path -- pooled_scale_status reads
+# strategy_tracking.EXNESS_JOURNAL_PATH directly, and a path that drifted
+# between the two copies would silently halve that function's sample
+# (code review 2026-10-02).
+TRADE_JOURNAL_PATH = strategy_tracking.EXNESS_JOURNAL_PATH
 JOURNAL_SUMMARY_WINDOW = 8
 
 # Grace period before a journal entry not found in get_positions() is
@@ -355,9 +416,11 @@ PORTFOLIO_MAX_CONCURRENT_TRADES = 3
 # answer is that this instrument's current volatility doesn't fit the risk
 # budget at this position size, and the pass should WAIT rather than take a
 # trade with an inadequate stop.
-ATR_PERIOD = "15m"
-ATR_LOOKBACK_BARS = 14
-ATR_STOP_MULTIPLE = 1.5
+# Moved to strategy_tracking.py 2026-10-13 (found by /code-review): these
+# were byte-for-byte duplicated with fundednext_reporter.py's copy.
+ATR_PERIOD = strategy_tracking.ATR_PERIOD
+ATR_LOOKBACK_BARS = strategy_tracking.ATR_LOOKBACK_BARS
+ATR_STOP_MULTIPLE = strategy_tracking.ATR_STOP_MULTIPLE
 
 # Spread floor for the stop-loss: on a tight enough stop, the live bid/ask
 # spread alone (before any fill slippage) eats a large share of the planned
@@ -442,6 +505,32 @@ REPORTER_LOG_PATH = REPO_ROOT / "logs" / "reporter.log"
 # independently derived more than once.
 WEEKEND_CUTOFF_UTC_HOUR = 20
 WEEKEND_STATE_PATH = REPO_ROOT / "logs" / "weekend_state.json"
+# A close that keeps failing all weekend (market already shut, broker
+# rejects it, etc.) must not go completely unmentioned after its first
+# failure email -- that's still an open position sitting through the
+# weekend gap-risk window. Re-notify on a standing failure after this many
+# hours of silence, instead of only ever re-notifying on a NEW successful
+# close (found by /code-review 2026-10-13).
+WEEKEND_FAILURE_RENOTIFY_HOURS = 6
+
+# Session-gated trading (2026-09-21): the loop deliberates 3x/day, anchored
+# to session opens, but only the New York pass (highest-liquidity window --
+# London/NY overlap) is allowed to trade; Asia/London passes are research-
+# only. See _next_session_boundary's own docstring for the schedule and
+# _build_prompt for how a same-day Asia/London read gets carried into the
+# NY pass instead of being thrown away.
+SESSION_BIAS_STATE_PATH = REPO_ROOT / "logs" / "session_bias_state.json"
+
+# Research-only (Asia/London) passes switched off 2026-09-24 to cut LLM cost:
+# they ran the full paid committee 2x/day per symbol but can never trade, and
+# their carry-over into the NY prompt (_record_session_bias) had never
+# actually produced a session_bias_state.json since the feature shipped on
+# 2026-09-21 -- so they were pure spend (~2/3 of all LLM calls) against a
+# live account whose total trading P&L to date (+$2.41) was a fraction of
+# the ~$20 LLM bill. run_once still fires at those boundaries so the
+# drought/cap-fit/balance alerts keep their 3x/day cadence; it just returns
+# before any committee runs. Flip to True to bring them back.
+RESEARCH_PASSES_ENABLED = False
 
 # Breakeven-stop management ("dual take-profit, Option A"): 0.01 lots is
 # XAUUSDm's broker-enforced minimum AND step size (confirmed live via
@@ -457,6 +546,42 @@ WEEKEND_STATE_PATH = REPO_ROOT / "logs" / "weekend_state.json"
 # check is pure API reads plus at most one SLTP modify (zero LLM cost).
 BREAKEVEN_POLL_SECONDS = 300
 BREAKEVEN_TRIGGER_FRACTION = 0.5
+
+# Stop-moving rules OFF (2026-09-24 exit replay, applied 2026-09-28 at the
+# user's request): replaying all 34 closed trades on M5 bars, plain
+# stop+target (plus the MAX_HOLD_HOURS time stop and the weekend flatten)
+# scored -0.97R total vs. -6.47R under the three stop-moving rules below --
+# each layer cut winners short while losers still took the full -1R
+# (Exness avg win 0.47R with them vs. 1.15R without; early-profit trail
+# ~-3.4R, time-decay trail ~-1R, breakeven-at-50%-of-target ~-1.2R).
+# Small sample, but every added layer lowered the total. With this False,
+# _profit_protection_check only enforces the MAX_HOLD_HOURS flatten;
+# breakeven (rule 1), early-profit trail (rule 2) and time-decay (rule 3b)
+# are skipped. Flip to True to restore them.
+STOP_TRAILING_ENABLED = False
+
+# Hard trend gate ON (2026-09-28, user's request): when H4 and D1 both trend
+# the same way, only that direction may be traded -- told to the committee
+# up front (strategy_tracking.trend_rule_prompt) and enforced after the fill
+# (_enforce_trend_rule closes a counter-trend order immediately). Motivated
+# by 2026-09-25, when both bots bought EURUSD into a downtrend on every
+# timeframe. Fails open if trend data can't be read. Flip to False to disable.
+TREND_FILTER_ENABLED = True
+
+# Rulebook (2026-09-30): the user's prop-firm rules, applied to both bots.
+# Exits stay plain stop+target (STOP_TRAILING_ENABLED) -- the proposed
+# breakeven/partial/trail "Rule 1" replayed at -4.22R vs +0.48R.
+MAX_STOP_PRICE_FRACTION = 0.01  # a stop farther than 1% of price is tightened to it
+NEWS_BLACKOUT_WINDOW_MINUTES = 120  # rulebook: no trade within 2h of a high-impact release
+# Rulebook daily loss stop: research-only for the rest of the day once equity is
+# this far below the day's baseline. Unlike LIVE_DRAWDOWN_HALT_PCT it does NOT
+# trip the (persistent, manually-cleared) kill switch -- it resets with the
+# next day's baseline. The 0.75% per-trade cap is NOT applied here: at ~$125
+# equity it is ~$0.93, below the minimum 0.01-lot risk at the ATR floor.
+DAILY_LOSS_STOP_PCT = 0.02
+
+BOT = "exness"
+BROKER_SERVER_TZ = timezone.utc  # Exness MT5 server clock is UTC (verified 2026-09-26)
 
 # modify_position's own validation rejects an SL sitting exactly at entry
 # ("stop_loss X must be below/above entry X") -- confirmed live 2026-09-03:
@@ -741,30 +866,10 @@ def _effective_max_loss_usd(connection: str) -> float:
     return min(MAX_LOSS_PER_ORDER_USD, portfolio_budget)
 
 
-def _mt5_config_for(connection: str):
-    """Resolve the actual MT5Config (incl. terminal_path) for a connection id.
-
-    Real bug found 2026-09-18 (originally caught and fixed on the sibling
-    fundednext_reporter.py first): _max_stop_distance/_atr_stop_floor used
-    to call mt5_sdk.contract_size()/get_historical_bars() with NO config,
-    which defaults to load_config() (the global ~/.vibe-trading/mt5.json --
-    bare MT5Config() if that file doesn't exist, terminal_path=""). With
-    only the Exness terminal ever running, an unpathed call had nothing
-    ambiguous to resolve against and accidentally always worked. Now that
-    the FundedNext bot runs a SEPARATE terminal on this SAME machine, an
-    unpathed call from a fresh `cli run` subprocess (a new one spawns every
-    pass) can silently attach to WHICHEVER terminal MT5 happens to find --
-    non-deterministic, not just "it worked once so it's fine." Every call
-    needs the correct profile's config explicitly, same pattern already
-    used elsewhere in this file (_live_circuit_breaker_check,
-    _weekend_flatten_and_notify, _profit_protection_check).
-    """
-    sys.path.insert(0, str(AGENT_DIR))
-    from src.trading.connectors.mt5 import sdk as mt5_sdk
-    from src.trading.profiles import profile_by_id
-
-    profile = profile_by_id(connection)
-    return mt5_sdk.build_config(profile.config, {})
+# Moved to strategy_tracking.py 2026-10-13 (found by /code-review): was
+# byte-for-byte duplicated with fundednext_reporter.py's copy. See that
+# module's docstring for the full history/rationale.
+_mt5_config_for = strategy_tracking._mt5_config_for
 
 
 def _max_stop_distance(symbol: str, lots: float, budget_usd: float, connection: str) -> float | None:
@@ -791,38 +896,9 @@ def _max_stop_distance(symbol: str, lots: float, budget_usd: float, connection: 
     return budget_usd / (size * lots)
 
 
-def _atr_stop_floor(symbol: str, connection: str) -> float | None:
-    """Minimum stop-loss distance (price units) to sit outside normal noise, or None if unavailable.
-
-    ATR_STOP_MULTIPLE x ATR(ATR_LOOKBACK_BARS) on ATR_PERIOD bars, computed
-    from the most recent real bars — pure historical-bar math, zero LLM cost.
-    Fails open (returns None) on any read error; a pass this can't compute
-    for just proceeds without the floor rather than blocking trading over a
-    transient data-feed hiccup.
-    """
-    sys.path.insert(0, str(AGENT_DIR))
-    from src.trading.connectors.mt5 import sdk as mt5_sdk
-
-    try:
-        config = _mt5_config_for(connection)
-        bars = mt5_sdk.get_historical_bars(symbol, config=config, period=ATR_PERIOD, limit=ATR_LOOKBACK_BARS + 1)["bars"]
-    except Exception:
-        return None
-
-    bars = [b for b in bars if b.get("high") is not None and b.get("low") is not None and b.get("close") is not None]
-    if len(bars) < 2:
-        return None
-
-    true_ranges = [
-        max(
-            bars[i]["high"] - bars[i]["low"],
-            abs(bars[i]["high"] - bars[i - 1]["close"]),
-            abs(bars[i]["low"] - bars[i - 1]["close"]),
-        )
-        for i in range(1, len(bars))
-    ]
-    atr = sum(true_ranges) / len(true_ranges)
-    return atr * ATR_STOP_MULTIPLE if atr > 0 else None
+# Moved to strategy_tracking.py 2026-10-13 (found by /code-review): was
+# byte-for-byte duplicated with fundednext_reporter.py's copy.
+_atr_stop_floor = strategy_tracking._atr_stop_floor
 
 
 def _spread_stop_floor(quote: dict | None) -> float | None:
@@ -935,21 +1011,34 @@ def _read_journal() -> list[dict]:
 
 
 def _write_journal(entries: list[dict]) -> None:
+    # Atomic write (temp file + os.replace, same pattern as strategy_tracking.
+    # _write_decisions) -- a plain write_text left a window where a concurrent
+    # reader (pooled_scale_status, exit_replay, the weekly report) could see a
+    # half-written file and silently treat the JSONDecodeError as "0 trades"
+    # for this bot instead of a real parse failure (code review 2026-10-02).
     TRADE_JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    TRADE_JOURNAL_PATH.write_text(json.dumps(entries, indent=2, default=str), encoding="utf-8")
+    tmp = TRADE_JOURNAL_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(entries, indent=2, default=str), encoding="utf-8")
+    tmp.replace(TRADE_JOURNAL_PATH)
 
 
-def _extract_placed_order(run_id: str) -> dict | None:
-    """Pull the verified trading_place_order RESULT (not the LLM's own report).
+def _extract_placed_orders(run_id: str) -> list[dict]:
+    """Pull every verified trading_place_order RESULT (not the LLM's own report).
 
-    Reads the trace's real tool_result record — the connector's own response
+    Reads the trace's real tool_result records — the connector's own response
     (ticket/side/quantity/fill_price/stop_loss/take_profit) — rather than
     trusting the committee's free-text summary of what it did.
 
-    Returns:
-        The connector's place_order response dict on a successful placement,
-        or None if this run didn't place one.
+    Returns every successful placement in trace order, not just the first:
+    the prompt explicitly tells the committee it may retry trading_place_order
+    after a rejected attempt (see _build_prompt's STOP-LOSS RECOMPUTATION RULE
+    comment), so a pass placing more than one order — e.g. the LLM misreads an
+    ambiguous first result as a failure and "retries" an order that had
+    already gone through — is a real, reachable case. Every such fill must run
+    through the post-trade guardrail chain (spec/trend/stop-floor/reward:risk)
+    and be journaled, not just the first one found by run_committee.
     """
+    orders = []
     for e in _trace_entries(run_id):
         if e.get("type") != "tool_result" or e.get("tool") != "trading_place_order":
             continue
@@ -961,8 +1050,15 @@ def _extract_placed_order(run_id: str) -> dict | None:
         except (TypeError, json.JSONDecodeError):
             continue
         if isinstance(parsed, dict) and parsed.get("status") == "ok":
-            return parsed
-    return None
+            orders.append(parsed)
+    return orders
+
+
+def _extract_placed_order(run_id: str) -> dict | None:
+    """Convenience single-result wrapper around _extract_placed_orders — the
+    first successful placement, or None if this run didn't place one."""
+    orders = _extract_placed_orders(run_id)
+    return orders[0] if orders else None
 
 
 def _blocked_order_note(run_id: str) -> str | None:
@@ -1008,7 +1104,15 @@ def _blocked_order_note(run_id: str) -> str | None:
 
 
 def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
-    """Append a new open-trade record from a verified place_order result."""
+    """Append a new open-trade record from a verified place_order result.
+
+    Real incident 2026-09-18 (found on the FundedNext sibling first, same
+    bug here): order.get("fill_price") can be 0.0 (MT5's order-send
+    response doesn't always have the real fill price populated yet — see
+    _resolve_fill_price). A journal entry recorded with entry_price=0.0 can
+    never be correctly classified win/loss on close (outcome stays
+    "unknown" forever). Use the same fallback here, at write time.
+    """
     entries = _read_journal()
     entries.append({
         "ticket": str(order.get("order_id") or ""),
@@ -1016,11 +1120,15 @@ def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
         "connection": connection,
         "side": order.get("side"),
         "lots": order.get("quantity"),
-        "entry_price": order.get("fill_price"),
+        "entry_price": _resolve_fill_price({"connection": connection}, order),
         "stop_loss": order.get("stop_loss"),
         "take_profit": order.get("take_profit"),
         "opened_at": datetime.now(timezone.utc).isoformat(),
         "status": "open",
+        "strategy_version": strategy_tracking.STRATEGY_VERSION,
+        "stop_adjusted": bool(order.get("stop_adjusted")),
+        "trend_alignment": order.get("trend_alignment"),
+        "regime": order.get("regime"),
     })
     _write_journal(entries)
 
@@ -1177,6 +1285,7 @@ def _journal_reconcile_closed(symbol: str, connection: str) -> None:
         else:
             entry["closed_at"] = datetime.now(timezone.utc).isoformat()
             entry["outcome"] = "unknown"  # closed, but couldn't match the closing deal
+        entry["review"] = strategy_tracking.review_closed_trade(entry)
         changed = True
 
     if changed:
@@ -1202,9 +1311,16 @@ def _journal_summary_text(symbol: str) -> str | None:
     # Only mentioned when it's actually happened — keeps a clean run's prompt
     # from growing for no reason (same "minimum tokens" discipline as the
     # rest of this block).
+    # Reworded 2026-10-06 (D5): the old "a stop-management issue, not an
+    # entry-quality one" framing biased the committee toward MORE active
+    # stop management on exactly the pattern the exit_replay evidence (n=39)
+    # shows is negative-expectancy to touch -- see STRATEGIC CONTEXT /
+    # strategy_tracking.strategic_context_prompt for the locked-exits
+    # rationale this line must not contradict.
     reversal_note = (
-        f" {reversals} of these moved favorably before reversing to a loss — "
-        f"a stop-management issue, not an entry-quality one."
+        f" {reversals} of last {len(scored)} closed trades moved favorably before reversing. Note: "
+        f"replay evidence (n=39) shows stop-tightening on this pattern is negative-expectancy; the "
+        f"correct response is entry/stop-sizing discipline, not exit management."
         if reversals else ""
     )
     return (
@@ -1268,6 +1384,26 @@ def _live_circuit_breaker_check(trade: dict) -> str | None:
     if baseline_equity <= 0:
         return None
     drawdown = (baseline_equity - equity) / baseline_equity
+
+    # DAILY_LOSS_STOP_PCT's own comment promises "research-only for the rest
+    # of the day" once tripped -- but this used to just re-compare the
+    # INSTANTANEOUS drawdown on every call, with nothing persisted. Real
+    # scenario: equity dips past the 2% stop on one check (research-only),
+    # then recovers above it by a later same-day check (a second scheduled
+    # pass, a manual re-run, or --loop with a short --interval) -- live
+    # trading would silently resume, contradicting the rulebook. Persisted
+    # on the baseline dict so it naturally resets with tomorrow's fresh
+    # baseline, same lifecycle as baseline_equity itself.
+    daily_loss_stop_tripped = bool(baseline.get("daily_loss_stop_tripped"))
+    if not daily_loss_stop_tripped and DAILY_LOSS_STOP_PCT <= drawdown < LIVE_DRAWDOWN_HALT_PCT:
+        baseline["daily_loss_stop_tripped"] = True
+        _write_live_baseline(baseline)
+        daily_loss_stop_tripped = True
+    if daily_loss_stop_tripped and drawdown < LIVE_DRAWDOWN_HALT_PCT:
+        return (
+            f"[DAILY LOSS STOP] equity ${equity:.2f} is {drawdown:.1%} below today's baseline "
+            f"${baseline_equity:.2f} (limit {DAILY_LOSS_STOP_PCT:.0%}) -- no new trades today (rulebook)."
+        )
     if drawdown < LIVE_DRAWDOWN_HALT_PCT:
         return None
 
@@ -1316,6 +1452,83 @@ def _in_weekend_window(now: datetime) -> bool:
     return now.weekday() == 4 and now.hour >= WEEKEND_CUTOFF_UTC_HOUR  # Fri evening
 
 
+# Moved to strategy_tracking.py 2026-10-13 (found by /code-review): was
+# byte-for-byte duplicated with fundednext_reporter.py's copy.
+_next_session_boundary = strategy_tracking._next_session_boundary
+
+
+def _next_pass_due_text(now: datetime) -> str:
+    """Human-readable 'next scheduled pass' string, straight from the schedule
+    (not derived from log arithmetic -- see _status_log_summary's comment for
+    why the old interval-based computation was retired)."""
+    boundary, session = _next_session_boundary(now)
+    return f"{boundary.strftime('%Y-%m-%d %H:%M:%S')} UTC ({session})"
+
+
+# Moved to strategy_tracking.py 2026-10-13 (found by /code-review): was
+# byte-for-byte duplicated with fundednext_reporter.py's copy. Its only
+# caller, _record_session_bias, is only ever invoked for Asia/London
+# passes, which have been fully disabled (RESEARCH_PASSES_ENABLED=False)
+# since 2026-09-24 -- already dead in production before this move.
+_parse_decision_reasoning = strategy_tracking._parse_decision_reasoning
+
+
+def _read_session_bias() -> dict:
+    try:
+        return json.loads(SESSION_BIAS_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _write_session_bias(data: dict) -> None:
+    SESSION_BIAS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SESSION_BIAS_STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _record_session_bias(symbol: str, session: str, report_text: str) -> None:
+    """Save a research-only pass's Decision/Reasoning for the NY pass to read back.
+
+    Keyed by symbol -> session ("asia"/"london") -> {date, decision,
+    reasoning}, so _session_bias_fact can filter to only today's entries --
+    a restart mid-day loses nothing (the next research pass just re-records
+    today's read), and a stale prior day's entry is never accidentally
+    carried forward.
+    """
+    parsed = _parse_decision_reasoning(report_text)
+    if parsed is None:
+        return
+    decision, reasoning = parsed
+    data = _read_session_bias()
+    data.setdefault(symbol, {})[session] = {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "decision": decision,
+        "reasoning": reasoning,
+    }
+    _write_session_bias(data)
+
+
+def _session_bias_fact(symbol: str) -> str:
+    """Build a prompt fact block from today's Asia/London reads for symbol, or "" if none."""
+    entries = _read_session_bias().get(symbol, {})
+    today = datetime.now(timezone.utc).date().isoformat()
+    lines = []
+    for session in ("asia", "london"):
+        entry = entries.get(session)
+        if not isinstance(entry, dict) or entry.get("date") != today:
+            continue
+        lines.append(
+            f"Your {session.capitalize()} session read on {symbol} today: {entry.get('decision', '')} "
+            f"— {entry.get('reasoning', '')}"
+        )
+    if not lines:
+        return ""
+    return (
+        "Earlier session reads today (research-only passes, no trade was placed on "
+        "either — this is context for your decision now, not a commitment to follow it):\n"
+        + "\n".join(lines)
+    )
+
+
 def _read_weekend_state() -> dict:
     try:
         return json.loads(WEEKEND_STATE_PATH.read_text(encoding="utf-8"))
@@ -1326,6 +1539,15 @@ def _read_weekend_state() -> dict:
 def _write_weekend_state(data: dict) -> None:
     WEEKEND_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     WEEKEND_STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _weekly_report_text() -> str:
+    """Strategy-version comparison for the weekly (weekend) email; never raises."""
+    try:
+        return strategy_tracking.weekly_version_report(_read_journal(), BOT)
+    except Exception:
+        logger.exception("weekly version report failed")
+        return "(strategy version report unavailable this week)"
 
 
 def _weekend_flatten_and_notify() -> None:
@@ -1339,10 +1561,17 @@ def _weekend_flatten_and_notify() -> None:
     per ISO week (via WEEKEND_STATE_PATH) so an unattended weekend doesn't
     spam a report every --interval seconds; a flatten actually happening
     always gets emailed regardless of that throttle, since that's new
-    information even if the week's notice already went out.
+    information even if the week's notice already went out. A close that
+    is STILL failing re-notifies every WEEKEND_FAILURE_RENOTIFY_HOURS
+    instead of staying silent for the rest of the weekend (found by
+    /code-review 2026-10-13 — the position is still open and exposed to
+    the weekend gap the whole time this would otherwise say nothing).
     """
-    week_key = datetime.now(timezone.utc).strftime("%G-W%V")
-    already_notified = _read_weekend_state().get("week") == week_key
+    now = datetime.now(timezone.utc)
+    week_key = now.strftime("%G-W%V")
+    weekend_state = _read_weekend_state()
+    already_notified = weekend_state.get("week") == week_key
+    last_notified_at = weekend_state.get("last_notified_at")
 
     closed_lines: list[str] = []
     for spec in TARGETS:
@@ -1353,10 +1582,13 @@ def _weekend_flatten_and_notify() -> None:
         sys.path.insert(0, str(AGENT_DIR))
         from src.trading.connectors.mt5 import sdk as mt5_sdk
         from src.trading.profiles import profile_by_id
-        from src.trading.service import get_positions
 
         try:
-            positions = get_positions(trade["connection"]).get("positions", [])
+            # Retrying (strategy_tracking._get_positions_retrying, added
+            # 2026-10-14): this exact call is what's recurringly hit the
+            # transient MT5 "IPC timeout"/"Authorization failed" errors in
+            # production -- see that function's comment.
+            positions = strategy_tracking._get_positions_retrying(trade["connection"])
         except Exception:
             logger.exception("weekend flatten: could not read positions for %s", trade["symbol"])
             continue
@@ -1394,8 +1626,23 @@ def _weekend_flatten_and_notify() -> None:
                 closed_lines.append(f"FAILED to close ticket {ticket} on {trade['symbol']}: {result.get('error')}")
                 logger.error("weekend flatten: close_position failed for ticket %s: %s", ticket, result.get("error"))
 
-    if already_notified and not closed_lines:
-        return
+    # Only a successful close, or a still-standing failure after the
+    # re-notify interval, is new information worth an extra email -- a
+    # close that keeps failing (e.g. market already shut) retries every
+    # tick all weekend and must not email every BREAKEVEN_POLL_SECONDS, but
+    # it also must not go completely silent for the rest of the weekend.
+    has_new_close = any(line.startswith("Closed ") for line in closed_lines)
+    has_standing_failure = any(line.startswith("FAILED ") for line in closed_lines)
+    if already_notified and not has_new_close:
+        renotify_due = False
+        if has_standing_failure and last_notified_at:
+            try:
+                elapsed = now - datetime.fromisoformat(last_notified_at)
+            except ValueError:
+                elapsed = timedelta.max
+            renotify_due = elapsed >= timedelta(hours=WEEKEND_FAILURE_RENOTIFY_HOURS)
+        if not renotify_due:
+            return
 
     body_lines = ["Market closed for the weekend — no committee runs until Monday (UTC)."]
     if closed_lines:
@@ -1406,11 +1653,47 @@ def _weekend_flatten_and_notify() -> None:
         body_lines.append("No open positions of ours to flatten.")
 
     try:
-        send_email("[Vibe-Trading] Weekend status — market closed", _status_header() + "\n".join(body_lines))
+        send_email("[Vibe-Trading] Weekend status — market closed", _status_header() + "\n".join(body_lines + ["", _weekly_report_text()]))
     except Exception:
         logger.exception("failed to send weekend status email")
 
-    _write_weekend_state({"week": week_key})
+    _write_weekend_state({"week": week_key, "last_notified_at": now.isoformat()})
+
+
+def _between_passes_tick(now_utc: datetime) -> None:
+    """One BREAKEVEN_POLL_SECONDS tick between scheduled committee passes.
+
+    Inside the weekend window this runs the weekend flatten instead of
+    profit protection. Added 2026-09-26 after a real miss: the flatten used
+    to run ONLY at session boundaries, and the first boundary after Friday's
+    NY pass is Saturday 00:00 UTC -- after the market had already closed --
+    so the Friday WEEKEND_CUTOFF_UTC_HOUR flatten never actually got a
+    chance to run. An EURUSDm buy opened Fri 2026-09-25 was carried into the
+    weekend, and every Saturday close attempt was rejected (retcode 10018,
+    market closed). Checking every tick means the flatten fires within one
+    poll interval of the cutoff, while the market is still open, and
+    retries each tick if a close fails.
+    """
+    try:
+        strategy_tracking.fill_decision_outcomes(BOT, BROKER_SERVER_TZ, now_utc)
+    except Exception:
+        logger.exception("decision outcome fill crashed; continuing")
+    for spec in TARGETS:
+        if spec.get("trade"):
+            try:
+                _journal_reconcile_closed(spec["trade"]["symbol"], spec["trade"]["connection"])
+            except Exception:
+                logger.exception("journal reconcile crashed for %s; continuing", spec["trade"]["symbol"])
+    if _in_weekend_window(now_utc):
+        try:
+            _weekend_flatten_and_notify()
+        except Exception:
+            logger.exception("weekend flatten/notify crashed; retrying next tick")
+        return
+    try:
+        _profit_protection_check()
+    except Exception:
+        logger.exception("profit protection check crashed; continuing")
 
 
 def _profit_protection_check() -> None:
@@ -1464,10 +1747,13 @@ def _profit_protection_check() -> None:
         sys.path.insert(0, str(AGENT_DIR))
         from src.trading.connectors.mt5 import sdk as mt5_sdk
         from src.trading.profiles import profile_by_id
-        from src.trading.service import get_positions
 
         try:
-            positions = get_positions(trade["connection"]).get("positions", [])
+            # Retrying (strategy_tracking._get_positions_retrying, added
+            # 2026-10-14): this exact call is what's recurringly hit the
+            # transient MT5 "IPC timeout"/"Authorization failed" errors in
+            # production -- see that function's comment.
+            positions = strategy_tracking._get_positions_retrying(trade["connection"])
         except Exception:
             logger.exception("profit protection check: could not read positions for %s", trade["symbol"])
             continue
@@ -1492,6 +1778,14 @@ def _profit_protection_check() -> None:
             # price gate below -- needs only the broker's own reported open
             # time, so it still backstops a stray naked position that the
             # rest of this function can't otherwise touch.
+            #
+            # Note: pos["time"] is a raw MT5 epoch value -- same broker-
+            # local-time-mislabeled-as-UTC skew found and fixed in
+            # _recent_deals (agent/src/trading/connectors/mt5/sdk.py) can
+            # under-count elapsed_hours here by roughly the broker's UTC
+            # offset (currently ~3h). Lower severity than the journal-
+            # reconciliation miss that fix addressed, so left as a known
+            # imprecision rather than reworked here.
             max_hold_hours = trade.get("max_hold_hours", MAX_HOLD_HOURS)
             elapsed_hours = None
             opened_raw = pos.get("time")
@@ -1524,6 +1818,9 @@ def _profit_protection_check() -> None:
                     )
                 continue  # this ticket is handled either way -- nothing else applies to it this pass
 
+            if not STOP_TRAILING_ENABLED:
+                continue  # plain stop+target -- see STOP_TRAILING_ENABLED
+
             entry, sl, tp, price = pos.get("price_open"), pos.get("stop_loss"), pos.get("take_profit"), pos.get("price_current")
             side = pos.get("side")
             if entry is None or sl is None or tp is None or price is None or side not in ("buy", "sell"):
@@ -1543,7 +1840,19 @@ def _profit_protection_check() -> None:
             if reached_halfway:
                 try:
                     point = mt5_sdk.point_size(trade["symbol"], config=config)
-                except Exception:
+                except Exception as exc:
+                    # 2026-09-21: found while investigating two gold reversal
+                    # trades (Exness + FundedNext) that moved 67%/89% of the
+                    # way to target -- well past every protection trigger --
+                    # and still closed at a near-full loss. Couldn't
+                    # reproduce a live failure here, but this call used to
+                    # fail dead silent (bare except, no log), which would
+                    # make a repeat of that pattern undiagnosable. Logged
+                    # now so a real recurrence leaves a trace.
+                    logger.warning(
+                        "profit protection check: point_size lookup failed for %s, skipping breakeven rule this cycle: %s",
+                        trade["symbol"], exc,
+                    )
                     point = None
                 if point and point > 0:
                     buffer = point * BREAKEVEN_BUFFER_POINTS
@@ -1560,11 +1869,29 @@ def _profit_protection_check() -> None:
             trail_candidate = None
             try:
                 size = mt5_sdk.contract_size(trade["symbol"], config=config)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "profit protection check: contract_size lookup failed for %s, skipping trail rule this cycle: %s",
+                    trade["symbol"], exc,
+                )
                 size = None
-            if size and size > 0 and trade["lots"] > 0:
+            # Real position volume, NOT trade["lots"] -- the regime gate
+            # (strategy_tracking.regime_adjusted_lots) can fill a VOLATILE
+            # pass at half of TARGETS' configured lots, so the static spec
+            # value silently diverges from what's actually on the broker.
+            # Using the static value here understated the real per-point $
+            # value on a halved FundedNext position (0.12/0.15 lots, well
+            # above the lot-step floor that keeps this latent on Exness'
+            # 0.01-lot targets), so the trail armed at half the intended
+            # real profit -- cutting a winner's stop in long before it
+            # actually earned early_profit_trigger_usd.
+            try:
+                position_lots = float(pos.get("volume") or 0)
+            except (TypeError, ValueError):
+                position_lots = 0.0
+            if size and size > 0 and position_lots > 0:
                 trigger_usd = trade.get("early_profit_trigger_usd", EARLY_PROFIT_TRIGGER_USD)
-                trigger_distance = trigger_usd / (size * trade["lots"])
+                trigger_distance = trigger_usd / (size * position_lots)
                 gained = (price - entry) if is_buy else (entry - price)
                 if gained >= trigger_distance:
                     atr_distance = _atr_stop_floor(trade["symbol"], trade["connection"])
@@ -1622,6 +1949,11 @@ class CommitteeResult:
     report_text: str
     traded: bool = False
     error: str | None = None
+    # D16 (2026-10-08): CALM/EXTREME/NORMAL/VOLATILE when known -- set on the
+    # regime gate's own short-circuit and on a normal successful pass, left
+    # None on timeout/crash/malformed-output paths (not meaningfully
+    # regime-tagged). See strategy_tracking.regime_breakdown.
+    regime: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -1629,24 +1961,90 @@ class CommitteeResult:
 # --------------------------------------------------------------------------- #
 
 
-_REPORT_FORMAT_NO_TRADE = (
-    "Finally, report in exactly this structure (plain text, these labels verbatim):\n"
-    "Decision: <long / short / wait, one sentence>\n"
-    "Reasoning: <the concrete factors behind the call - technicals, fundamentals, risk/sizing, "
-    "whatever the committee actually weighed - 3-6 sentences, specific numbers where the debate gave them>\n"
-    "Targets & Stops: <PM's price levels, or 'none given' if the call was wait/hold>\n"
-    "Confidence: <the PM's stated confidence, or 'not stated'>"
+_RULEBOOK_V51_RULES = (
+    # D6 (v5.1, 2026-10-06), applies to both formats below.
+    "Two more rules before you answer:\n"
+    "- If DATA_MISSING below is not \"none\": do not attempt a full debate on incomplete facts -- "
+    "DECISION must be PASS, EDGE/CHECKLIST/ORDER/INVALIDATION/PROPOSAL get trivial placeholder values "
+    "(\"none\" / \"n/a\"), and REASON FOR PASS must quote exactly what's missing. Do NOT salvage this "
+    "into a trade by estimating or guessing the missing value -- a verified fact you don't have is not "
+    "something you can approximate your way around.\n"
+    "- If NEWS_API_STATUS below is not \"OK\": same as above -- DECISION must be PASS, REASON FOR PASS "
+    "must quote the status and why it matters (an UNAVAILABLE or STALE calendar means you cannot verify "
+    "there's no high-impact release about to move price).\n"
+    "PASS is a successful outcome of this process, not a failure of it -- protecting capital by correctly "
+    "recognizing you don't have what you need to trade is the job working as intended.\n\n"
 )
 
 _REPORT_FORMAT_TRADE = (
-    "Finally, report in exactly this structure (plain text, these labels verbatim):\n"
-    "Decision: <long / short / wait, one sentence>\n"
-    "Reasoning: <the concrete factors behind the call - technicals, fundamentals, risk/sizing, "
-    "whatever the committee actually weighed - 3-6 sentences, specific numbers where the debate gave them>\n"
-    "Order: <if placed: symbol, side, lots, the resulting fill/price, and the exact stop_loss/take_profit "
-    "levels attached to it (from trading_place_order's response, not just what the PM said - confirm they "
-    "actually landed on the order); if not placed: the specific reason (decision was wait/hold, a position "
-    "already existed, the PM gave no stop level, or the order was rejected - state which)>"
+    # Rulebook output format (2026-09-30; v4 edge taxonomy + PROPOSAL field,
+    # 2026-10-01; MODE field, D3/D6 2026-10-06; v5.1 DATA_MISSING/
+    # NEWS_API_STATUS/INPUT_PROVENANCE, D6 2026-10-06). strategy_tracking.
+    # parse_decision reads the DECISION line (PASS counts as a wait). Exits
+    # stay plain stop+target either way -- that's locked in the preset's own
+    # prompt and in STOP_TRAILING_ENABLED, not something this report format
+    # needs to restate per trade.
+    "Finally: your ENTIRE final answer must consist of ONLY the labeled lines below -- plain text, these "
+    "labels verbatim, in this order, nothing before or after them. Do NOT use markdown headers (##/###), "
+    "tables, horizontal rules (---), emoji, bullet-point prose, or a narrative write-up of the debate -- "
+    "every fact that matters belongs inside one of these lines, not around them. Max 40 lines total -- if "
+    "the head trader's own answer would exceed that, or stated confidence below 60, or left any checklist "
+    "item unclear, DECISION must be PASS regardless of what was otherwise concluded. This format applies "
+    "UNCONDITIONALLY, including when trading_place_order is denied, blocked, or errors -- report that "
+    "outcome ONLY inside ORDER (\"none\") and REASON FOR PASS (quoting the gate's error text verbatim); "
+    "never switch to a narrative explanation, a status table, or markdown formatting just because "
+    "something unusual happened on the order call. The swarm's own final decision-maker (the head trader) "
+    "already answered in this exact schema -- copy that text verbatim for DECISION/CONFIDENCE/EDGE/"
+    "CHECKLIST/INVALIDATION rather than re-deriving or re-wording it yourself; your only added job is "
+    "filling in ORDER with the real trading_place_order outcome and INPUT_PROVENANCE/NEWS_API_STATUS with "
+    "the verified facts above:\n"
+    "DECISION: <LONG / SHORT / PASS>\n"
+    "CONFIDENCE: <0-100>\n"
+    "MODE: LIVE\n"
+    "DATA_MISSING: <comma-separated list of any verified fact above that was unavailable (e.g. "
+    "\"live quote\", \"ATR\"), or \"none\">\n"
+    "NEWS_API_STATUS: <echo the NEWS_API_STATUS verified fact above exactly: OK / STALE / UNAVAILABLE>\n"
+    "EDGE: <one of HTF_TREND_CONTINUATION / HTF_LEVEL_REJECTION / SESSION_RANGE_BREAKOUT, then one sentence why>\n"
+    "CHECKLIST: <the head trader's ten numbered answers, one short line each>\n"
+    "ORDER: <if placed: symbol, side, type, fill price, stop_loss, take_profit, lots and net R:R, confirmed "
+    "from trading_place_order's own response (not just what the head trader said); if not placed: none>\n"
+    "INVALIDATION: <the specific thesis-break price>\n"
+    "INPUT_PROVENANCE: <echo the quote source, quote-fetched-at, and data-pack-built-at facts above, in "
+    "one short line>\n"
+    "PROPOSAL: <a new rule/filter/exit idea the head trader flagged, marked DO NOT SHIP -- it must not affect "
+    "this pass's decision or order; otherwise \"none\">\n"
+    "REASON FOR PASS: <if PASS or no order was placed: the specific rule-based reason (which checklist item, "
+    "trend rule, position already open, or the order's rejection -- quote its error text); otherwise n/a>"
+)
+
+# D3 (2026-10-06): replaces the old _REPORT_FORMAT_NO_TRADE. A research-only
+# pass now gets the SAME structured schema as a live one (EDGE/CHECKLIST/
+# PROPOSAL included) instead of the old free-text Decision/Reasoning/
+# Targets&Stops format -- the only differences are DECISION forced to PASS,
+# MODE: RESEARCH_ONLY, and no ORDER block (trading_place_order is not
+# offered as an option in this prompt at all -- see run_committee's
+# research_only handling for the code-level backstop if the LLM calls it
+# anyway). v5.1 DATA_MISSING/NEWS_API_STATUS/INPUT_PROVENANCE added D6
+# 2026-10-06, same as the LIVE format.
+_REPORT_FORMAT_RESEARCH_ONLY = (
+    "Finally: your ENTIRE final answer must consist of ONLY the labeled lines below -- plain text, these "
+    "labels verbatim, in this order, nothing before or after them. Do NOT use markdown headers (##/###), "
+    "tables, horizontal rules (---), emoji, bullet-point prose, or a narrative write-up of the debate -- "
+    "every fact that matters belongs inside one of these lines, not around them. Max 40 lines total:\n"
+    "DECISION: PASS\n"
+    "CONFIDENCE: <0-100 -- the debate's own confidence, had this been a live pass>\n"
+    "MODE: RESEARCH_ONLY\n"
+    "DATA_MISSING: <comma-separated list of any verified fact above that was unavailable, or \"none\">\n"
+    "NEWS_API_STATUS: <echo the NEWS_API_STATUS verified fact above exactly: OK / STALE / UNAVAILABLE>\n"
+    "EDGE: <one of HTF_TREND_CONTINUATION / HTF_LEVEL_REJECTION / SESSION_RANGE_BREAKOUT, then one sentence "
+    "why, or \"none\" if no setup qualified>\n"
+    "CHECKLIST: <the head trader's ten numbered answers, one short line each>\n"
+    "ORDER: none (research-only pass -- trading_place_order must not be called under any circumstances)\n"
+    "INVALIDATION: <the specific thesis-break price the debate would have used, or \"n/a\">\n"
+    "INPUT_PROVENANCE: <echo the quote source, quote-fetched-at, and data-pack-built-at facts above, in "
+    "one short line>\n"
+    "PROPOSAL: <a new rule/filter/exit idea the head trader flagged, marked DO NOT SHIP; otherwise \"none\">\n"
+    "REASON FOR PASS: <the specific rule-based reason this pass is research-only -- quote it verbatim>"
 )
 
 
@@ -1663,18 +2061,70 @@ _DAY_TRADE_FRAMING = (
 )
 
 
-def _build_prompt(committee: str, target: str, market: str, trade: dict | None) -> str:
+def _build_prompt(
+    committee: str, target: str, market: str, trade: dict | None,
+    *, research_only: bool = False, research_only_reason: str = "",
+) -> str | None:
+    """Returns None (D2, 2026-10-06) when `trade` is set but no fresh data
+    pack could be verified -- the caller (run_committee) must treat that as
+    a hard PASS and never invoke the LLM on unverified facts. Computed first,
+    before any of the other (expensive, broker-round-trip) facts below, so a
+    pack failure short-circuits without wasted work on a prompt that will
+    never be used.
+
+    research_only=True (D3, 2026-10-06): `trade` still carries symbol/
+    connection/lots (the caller no longer nulls it out just to signal
+    research-only -- see run_committee) so this still builds the full,
+    data-pack-backed v4 prompt, just with the trading_place_order
+    instructions replaced by an explicit "do not trade" one and the v5
+    RESEARCH_ONLY report format instead of the LIVE one.
+    """
     if not trade:
+        # No trade spec configured for this target this session at all (the
+        # dormant Asia/London path, RESEARCH_PASSES_ENABLED=False today) --
+        # no symbol means no data pack is possible either.
         return (
             f'Run the {committee} swarm with target="{target}" and market="{market}" '
             f"to produce its full debate and final decision.\n\n"
             f"{_DAY_TRADE_FRAMING}"
-            f"{_REPORT_FORMAT_NO_TRADE}"
+            f"This pass is RESEARCH-ONLY: no trade spec is configured for this target this session. "
+            f"Produce the full debate and final decision anyway; DECISION must be reported as PASS "
+            f"regardless of what the debate concludes, and no ORDER may be placed.\n\n"
+            f"{_REPORT_FORMAT_RESEARCH_ONLY}"
         )
     symbol = trade["symbol"]
     connection = trade["connection"]
     lots = trade["lots"]
     max_stack = trade.get("max_stack", MAX_SAME_DIRECTION_POSITIONS)
+
+    # Verified broker data for the swarm agents (see scripts/market_data_pack.py).
+    # HARD gate (D2, 2026-10-06): a trade-enabled pass must not reach the LLM
+    # at all without this -- real incident 2026-10-05, where a missing pack
+    # was noted in passing but the committee ran anyway on prose reasoning
+    # instead of verified numbers. Computed once, right here; everything
+    # below reuses this same pack_path/swarm_intro rather than re-fetching.
+    pack_built_at = datetime.now(timezone.utc)
+    pack_path = market_data_pack.write_data_pack(symbol, connection)
+    if pack_path is None:
+        logger.warning("NO_DATA_PACK: %s -- data pack unavailable this pass", target)
+        return None
+    swarm_intro = market_data_pack.swarm_instruction(committee, target, market, pack_path)
+
+    # v5.1 (D6, 2026-10-06): NEWS_API_STATUS is read here, not asked of the
+    # LLM -- is_news_blackout already ran as one of run_committee's
+    # pre-checks (before this prompt was even built), so fn_news's cache
+    # already reflects today's real outcome. The committee just echoes this
+    # verified fact back in its own NEWS_API_STATUS field; see
+    # fn_news.news_api_status's docstring for why "STALE" matters (the one
+    # state D1's fail-closed fix does NOT catch -- a trade-enabled pass can
+    # still proceed on a day-old calendar with nothing else flagging it).
+    news_status = fn_news.news_api_status()
+    news_status_fact = f"NEWS_API_STATUS verified fact: {news_status}."
+    provenance_fact = (
+        f"INPUT PROVENANCE verified facts (echo these in your own INPUT_PROVENANCE line): quote source="
+        f"{connection}, quote fetched at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC, data pack "
+        f"built at {pack_built_at.strftime('%H:%M:%S')} UTC."
+    )
 
     summary = _symbol_position_summary(symbol, connection)
     count, side = summary["count"], summary["side"]
@@ -1794,17 +2244,66 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
     journal_fact = _journal_summary_text(symbol)
     journal_block = f"{journal_fact}\n\n" if journal_fact else ""
 
+    session_bias_fact = _session_bias_fact(symbol)
+    session_bias_block = f"{session_bias_fact}\n\n" if session_bias_fact else ""
+    trend_block = trade.get("trend_rule", "")
+    regime_block = trade.get("regime_rule", "")
+    strategic_context_block = strategy_tracking.strategic_context_prompt()
+
+    if research_only:
+        # D3 (2026-10-06): same verified facts (position/quote/risk/
+        # volatility/journal/data-pack) as a live pass, so the debate is
+        # just as well-grounded -- but no trading_place_order instructions
+        # are offered at all, and DECISION is forced to PASS regardless of
+        # what the debate concludes. See run_committee's research_only
+        # handling for the code-level backstop if the LLM calls
+        # trading_place_order anyway (the tool is still technically
+        # reachable even though this prompt never mentions it).
+        return (
+            f"{swarm_intro}"
+            f"{strategic_context_block}"
+            f"The swarm must produce its full debate and final decision, including the concrete stop-loss "
+            f"and take-profit price levels it WOULD have used — even though no order will be placed this "
+            f"pass (see below for why).\n\n"
+            f"{quote_fact}\n\n"
+            f"{news_status_fact}\n\n"
+            f"{provenance_fact}\n\n"
+            f"{risk_fact}\n\n"
+            f"{volatility_block}"
+            f"{signal_block}"
+            f"{journal_block}"
+            f"{session_bias_block}"
+            f"{trend_block}"
+            f"{regime_block}"
+            f"{_DAY_TRADE_FRAMING}"
+            f"THIS PASS IS RESEARCH-ONLY: {research_only_reason} Do NOT call trading_place_order under "
+            f"any circumstances this pass, no matter how strong the setup looks. Produce the full debate "
+            f"and final decision as you normally would, but DECISION must be reported as PASS and REASON "
+            f"FOR PASS must quote the reason above verbatim.\n\n"
+            f"{_RULEBOOK_V51_RULES}"
+            f"{_REPORT_FORMAT_RESEARCH_ONLY}"
+        )
+
     return (
-        f'Run the {committee} swarm with target="{target}" ({market}) to produce its full debate '
+        f"{swarm_intro}"
+        f"{strategic_context_block}"
+        f"The swarm must produce its full debate "
         f"and final decision, including concrete stop-loss and take-profit price levels — every "
         f"committee decision must carry these, not just a direction.\n\n"
         f"{quote_fact}\n\n"
+        f"{news_status_fact}\n\n"
+        f"{provenance_fact}\n\n"
         f"{risk_fact}\n\n"
         f"{volatility_block}"
         f"{signal_block}"
         f"{journal_block}"
+        f"{session_bias_block}"
+        f"{trend_block}"
+        f"{regime_block}"
         f"{_DAY_TRADE_FRAMING}"
-        f"Then, based ONLY on the portfolio manager's final decision:\n"
+        f"{_RULEBOOK_V51_RULES}"
+        f"Then, based ONLY on the swarm's final decision (made by its final decision-maker -- the "
+        f"head trader on fx_commodity_day_desk; 'PM' below means that final decision-maker):\n"
         + (
             "- Consider the signal-service activity above as one more input to the debate — a second "
             "opinion, not a directive to mirror or fade.\n"
@@ -1853,6 +2352,32 @@ def _build_prompt(committee: str, target: str, market: str, trade: dict | None) 
     )
 
 
+def _exclusive_group_conflict(trade: dict) -> str | None:
+    """Return a skip/research-only note if another EXCLUSIVE_SYMBOL_GROUP symbol is open, else None.
+
+    Fails closed: if positions can't be read, the pass does not trade
+    rather than risk opening a second correlated position blind.
+    """
+    symbol = trade["symbol"]
+    if symbol not in EXCLUSIVE_SYMBOL_GROUP:
+        return None
+    for other in sorted(EXCLUSIVE_SYMBOL_GROUP - {symbol}):
+        try:
+            summary = _symbol_position_summary(other, trade["connection"])
+        except Exception as exc:
+            return (
+                f"[CORRELATION LIMIT] {symbol} not traded this pass: could not read open "
+                f"{other} positions ({exc}), and {symbol}/{other} may not both be open."
+            )
+        if summary["count"] > 0:
+            return (
+                f"[CORRELATION LIMIT] {symbol} not traded this pass: a {summary['side']} {other} "
+                f"position is already open, and {symbol}/{other} (highly correlated) may not "
+                f"both be open at once."
+            )
+    return None
+
+
 def run_committee(committee: str, target: str, market: str, trade: dict | None = None) -> CommitteeResult:
     """Run one committee preset against one target as an isolated subprocess.
 
@@ -1860,15 +2385,116 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     checks positions and conditionally places a demo order on the PM's
     decision. Omit it for research-only, no-trading runs.
     """
+    # D3 (2026-10-06): a pre-check tripping no longer nulls `trade` out --
+    # `trade` keeps its symbol/connection/lots all the way to _build_prompt
+    # (and the post-fill guardrail chain) so a downgraded pass still gets
+    # the full data-pack-backed v4 prompt and proper journaling, just with
+    # trading_place_order never offered and any fill treated as a violation
+    # (see _post_trade_research_only_violation). research_only_reason is
+    # what REASON FOR PASS must quote.
     breaker_note = None
+    research_only = False
     if trade:
         breaker_note = _live_circuit_breaker_check(trade)
         if breaker_note:
             logger.warning("live circuit breaker for %s: %s", target, breaker_note)
-            trade = None  # fall back to a research-only run this pass
+            research_only = True
 
-    prompt = _build_prompt(committee, target, market, trade)
-    logger.info("running %s on %s (%s)%s", committee, target, market, " [trade-enabled]" if trade else "")
+    if trade and not research_only:
+        conflict = _exclusive_group_conflict(trade)
+        if conflict:
+            breaker_note = conflict
+            logger.warning("correlation limit for %s: %s", target, conflict)
+            research_only = True
+
+    if trade and not research_only:
+        in_blackout, why = fn_news.is_news_blackout(
+            {trade["symbol"][:3], trade["symbol"][3:6]}, window_minutes=NEWS_BLACKOUT_WINDOW_MINUTES)
+        if in_blackout:
+            breaker_note = f"[NEWS BLACKOUT] {trade['symbol']} pass run research-only: {why}."
+            logger.warning("news blackout for %s: %s", target, why)
+            research_only = True
+
+    trend_allowed = None
+    if trade and not research_only and TREND_FILTER_ENABLED:
+        trend_allowed, trend_reason = strategy_tracking.trend_gate(trade["symbol"], trade["connection"])
+        logger.info("trend gate for %s: %s", target, trend_reason)
+        if trend_allowed:
+            trade = {**trade, "trend_rule": strategy_tracking.trend_rule_prompt(trend_allowed, trend_reason)}
+
+    # D12 (2026-10-08) -- see fundednext_reporter.py's identical gate for
+    # the full rationale.
+    if trade and not research_only:
+        regime = strategy_tracking.regime_for_symbol(trade["symbol"], trade["connection"])
+        logger.info(
+            "REGIME_GATE symbol=%s label=%s atr_pct=%.0f action=%s reason=%s",
+            trade["symbol"], regime.label, regime.atr_percentile, regime.action, regime.reason,
+        )
+        # D17 (2026-10-08) -- see fundednext_reporter.py's identical toggle
+        # for the full rationale.
+        skip = (
+            (regime.label == "CALM" and strategy_tracking.REGIME_SKIP_CALM)
+            or (regime.label == "EXTREME" and strategy_tracking.REGIME_SKIP_EXTREME)
+        )
+        if regime.action == "PASS_NO_LLM" and skip:
+            return CommitteeResult(
+                committee, target, market, "success", None,
+                "DECISION: PASS\n"
+                "CONFIDENCE: 0\n"
+                "MODE: LIVE\n"
+                "DATA_MISSING: none\n"
+                f"NEWS_API_STATUS: {fn_news.news_api_status()}\n"
+                "EDGE: none\n"
+                f"CHECKLIST: n/a -- regime gate short-circuit ({regime.label}, atr_percentile="
+                f"{regime.atr_percentile:.0f}), LLM not invoked\n"
+                "ORDER: none\n"
+                "INVALIDATION: n/a\n"
+                "INPUT_PROVENANCE: n/a -- no data pack built, regime computed directly from broker OHLC\n"
+                "PROPOSAL: none\n"
+                f"REASON FOR PASS: {regime.reason} -- ATR percentile {regime.atr_percentile:.0f} outside the "
+                f"tradeable NORMAL/VOLATILE band (code-level regime gate, no LLM invoked).",
+                traded=False,
+                regime=regime.label,
+            )
+        # D13 (2026-10-08) -- see fundednext_reporter.py's identical wiring
+        # for the full rationale (regime_label carried through to the
+        # journal so VOLATILE trades can be excluded from the pooled
+        # NORMAL scale/pause sample).
+        # D-repair (2026-10-09) -- see fundednext_reporter.py's identical
+        # wiring for the full rationale (strategy_tracking.regime_adjusted_lots).
+        trade = {
+            **trade,
+            "lots": strategy_tracking.regime_adjusted_lots(trade["lots"], regime),
+            "regime_rule": strategy_tracking.regime_rule_prompt(regime),
+            "regime_label": regime.label,
+        }
+
+    prompt = _build_prompt(
+        committee, target, market, trade,
+        research_only=research_only, research_only_reason=breaker_note or "",
+    )
+    if prompt is None:
+        # D2 (2026-10-06): no fresh data pack could be verified for this
+        # trade-enabled pass -- hard PASS, no LLM call, no cost attributed.
+        # report_text is in the normal v4 shape so parse_decision/the
+        # journal/email pipeline treat it exactly like any other PASS.
+        return CommitteeResult(
+            committee, target, market, "success", None,
+            "DECISION: PASS\n"
+            "CONFIDENCE: 0\n"
+            f"MODE: {'RESEARCH_ONLY' if research_only else 'LIVE'}\n"
+            "EDGE: none\n"
+            "CHECKLIST: n/a -- data pack unavailable, LLM not invoked\n"
+            "ORDER: none\n"
+            "INVALIDATION: n/a\n"
+            "PROPOSAL: none\n"
+            "REASON FOR PASS: data_pack_unavailable -- no fresh live data pack could be built this pass "
+            "(see NO_DATA_PACK in the log); the LLM was not invoked rather than let it reason on "
+            "unverified facts (D2).",
+            traded=False,
+        )
+    logger.info("running %s on %s (%s)%s", committee, target, market,
+                " [research-only]" if research_only else (" [trade-enabled]" if trade else ""))
     cmd = [
         sys.executable, "-m", "cli", "run",
         "--prompt", prompt,
@@ -1914,46 +2540,122 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
     status = payload.get("status", "unknown")
     run_id = payload.get("run_id")
     if status != "success":
-        return CommitteeResult(
-            committee, target, market, "error", run_id, "",
-            error=payload.get("reason") or f"run status was '{status}'",
+        # A run that places an order and THEN fails on a later step (an
+        # empty model response, max-iterations, an unparseable final
+        # answer) must not let that fill skip every guardrail and the
+        # journal just because the run itself didn't end cleanly -- real
+        # incident 2026-10-05 (FundedNext GBPUSD empty_model_response)
+        # happened not to have placed anything, but confirmed the gap was
+        # live; found and fixed per the daily-repair agent's 2026-10-06
+        # review of that incident.
+        notes, traded, any_placed = _journal_any_placed_orders(
+            trade, run_id, trend_allowed, research_only=research_only, research_only_reason=breaker_note or "",
         )
+        error_text = payload.get("reason") or f"run status was '{status}'"
+        if any_placed:
+            error_text += (
+                f"\n\n[POST-FAILURE GUARDRAIL CHECK] this run ended '{status}' but had already placed a "
+                f"live order -- it was still run through the full guardrail chain and journaled:{notes}"
+            )
+        return CommitteeResult(committee, target, market, "error", run_id, "", error=error_text, traded=traded)
 
     report_text = _read_final_answer(run_id) if run_id else ""
     if not report_text:
-        return CommitteeResult(committee, target, market, "error", run_id, "", error="run succeeded but produced no final answer")
+        notes, traded, any_placed = _journal_any_placed_orders(
+            trade, run_id, trend_allowed, research_only=research_only, research_only_reason=breaker_note or "",
+        )
+        error_text = "run succeeded but produced no final answer"
+        if any_placed:
+            error_text += (
+                f"\n\n[POST-FAILURE GUARDRAIL CHECK] this run had already placed a live order -- it was "
+                f"still run through the full guardrail chain and journaled:{notes}"
+            )
+        return CommitteeResult(committee, target, market, "error", run_id, "", error=error_text, traded=traded)
+
+    # D4 (2026-10-06): checked against the LLM's RAW answer, before any
+    # guardrail/violation notes get appended below -- those use their own
+    # bracketed [CRITICAL]/[AUTOMATED CHECK] markers, not the required-field
+    # labels, and would never legitimately satisfy this check anyway.
+    missing_fields = strategy_tracking.validate_committee_fields(report_text)
 
     # A trading_place_order CALL happening is not the same as an order being
     # PLACED — a call the mandate gate blocks (wrong size, breach, halted,
     # etc.) still shows up as a tool_call. Regression: a hallucinated 1.0-lot
     # order (100x the intended 0.01) was correctly denied by the gate
     # ($465,893 notional vs. the $6,000 cap) but still got tagged "TRADED" in
-    # the email under the old tool_call-only check. `_extract_placed_order`
+    # the email under the old tool_call-only check. `_extract_placed_orders`
     # already verifies status=="ok" against the connector's own response, so
     # basing `traded` on it directly is both the fix and the single source of
-    # truth for what actually reached the broker.
-    placed_order = _extract_placed_order(run_id) if trade else None
-    traded = bool(placed_order)
-    if traded:
-        spec_note = _post_trade_spec_check(trade, placed_order)
-        if spec_note:
-            # A spec violation is CLOSED, not just reported -- see
-            # _post_trade_spec_check's docstring for why this is a real
-            # corrective action, not another informational-only check.
-            report_text = report_text + spec_note
-            traded = False
-        else:
-            report_text = report_text + _post_trade_cap_check(trade)
-            report_text = report_text + _post_trade_spread_check(trade, placed_order)
-            report_text = report_text + _post_trade_reward_risk_check(trade, placed_order)
-            _journal_record_open(trade["symbol"], trade["connection"], placed_order)
-    elif trade:
+    # truth for what actually reached the broker. Journaled unconditionally,
+    # even if the schema check above will reject this report below -- a real
+    # fill must never be dropped because the narrative around it is
+    # malformed (same principle as the empty_model_response fix).
+    notes, traded, any_placed = _journal_any_placed_orders(
+        trade, run_id, trend_allowed, research_only=research_only, research_only_reason=breaker_note or "",
+    )
+    report_text = report_text + notes
+
+    if missing_fields:
+        # D4: do not treat this as a trustworthy decision record -- status
+        # "error" (not "success") means record_decision logs result.status
+        # instead of parse_decision(report_text), and no AI-cost attribution
+        # exists anywhere in this codebase to skip (confirmed in the
+        # 2026-10-01 due-diligence review) so there is nothing further to
+        # withhold there. The real fill above (if any) is still journaled
+        # and still counts toward `traded` -- only the REPORT's trustworthi-
+        # ness as a decision record is being rejected, not the fill itself.
+        logger.error("MALFORMED_OUTPUT: %s missing required fields: %s", target, ", ".join(missing_fields))
+        error_text = f"MALFORMED_OUTPUT: missing required field(s): {', '.join(missing_fields)}"
+        if breaker_note:
+            error_text += f"\n\n{breaker_note}"
+        return CommitteeResult(committee, target, market, "error", run_id, report_text, error=error_text, traded=traded)
+
+    if not any_placed and trade:
         blocked_note = _blocked_order_note(run_id)
         if blocked_note:
             report_text = report_text + blocked_note
     if breaker_note:
         report_text = report_text + f"\n\n{breaker_note}"
-    return CommitteeResult(committee, target, market, "success", run_id, report_text, traded=traded)
+    return CommitteeResult(
+        committee, target, market, "success", run_id, report_text, traded=traded,
+        regime=trade.get("regime_label") if trade else None,
+    )
+
+
+def _enforce_trend_rule(trade: dict, placed_order: dict, allowed: set[str] | None) -> str:
+    """Close a just-filled order that breaks the hard trend gate; returns a report note or "".
+
+    Unlike _post_trade_spec_check this does NOT trip the kill switch -- a
+    counter-trend call is a judgment error the gate exists to catch, not a
+    sign the automation itself is broken. Matches the new order's own
+    ticket only, same as _post_trade_spec_check.
+    """
+    side = str(placed_order.get("side") or "").lower()
+    if not allowed or side not in ("buy", "sell") or side in allowed:
+        return ""
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.service import get_positions
+
+    ticket = str(placed_order.get("order_id") or "").strip()
+    outcome = "could not identify the new position's ticket -- close it manually"
+    if ticket:
+        try:
+            for pos in get_positions(trade["connection"]).get("positions", []):
+                if str(pos.get("ticket")) == ticket and pos.get("magic") == OUR_MAGIC:
+                    result = mt5_sdk.close_position(_mt5_config_for(trade["connection"]), ticket=pos.get("ticket"))
+                    outcome = f"close {result.get('status')}"
+                    break
+            else:
+                outcome = "no open position with that ticket (already closed?)"
+        except Exception as exc:
+            outcome = f"close attempt raised: {exc}"
+    logger.warning("trend gate: closed counter-trend %s %s ticket %s: %s", side, trade["symbol"], ticket, outcome)
+    return (
+        f"\n\n[TREND GATE -- ORDER CLOSED] The committee placed a {side.upper()} on {trade['symbol']} "
+        f"against the hard trend rule (allowed: {', '.join(sorted(allowed)).upper()} only). "
+        f"Ticket {ticket or '?'}: {outcome}."
+    )
 
 
 def _post_trade_cap_check(trade: dict) -> str:
@@ -1980,6 +2682,151 @@ def _post_trade_cap_check(trade: dict) -> str:
             f"The agent's own count was wrong somewhere; check manually."
         )
     return ""
+
+
+def _post_trade_stop_floor_check(trade: dict, placed_order: dict) -> tuple[str, bool]:
+    """Hard check: a just-filled stop tighter than the noise floor is widened, or the trade closed.
+
+    Added 2026-09-29 at the user's request, after a 2026-09-28 plan carried a
+    2.3-pip EURUSD stop -- far inside normal noise. The prompt already gives
+    the committee the ATR/spread floor, but nothing enforced it in code.
+    The floor is the larger of _atr_stop_floor and _spread_stop_floor (the
+    same floor _post_trade_reward_risk_check refuses to tighten past):
+      - stop at/outside the floor -> ("", False), nothing to do;
+      - inside the floor, and the floor-distance loss fits the per-trade
+        risk cap -> widen the stop to the floor on the live position and
+        update placed_order["stop_loss"], so the reward:risk check that runs
+        next sees (and if needed widens the target for) the real stop;
+      - inside the floor, but a floor-distance stop would exceed the cap ->
+        close the position: there is no noise-safe stop within budget.
+    Returns (report note, closed). Fails open (no action) if the floor or
+    contract size can't be read -- the loss cap is still enforced upstream.
+    """
+    side = placed_order.get("side")
+    entry = _resolve_fill_price(trade, placed_order)
+    sl = placed_order.get("stop_loss")
+    if side not in ("buy", "sell") or entry is None or sl is None:
+        return "", False
+    entry, sl = float(entry), float(sl)
+    is_buy = side == "buy"
+    stop_distance = (entry - sl) if is_buy else (sl - entry)
+    symbol, connection = trade["symbol"], trade["connection"]
+    quote = _symbol_live_quote(symbol, connection)
+    floor_distance = max(_atr_stop_floor(symbol, connection) or 0.0, _spread_stop_floor(quote) or 0.0)
+    if floor_distance <= 0 or stop_distance >= floor_distance:
+        return "", False
+
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.service import get_positions
+
+    try:
+        size = float(mt5_sdk.contract_size(symbol, config=_mt5_config_for(connection)))
+    except Exception:
+        return "", False
+    floor_loss = floor_distance * size * float(trade["lots"])
+    budget = _effective_max_loss_usd(connection)
+    header = (
+        f"{symbol}'s filled stop was only {stop_distance:.5f} from entry {entry:.5f}, inside the "
+        f"{floor_distance:.5f} noise floor (1.5x 15m ATR / spread)"
+    )
+    ticket = str(placed_order.get("order_id") or "").strip()
+    try:
+        pos = next((p for p in get_positions(connection).get("positions", [])
+                    if ticket and str(p.get("ticket")) == ticket and p.get("magic") == OUR_MAGIC), None)
+    except Exception as exc:
+        return f"\n\n[STOP FLOOR] {header}; could not read positions to fix it ({exc}) -- check manually.", False
+    if pos is None:
+        return f"\n\n[STOP FLOOR] {header}; no open position with ticket {ticket or '?'} to fix -- check manually.", False
+    config = _mt5_config_for(connection)
+
+    if floor_loss > budget:
+        result = mt5_sdk.close_position(config, ticket=pos.get("ticket"))
+        logger.warning("stop floor: closed %s ticket %s (floor loss $%.2f > cap $%.2f): %s",
+                       symbol, ticket, floor_loss, budget, result.get("status"))
+        return (
+            f"\n\n[STOP FLOOR -- ORDER CLOSED] {header}. A floor-distance stop would risk "
+            f"${floor_loss:.2f}, over the ${budget:.2f} per-trade cap, so there is no noise-safe stop "
+            f"within budget; position closed ({result.get('status')})."
+        ), True
+
+    new_sl = entry - floor_distance if is_buy else entry + floor_distance
+    result = mt5_sdk.modify_position(config, ticket=pos.get("ticket"), stop_loss=new_sl,
+                                     take_profit=placed_order.get("take_profit"))
+    if result.get("status") != "ok":
+        return (f"\n\n[STOP FLOOR] {header}; widening the stop to {new_sl:.5f} FAILED "
+                f"({result.get('error')}) -- check manually."), False
+    placed_order["stop_loss"] = new_sl
+    placed_order["stop_adjusted"] = True
+    logger.info("stop floor: widened %s ticket %s stop %.5f -> %.5f", symbol, ticket, sl, new_sl)
+    return (
+        f"\n\n[STOP FLOOR -- STOP WIDENED] {header}; stop moved to {new_sl:.5f} "
+        f"(risk now ${floor_loss:.2f}, within the ${budget:.2f} cap)."
+    ), False
+
+
+def _post_trade_max_stop_check(trade: dict, placed_order: dict) -> str:
+    """Rulebook (2026-09-30): a stop farther than MAX_STOP_PRICE_FRACTION of price is tightened to it.
+
+    Tightening only ever reduces risk, so no budget check is needed -- except
+    it must never tighten past the noise floor (the same ATR/spread floor
+    _post_trade_stop_floor_check enforces as a minimum). Without this, a stop
+    that floor check just widened to clear the noise floor could get
+    tightened straight back inside it whenever the floor itself exceeds
+    MAX_STOP_PRICE_FRACTION (e.g. a volatility spike), undoing that
+    correction and re-exposing the position to an ordinary-noise stop-out --
+    the opposite of what the floor check exists to prevent. Returns a report
+    note, or "" when the stop is within bounds / data is missing.
+    """
+    side = placed_order.get("side")
+    entry = _resolve_fill_price(trade, placed_order)
+    sl = placed_order.get("stop_loss")
+    if side not in ("buy", "sell") or entry is None or sl is None:
+        return ""
+    entry, sl = float(entry), float(sl)
+    is_buy = side == "buy"
+    symbol, connection = trade["symbol"], trade["connection"]
+    quote = _symbol_live_quote(symbol, connection)
+    floor_distance = max(_atr_stop_floor(symbol, connection) or 0.0, _spread_stop_floor(quote) or 0.0)
+    max_distance = max(entry * MAX_STOP_PRICE_FRACTION, floor_distance)
+    if ((entry - sl) if is_buy else (sl - entry)) <= max_distance:
+        return ""
+    new_sl = entry - max_distance if is_buy else entry + max_distance
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.service import get_positions
+
+    ticket = str(placed_order.get("order_id") or "").strip()
+    try:
+        pos = next((p for p in get_positions(trade["connection"]).get("positions", [])
+                    if ticket and str(p.get("ticket")) == ticket and p.get("magic") == OUR_MAGIC), None)
+        if pos is None:
+            return f"\n\n[MAX STOP] {trade['symbol']} stop {sl:.5f} is wider than 1% of price; ticket {ticket or '?'} not found -- check manually."
+        result = mt5_sdk.modify_position(_mt5_config_for(trade["connection"]), ticket=pos.get("ticket"),
+                                         stop_loss=new_sl, take_profit=placed_order.get("take_profit"))
+    except Exception as exc:
+        return f"\n\n[MAX STOP] {trade['symbol']} stop wider than 1% of price; tightening raised {exc} -- check manually."
+    if result.get("status") != "ok":
+        return f"\n\n[MAX STOP] tightening {trade['symbol']} stop to {new_sl:.5f} FAILED ({result.get('error')}) -- check manually."
+    placed_order["stop_loss"] = new_sl
+    placed_order["stop_adjusted"] = True
+    return f"\n\n[MAX STOP -- STOP TIGHTENED] {trade['symbol']} stop {sl:.5f} was wider than 1% of price; moved to {new_sl:.5f}."
+
+
+def _rulebook_skip_reason(symbol: str) -> str | None:
+    """Rulebook pre-pass skips: 3-loss bench, or a repeated post-trade deviation."""
+    try:
+        journal = _read_journal()
+        note = strategy_tracking.bench_reason(journal, symbol)
+        if note:
+            return note
+        note = strategy_tracking.consume_repeat_deviation(journal, symbol)
+        if note:
+            _write_journal(journal)  # persists the "pass served" mark
+        return note
+    except Exception:
+        logger.exception("rulebook skip check failed for %s; not skipping", symbol)
+        return None
 
 
 def _post_trade_spread_check(trade: dict, placed_order: dict) -> str:
@@ -2038,6 +2885,17 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
     to the live position's own price_open (a fresh get_positions() read,
     same source --status uses) whenever fill_price is missing OR
     non-positive.
+
+    Matches by the NEW order's own ticket (order_id) first, same fix as
+    _post_trade_spec_check/_post_trade_reward_risk_check (found by
+    /code-review): with MAX_SAME_DIRECTION_POSITIONS (or a target's own
+    max_stack) > 1, this symbol can legitimately have several already-open
+    positions, and get_positions() order is not guaranteed to put the new
+    one last. Matching on symbol+magic alone could silently return an
+    OLDER position's entry price instead of the new fill's, feeding a wrong
+    entry into the reward:risk correction (mis-pricing a live stop) and the
+    permanent trade-journal entry_price. Falls back to the old broad
+    symbol+magic match only when the order carries no ticket at all.
     """
     price = placed_order.get("fill_price")
     try:
@@ -2053,15 +2911,25 @@ def _resolve_fill_price(trade: dict, placed_order: dict) -> float | None:
         positions = get_positions(trade["connection"]).get("positions", [])
     except Exception:
         return None
-    symbol = placed_order.get("symbol") or trade["symbol"]
-    for pos in positions:
-        if pos.get("symbol") == symbol and pos.get("magic") == OUR_MAGIC:
-            try:
-                open_price = float(pos.get("price_open"))
-            except (TypeError, ValueError):
-                continue
-            if open_price > 0:
-                return open_price
+    # .get, not trade["symbol"]: _journal_record_open calls this with a
+    # minimal {"connection": ...} trade dict that has no "symbol" key at
+    # all (found by /code-review 2026-10-13) -- currently dormant since MT5
+    # sdk.place_order() always sets placed_order["symbol"] on success, but
+    # a KeyError here would otherwise drop the fill from the journal.
+    symbol = placed_order.get("symbol") or trade.get("symbol")
+    target_ticket = str(placed_order.get("order_id") or "").strip()
+    candidates = [
+        pos for pos in positions
+        if pos.get("symbol") == symbol and pos.get("magic") == OUR_MAGIC
+        and (not target_ticket or str(pos.get("ticket")) == target_ticket)
+    ]
+    for pos in candidates:
+        try:
+            open_price = float(pos.get("price_open"))
+        except (TypeError, ValueError):
+            continue
+        if open_price > 0:
+            return open_price
     return None
 
 
@@ -2110,25 +2978,40 @@ def _post_trade_spec_check(trade: dict, placed_order: dict) -> str:
     sys.path.insert(0, str(AGENT_DIR))
     from src.live.halt import trip_halt
     from src.trading.connectors.mt5 import sdk as mt5_sdk
-    from src.trading.profiles import profile_by_id
     from src.trading.service import get_positions
 
     broker = "mt5"  # every mt5-live-* profile shares this mandate/halt broker key
     connection = trade["connection"]
+    # Match by the NEW order's own ticket (order_id), not just symbol+magic
+    # -- real bug found by /code-review: with MAX_SAME_DIRECTION_POSITIONS
+    # (or a target's own max_stack) > 1, this symbol can legitimately have
+    # several already-open, healthy positions. Matching on symbol+magic
+    # alone force-closed ALL of them on a spec violation, not just the one
+    # bad new fill.
+    target_ticket = str(placed_order.get("order_id") or "").strip()
     closed: list[str] = []
     try:
         positions = get_positions(connection).get("positions", [])
-        ours = [
+        matches = [
             p for p in positions
-            if p.get("symbol") == (actual_symbol or trade["symbol"]) and p.get("magic") == OUR_MAGIC
+            if p.get("symbol") == (actual_symbol or trade["symbol"])
+            and p.get("magic") == OUR_MAGIC
+            and target_ticket
+            and str(p.get("ticket")) == target_ticket
         ]
-        if ours:
-            profile = profile_by_id(connection)
-            config = mt5_sdk.build_config(profile.config, {})
-            for pos in ours:
+        if matches:
+            config = _mt5_config_for(connection)
+            for pos in matches:  # should be exactly one; loop defensively
                 ticket = pos.get("ticket")
                 result = mt5_sdk.close_position(config, ticket=ticket)
                 closed.append(f"{pos.get('symbol')} ticket {ticket}: {result.get('status')}")
+        elif not target_ticket:
+            closed.append(
+                "could not identify the new position's own ticket (order_id missing) -- "
+                "refusing to blindly close other positions on this symbol; close manually"
+            )
+        else:
+            closed.append(f"no open position found with ticket {target_ticket} (already closed/never opened?)")
     except Exception as exc:
         closed.append(f"flatten attempt raised: {exc}")
 
@@ -2141,6 +3024,65 @@ def _post_trade_spec_check(trade: dict, placed_order: dict) -> str:
         f"(src.live.halt.clear_halt) — the committee did not follow the prompt's hardcoded "
         f"order parameters, and this needs human review before further automated trading. "
         f"Close attempt: {closed_note}."
+    )
+
+
+def _post_trade_research_only_violation(trade: dict, placed_order: dict, reason: str) -> str:
+    """D3 (2026-10-06): a research-only pass's prompt never includes the
+    trading_place_order instructions at all, but the tool is still
+    technically callable by the agent regardless of what the prompt says to
+    use it for. If one somehow fires anyway, this is the code-level
+    backstop -- CLOSE it immediately and trip the kill switch, the same
+    severity _post_trade_spec_check gives a parameter mismatch (arguably
+    this is worse: the LLM didn't just get a parameter wrong, it ignored an
+    explicit "do not trade this pass" instruction entirely). Mirrors
+    _post_trade_spec_check's own closing logic; see that function for the
+    ticket-matching rationale.
+
+    Chosen over the alternative (silently ignore, as today's trade=None
+    research path already does) specifically so this never happens
+    invisibly -- see the D3 ripple discussion for why "research-only" must
+    be enforced in code, not just trusted from the prompt.
+    """
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.live.halt import trip_halt
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.service import get_positions
+
+    broker = "mt5"
+    connection = trade["connection"]
+    actual_symbol = placed_order.get("symbol") or trade["symbol"]
+    target_ticket = str(placed_order.get("order_id") or "").strip()
+    closed: list[str] = []
+    try:
+        positions = get_positions(connection).get("positions", [])
+        matches = [
+            p for p in positions
+            if p.get("symbol") == actual_symbol and p.get("magic") == OUR_MAGIC
+            and target_ticket and str(p.get("ticket")) == target_ticket
+        ]
+        if matches:
+            config = _mt5_config_for(connection)
+            for pos in matches:
+                ticket = pos.get("ticket")
+                result = mt5_sdk.close_position(config, ticket=ticket)
+                closed.append(f"{pos.get('symbol')} ticket {ticket}: {result.get('status')}")
+        elif not target_ticket:
+            closed.append("could not identify the new position's own ticket (order_id missing) -- "
+                           "refusing to blindly close other positions on this symbol; close manually")
+        else:
+            closed.append(f"no open position found with ticket {target_ticket} (already closed/never opened?)")
+    except Exception as exc:
+        closed.append(f"flatten attempt raised: {exc}")
+
+    trip_halt(by="cli", reason=f"research-only pass placed a live order on {trade['symbol']}: {reason}", broker=broker)
+    closed_note = "; ".join(closed) if closed else "no position found to close (already flat?)"
+    return (
+        f"\n\n[CRITICAL — RESEARCH-ONLY VIOLATION, AUTO-CLOSED] This pass was research-only ({reason}) "
+        f"and was explicitly told not to call trading_place_order, but did anyway. This position has "
+        f"been closed immediately and {broker} live trading is now HALTED (kill switch) until manually "
+        f"cleared (src.live.halt.clear_halt) — this needs human review before further automated "
+        f"trading. Close attempt: {closed_note}."
     )
 
 
@@ -2181,22 +3123,31 @@ def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
     if risk_distance <= 0 or reward_distance <= 0:
         return ""  # malformed levels -- nothing sane to enforce
 
-    ratio = reward_distance / risk_distance
-    if ratio >= MIN_REWARD_RISK_RATIO:
-        return ""
-
+    # Rulebook 2026-09-30: the floor is NET of spread -- the spread is paid
+    # on both the risk and the reward side of the trade.
     symbol = trade["symbol"]
     connection = trade["connection"]
     quote = _symbol_live_quote(symbol, connection)
+    spread = max(0.0, float(quote["ask"]) - float(quote["bid"])) if quote else 0.0
+    ratio = (reward_distance - spread) / (risk_distance + spread)
+    if ratio >= MIN_REWARD_RISK_RATIO:
+        return ""
+
     floor_distance = max(_atr_stop_floor(symbol, connection) or 0.0, _spread_stop_floor(quote) or 0.0)
 
-    desired_risk_distance = reward_distance / MIN_REWARD_RISK_RATIO
-    if desired_risk_distance >= floor_distance:
+    # floor_distance == 0.0 means the floor couldn't be read (both helpers
+    # fail open to None on a transient bars/quote error), not "no floor" --
+    # tightening unchecked in that case could land inside live spread (the
+    # exact failure _post_trade_stop_floor_check guards against with its own
+    # `if floor_distance <= 0: return "", False`). Falling to the
+    # widen-take-profit branch is always safe regardless of floor knowledge.
+    desired_risk_distance = (reward_distance - spread) / MIN_REWARD_RISK_RATIO - spread
+    if floor_distance > 0 and desired_risk_distance >= floor_distance:
         new_sl = entry - desired_risk_distance if is_buy else entry + desired_risk_distance
         new_tp = tp
         action = f"tightened stop-loss to {new_sl:.5f}"
     else:
-        desired_reward_distance = risk_distance * MIN_REWARD_RISK_RATIO
+        desired_reward_distance = (risk_distance + spread) * MIN_REWARD_RISK_RATIO + spread
         new_sl = sl
         new_tp = entry + desired_reward_distance if is_buy else entry - desired_reward_distance
         action = f"widened take-profit to {new_tp:.5f}"
@@ -2208,23 +3159,155 @@ def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
 
     sys.path.insert(0, str(AGENT_DIR))
     from src.trading.connectors.mt5 import sdk as mt5_sdk
-    from src.trading.profiles import profile_by_id
     from src.trading.service import get_positions
 
+    # Match by the NEW order's own ticket (order_id), not ours[0] -- real
+    # bug found by /code-review: with multiple legitimate stacked positions
+    # on this symbol, ours[0] (whatever order the broker happens to return)
+    # could be an older, already-compliant position -- modifying it leaves
+    # the actual sub-floor new fill uncorrected while altering a healthy one.
+    target_ticket = str(placed_order.get("order_id") or "").strip()
     try:
         positions = get_positions(connection).get("positions", [])
-        ours = [p for p in positions if p.get("symbol") == symbol and p.get("magic") == OUR_MAGIC]
-        if not ours:
-            return f"\n\n[AUTOMATED CHECK] {header} — no matching open position was found to correct; check manually."
-        profile = profile_by_id(connection)
-        config = mt5_sdk.build_config(profile.config, {})
-        result = mt5_sdk.modify_position(config, ticket=ours[0].get("ticket"), stop_loss=new_sl, take_profit=new_tp)
+        matches = [
+            p for p in positions
+            if p.get("symbol") == symbol and p.get("magic") == OUR_MAGIC
+            and target_ticket and str(p.get("ticket")) == target_ticket
+        ]
+        if not matches:
+            return (
+                f"\n\n[AUTOMATED CHECK] {header} — no matching open position "
+                f"(ticket {target_ticket or '?'}) was found to correct; check manually."
+            )
+        config = _mt5_config_for(connection)
+        result = mt5_sdk.modify_position(config, ticket=matches[0].get("ticket"), stop_loss=new_sl, take_profit=new_tp)
     except Exception as exc:
         return f"\n\n[AUTOMATED CHECK] {header} — correction attempt raised: {exc}."
 
     if result.get("status") != "ok":
         return f"\n\n[AUTOMATED CHECK] {header} — correction attempt failed: {result.get('error')}."
+    # Mutate placed_order in place so the caller's subsequent journal write
+    # (_journal_record_open) records the ACTUAL live stop/target, not the
+    # stale pre-correction values -- real bug found by /code-review: the
+    # journal used to silently diverge from what's really on the broker,
+    # corrupting later excursion/reversal-tag analysis for this trade.
+    placed_order["stop_loss"] = new_sl
+    placed_order["take_profit"] = new_tp
     return f"\n\n[AUTOMATED CHECK — CORRECTED] {header} — {action} to restore it."
+
+
+def _handle_filled_order(
+    trade: dict, placed_order: dict, trend_allowed: set[str] | None,
+    *, research_only: bool = False, research_only_reason: str = "",
+) -> tuple[str, bool]:
+    """Run every post-fill guardrail against a just-filled order, then journal it.
+
+    Real bug found by /code-review: a fill that a guardrail immediately
+    closes (trend-gate violation, spec violation, or a stop-floor-budget
+    violation) is still a real trade that happened on the live account, but
+    the journal write used to live only in the "no violation" branch below
+    -- so every auto-closed fill silently vanished from the trade journal.
+    That blinds _rulebook_skip_reason's 3-loss bench and repeat-deviation
+    checks, the weekly win/loss report, and _journal_summary_text's own-
+    history fact to exactly the fills most worth tracking -- all three exist
+    specifically to never trust the LLM's own account of what happened.
+    Journals under the order's OWN reported symbol (not trade["symbol"]):
+    a spec violation can carry a different, wrong symbol, and recording it
+    under the expected symbol would misfile it into the wrong instrument's
+    history.
+
+    research_only=True (D3, 2026-10-06) checked FIRST, ahead of even the
+    trend/spec checks: a research-only pass's prompt never offers
+    trading_place_order as an option at all, so any fill here means the LLM
+    ignored an explicit "do not trade this pass" instruction entirely --
+    more fundamental than a parameter mismatch, so it takes priority over
+    (not in addition to) the normal spec-check framing.
+
+    Returns (report note to append, whether this counts as "traded" for
+    CommitteeResult/email tagging).
+    """
+    spec_note = (
+        _post_trade_research_only_violation(trade, placed_order, research_only_reason) if research_only else
+        _enforce_trend_rule(trade, placed_order, trend_allowed)
+        or _post_trade_spec_check(trade, placed_order)
+    )
+    floor_note, floor_closed = ("", False) if spec_note else _post_trade_stop_floor_check(trade, placed_order)
+    if floor_closed:
+        spec_note = floor_note
+    elif not spec_note:
+        floor_note = floor_note + _post_trade_max_stop_check(trade, placed_order)
+    if spec_note:
+        # A spec violation is CLOSED, not just reported -- see
+        # _post_trade_spec_check's docstring for why this is a real
+        # corrective action, not another informational-only check.
+        note = spec_note
+        traded = False
+    else:
+        note = floor_note
+        note = note + _post_trade_cap_check(trade)
+        note = note + _post_trade_spread_check(trade, placed_order)
+        note = note + _post_trade_reward_risk_check(trade, placed_order)
+        # "with" = H4+D1 agreed and the gate allowed only this side; counter-trend
+        # fills never get here (closed by _enforce_trend_rule).
+        placed_order["trend_alignment"] = "with" if trend_allowed else "neutral"
+        # D13 (2026-10-08) -- see fundednext_reporter.py's identical line
+        # for the full rationale.
+        placed_order["regime"] = trade.get("regime_label", "NORMAL")
+        traded = True
+    _journal_record_open(placed_order.get("symbol") or trade["symbol"], trade["connection"], placed_order)
+    return note, traded
+
+
+def _journal_any_placed_orders(
+    trade: dict | None, run_id: str | None, trend_allowed: set[str] | None,
+    *, research_only: bool = False, research_only_reason: str = "",
+) -> tuple[str, bool, bool]:
+    """Run every verified placed order in this run's trace (if any) through
+    the full post-fill guardrail chain and journal it. Returns (report notes,
+    traded, any orders were placed at all).
+
+    Shared by every return point in run_committee -- success, a non-success
+    status, and an empty final answer -- not just the success path. A run
+    that places an order and THEN fails on a later step (an empty model
+    response, max-iterations, an unparseable final answer) must not let that
+    fill skip every guardrail and the journal just because the run itself
+    didn't end cleanly. Real incident 2026-10-05 (FundedNext GBPUSD
+    empty_model_response) happened not to have placed anything, but
+    confirmed this gap was live; the daily-repair agent's 2026-10-06 review
+    of that incident is what found it.
+
+    research_only=True (D3, 2026-10-06) is passed straight through to
+    _handle_filled_order, which treats any fill found here as a violation
+    (closed + kill switch tripped) rather than a normal trade -- see that
+    function's docstring.
+
+    `run_id` being None (the CLI's own JSON output failed to parse, so there
+    is no run directory to inspect) returns (empty, False, False) -- there is
+    genuinely nothing to recover there.
+    """
+    if not trade or not run_id:
+        return "", False, False
+    notes = ""
+    traded = False
+    placed_orders = _extract_placed_orders(run_id)
+    for placed_order in placed_orders:
+        # Resolve the real fill price ONCE here and patch it into
+        # placed_order, so every downstream consumer (_post_trade_spread_
+        # check, _post_trade_reward_risk_check, _journal_record_open) can
+        # just read placed_order["fill_price"] directly instead of each
+        # independently calling _resolve_fill_price (and its own
+        # get_positions broker round-trip) -- real inefficiency found by
+        # /code-review: up to 3 redundant broker calls per trade.
+        resolved_price = _resolve_fill_price(trade, placed_order)
+        if resolved_price is not None:
+            placed_order["fill_price"] = resolved_price
+        note, order_traded = _handle_filled_order(
+            trade, placed_order, trend_allowed,
+            research_only=research_only, research_only_reason=research_only_reason,
+        )
+        notes += note
+        traded = traded or order_traded
+    return notes, traded, bool(placed_orders)
 
 
 def _last_json_line(stdout: str | None) -> dict | None:
@@ -2307,11 +3390,23 @@ def send_email(subject: str, body: str, html_body: str | None = None) -> None:
     if cc:
         msg["Cc"] = ", ".join(cc)
 
-    with smtplib.SMTP(host, port, timeout=30) as smtp:
-        smtp.starttls()
-        smtp.login(user, password)
-        smtp.sendmail(sender, [recipient, *cc], msg.as_string())
-    logger.info("emailed report: %s (cc: %s)", subject, ", ".join(cc) or "none")
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            with smtplib.SMTP(host, port, timeout=30) as smtp:
+                smtp.starttls()
+                smtp.login(user, password)
+                smtp.sendmail(sender, [recipient, *cc], msg.as_string())
+            logger.info("emailed report: %s (cc: %s)", subject, ", ".join(cc) or "none")
+            return
+        except (socket.gaierror, OSError, smtplib.SMTPException) as exc:
+            if attempt == attempts:
+                raise
+            logger.warning(
+                "send_email attempt %d/%d failed (%s), retrying in %ds",
+                attempt, attempts, exc, attempt * 5,
+            )
+            time.sleep(attempt * 5)
 
 
 def _format_body(result: CommitteeResult) -> str:
@@ -2341,7 +3436,7 @@ def _format_body(result: CommitteeResult) -> str:
 # output is untrusted content, never allowed to inject markup into the email.
 # --------------------------------------------------------------------------- #
 
-_TAG_COLORS = {"TRADED": "#2e7d32", "OK": "#555555", "ERROR": "#c62828", "TIMEOUT": "#c62828", "CRASHED": "#c62828"}
+_TAG_COLORS = {"TRADED": "#2e7d32", "OK": "#555555", "SKIPPED": "#888888", "ERROR": "#c62828", "TIMEOUT": "#c62828", "CRASHED": "#c62828"}
 _EMAIL_FONT = "font-family:Arial,Helvetica,sans-serif;"
 
 
@@ -2424,7 +3519,9 @@ def _status_report_html() -> str:
     log = _status_log_summary()
     if log.get("last_result_ts"):
         tag = log["last_result_tag"]
-        tag_color = _TAG_COLORS.get(tag, "#555555")
+        # D16: tag may now be "OK, NORMAL" (regime suffix) -- look up color
+        # by the base tag only, so a known status still gets its color.
+        tag_color = _TAG_COLORS.get(tag.split(",", 1)[0], "#555555")
         parts.append(
             f'<p style="margin:2px 0;">Last pass: {_esc(log["last_result_ts"])} &rarr; {_esc(log["last_result_desc"])} '
             f'(<span style="color:{tag_color};font-weight:bold;">{_esc(tag)}</span>)</p>'
@@ -2433,8 +3530,7 @@ def _status_report_html() -> str:
         parts.append(f'<p style="margin:2px 0;">Last pass started: {_esc(log["last_start_ts"])} (in progress)</p>')
     else:
         parts.append('<p style="margin:2px 0;color:#555;">Last pass: no reporter.log data found</p>')
-    if log.get("next_due"):
-        parts.append(f'<p style="margin:2px 0;">Next pass due: ~{_esc(log["next_due"])} (interval {log.get("interval")}s)</p>')
+    parts.append(f'<p style="margin:2px 0;">Next pass due: ~{_esc(_next_pass_due_text(datetime.now(timezone.utc)))}</p>')
 
     sys.path.insert(0, str(AGENT_DIR))
     from src.live.halt import halt_flag_set
@@ -2562,7 +3658,8 @@ def _status_report_html() -> str:
 def _format_body_html(result: CommitteeResult, tag: str) -> str:
     """HTML counterpart to _format_body — same content, real tables/bold/color."""
     when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    color = _TAG_COLORS.get(tag, "#555555")
+    # D16: tag may be "OK, NORMAL" (regime suffix) -- color by base tag only.
+    color = _TAG_COLORS.get(tag.split(",", 1)[0], "#555555")
     header = (
         f'<div style="{_EMAIL_FONT}font-size:14px;color:#222;">'
         f'<h2 style="margin:0 0 4px;font-size:16px;">{_esc(result.committee)} &mdash; {_esc(result.target)} '
@@ -2615,9 +3712,20 @@ def _check_trade_drought() -> None:
     re-arms itself once a new trade actually happens. Fails open (skips
     silently) on any read error or if a symbol has no trade history yet —
     a missed alert is better than crashing the loop over this.
+
+    Real bug found 2026-09-24: this used to call the generic
+    ``get_open_orders`` (mt5_sdk's own default ``executions_lookback_days=7``,
+    matching the unrelated signal-service-activity feature's window). Once a
+    symbol's last trade aged past that same ~7-day window, the deal proving
+    the drought fell OUTSIDE the fetch window too -- ``executions`` came back
+    empty and this function took that as "never traded, nothing to check,"
+    silently skipping the exact multi-week drought this alert exists to
+    catch. Passing a lookback well past NO_TRADE_ALERT_DAYS fixes this: the
+    deal that would trigger the alert is always still in view.
     """
     sys.path.insert(0, str(AGENT_DIR))
-    from src.trading.service import get_open_orders
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+    from src.trading.profiles import profile_by_id
 
     for spec in TARGETS:
         trade = spec.get("trade")
@@ -2625,7 +3733,10 @@ def _check_trade_drought() -> None:
             continue
 
         try:
-            executions = get_open_orders(trade["connection"], include_executions=True).get("executions", [])
+            config = mt5_sdk.build_config(profile_by_id(trade["connection"]).config, {})
+            executions = mt5_sdk.get_open_orders(
+                config, include_executions=True, executions_lookback_days=NO_TRADE_ALERT_DAYS + 90
+            ).get("executions", [])
         except Exception:
             continue
 
@@ -2684,38 +3795,69 @@ def _deepseek_balance_usd() -> float | None:
     """Read the DeepSeek platform account's USD balance, or None if unavailable.
 
     Direct call to DeepSeek's own billing endpoint (not the OpenAI-compatible
-    chat completions API) — stdlib ``urllib`` only, no new dependency. A
-    no-op for any other provider (LANGCHAIN_PROVIDER != "deepseek"). Fails
+    chat completions API) — stdlib ``urllib`` only, no new dependency. Fails
     open (returns None) on any network/parse error — this is purely an
     advisory alert and must never block or slow down a pass.
     """
-    if os.environ.get("LANGCHAIN_PROVIDER", "").strip().lower() != "deepseek":
-        return None
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         return None
-
-    import urllib.error
-    import urllib.request
-
-    req = urllib.request.Request(
-        "https://api.deepseek.com/user/balance",
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError):
+    payload = _fetch_json_or_none("https://api.deepseek.com/user/balance", api_key)
+    if payload is None:
         return None
-
     try:
         usd_info = next(
             (b for b in (payload.get("balance_infos") or []) if b.get("currency") == "USD"),
             None,
         )
         return float(usd_info["total_balance"]) if usd_info else None
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return None
+
+
+def _openrouter_balance_usd() -> float | None:
+    """Read the OpenRouter account's remaining USD credit, or None if unavailable.
+
+    Added 2026-09-24 after a real incident: both bots moved from DeepSeek to
+    OpenRouter on 2026-09-18, but this alert still only checked DeepSeek --
+    so OpenRouter ran down to $0.11 and every pass from 2026-09-23 10:03
+    failed with 402 "requires more credits" with no warning. /credits
+    returns account-wide totals (purchased minus used), which is what
+    actually runs out; a per-key "limit" is not set on this account.
+    Fails open exactly like _deepseek_balance_usd.
+    """
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return None
+    payload = _fetch_json_or_none("https://openrouter.ai/api/v1/credits", api_key)
+    if payload is None:
+        return None
+    try:
+        data = payload["data"]
+        return float(data["total_credits"]) - float(data["total_usage"])
     except (TypeError, ValueError, KeyError):
         return None
+
+
+def _fetch_json_or_none(url: str, api_key: str) -> dict | None:
+    """GET url with a bearer token and return the decoded JSON, or None on any failure."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError):
+        return None
+
+
+# Provider name (as set in LANGCHAIN_PROVIDER) -> (display name, balance reader).
+# Any provider not listed here is simply not monitored.
+_LLM_BALANCE_READERS = {
+    "deepseek": ("DeepSeek", _deepseek_balance_usd),
+    "openrouter": ("OpenRouter", _openrouter_balance_usd),
+}
 
 
 def _check_llm_balance_alert() -> None:
@@ -2727,34 +3869,39 @@ def _check_llm_balance_alert() -> None:
     _check_cap_fit_alert: fires once on the pass balance first drops below
     LLM_BALANCE_ALERT_THRESHOLD_USD, clears once it recovers above it, so a
     top-up followed by another dip alerts again rather than firing only
-    once ever. Pure read-only balance check; fails open (skips silently) if
-    the balance can't be read.
+    once ever. The "alerted" flag is tied to the provider it was set for, so
+    switching providers re-arms it instead of inheriting a stale flag (the
+    DeepSeek-era {"alerted": true} would otherwise have muted OpenRouter's
+    first alert). Pure read-only balance check; fails open (skips silently)
+    if the balance can't be read.
     """
-    balance = _deepseek_balance_usd()
+    provider = os.environ.get("LANGCHAIN_PROVIDER", "").strip().lower()
+    reader = _LLM_BALANCE_READERS.get(provider)
+    if reader is None:
+        return
+    display_name, read_balance = reader
+    balance = read_balance()
     if balance is None:
         return
 
     state = _read_llm_balance_alert_state()
-    already_alerted = state.get("alerted") is True
+    already_alerted = state.get("alerted") is True and state.get("provider") == provider
     below = balance < LLM_BALANCE_ALERT_THRESHOLD_USD
 
     if below and not already_alerted:
         try:
             text = (
-                f"DeepSeek account balance is ${balance:.2f}, below the "
-                f"${LLM_BALANCE_ALERT_THRESHOLD_USD:.2f} alert threshold. Once it hits $0, every "
-                f"committee pass fails outright (402 Insufficient Balance) with no trade decision "
-                f"made and no position monitoring for that pass — top up soon to avoid a silent "
-                f"gap in live coverage."
+                f"{display_name} account balance is ${balance:.2f}, below the "
+                f"${LLM_BALANCE_ALERT_THRESHOLD_USD:.2f} alert threshold. Once it runs out, every "
+                f"committee pass on BOTH bots fails outright (402) with no trade decision "
+                f"made — top up soon to avoid a silent gap in live coverage."
             )
-            send_email(f"[Vibe-Trading] LOW BALANCE — DeepSeek ${balance:.2f}", text)
-            state["alerted"] = True
-            _write_llm_balance_alert_state(state)
+            send_email(f"[Vibe-Trading] LOW BALANCE — {display_name} ${balance:.2f}", text)
+            _write_llm_balance_alert_state({"alerted": True, "provider": provider})
         except Exception:
             logger.exception("failed to send LLM balance alert email")
-    elif not below and already_alerted:
-        state["alerted"] = False
-        _write_llm_balance_alert_state(state)
+    elif not below and state.get("alerted") is True:
+        _write_llm_balance_alert_state({"alerted": False, "provider": provider})
 
 
 def _read_cap_fit_alert_state() -> dict:
@@ -2918,7 +4065,24 @@ def _status_header_html() -> str:
         return ""
 
 
-def run_once() -> None:
+def run_once(session: str = "new_york") -> None:
+    """Run one pass over TARGETS for the given session.
+
+    Each TARGETS entry may carry a "sessions" set naming which session
+    labels trade-enable IT specifically (default {"new_york"} when absent,
+    preserving the original "only new_york trades" behavior for every
+    target that doesn't opt in). A target not in its own "sessions" set
+    falls back to research-only when RESEARCH_PASSES_ENABLED, or is skipped
+    entirely for that one target when it's off -- independent of every
+    other target's own eligibility. This is per-target rather than a single
+    session-wide flag because of EURUSD's "sessions": {"new_york", "london"}
+    entry below (2026-10-09, user's explicit call after a cost discussion:
+    smallest-footprint way to test whether trading London adds anything --
+    one symbol, this account only, GBPUSD and FundedNext both untouched).
+    A research-only pass's Decision/Reasoning still gets carried forward via
+    _record_session_bias for the next NY pass to read back
+    (_session_bias_fact, wired into _build_prompt).
+    """
     # Disabled 2026-09-02 at the user's request: equity crossed the $100
     # milestone on 2026-09-01, and the user already decided (with silver
     # deliberately deferred ~1 month) to hold off adding it -- this alert
@@ -2934,8 +4098,47 @@ def run_once() -> None:
     _log_cap_gap()
     for spec in TARGETS:
         target = spec.get("target", "?")
+        target_trade_enabled = session in spec.get("sessions", {"new_york"})
+        if not target_trade_enabled and not RESEARCH_PASSES_ENABLED:
+            logger.info(
+                "%s pass for %s is research-only (not in this target's own sessions) and "
+                "RESEARCH_PASSES_ENABLED is off -- skipping", session, target,
+            )
+            continue
+        # Never mutate the module-level TARGETS list -- a fresh dict per
+        # pass, trade forced to None on research-only sessions. "sessions"
+        # is TARGETS-only metadata (run_committee's own call below does
+        # **effective_spec) -- dropped here, not forwarded, after a real
+        # live crash 2026-10-09 (TypeError: run_committee() got an
+        # unexpected keyword argument 'sessions') the very first time a
+        # TARGETS entry actually carried one.
+        effective_spec = {k: v for k, v in spec.items() if k != "sessions"}
+        if not target_trade_enabled:
+            effective_spec["trade"] = None
+        # Skip the committee outright while a correlated EXCLUSIVE_SYMBOL_GROUP
+        # partner is open (2026-09-24, user's call) -- the pass couldn't
+        # trade anyway and its report feeds nothing downstream, so running
+        # it was ~$0.80 for an email. A one-line email keeps the day's
+        # report from going silent.
+        if target_trade_enabled and spec.get("trade"):
+            conflict = (_exclusive_group_conflict(spec["trade"])
+                        or _rulebook_skip_reason(spec["trade"]["symbol"]))
+            if conflict:
+                logger.info("skipping %s committee: %s", target, conflict)
+                strategy_tracking.record_decision(
+                    BOT, spec["trade"]["symbol"], spec["trade"]["connection"],
+                    decision="skipped", traded=False, status="skipped", note=conflict,
+                )
+                try:
+                    send_email(
+                        f"[Vibe-Trading] {session}: {spec.get('committee', '?')} — {target} (SKIPPED)",
+                        _status_header() + conflict + " Committee not run (no LLM cost).",
+                    )
+                except Exception:
+                    logger.exception("failed to send skip notice for %s", target)
+                continue
         try:
-            result = run_committee(**spec)
+            result = run_committee(**effective_spec)
         except Exception:
             # A bug in run_committee (or anything it calls) must not take the
             # whole unattended loop down with it — one target's crash should
@@ -2958,11 +4161,36 @@ def run_once() -> None:
                 logger.exception("also failed to send the crash notification email")
             continue
 
+        if target_trade_enabled and spec.get("trade"):
+            strategy_tracking.record_decision(
+                BOT, spec["trade"]["symbol"], spec["trade"]["connection"],
+                decision=(strategy_tracking.parse_decision(result.report_text)
+                          if result.status == "success" else result.status),
+                traded=result.traded, status=result.status, note=result.error or "",
+                regime=result.regime,
+            )
+
+        if not target_trade_enabled and result.status == "success":
+            trade_spec = spec.get("trade")
+            symbol = trade_spec.get("symbol") if isinstance(trade_spec, dict) else None
+            if symbol:
+                try:
+                    _record_session_bias(symbol, session, result.report_text)
+                except Exception:
+                    logger.exception("failed to record session bias for %s (%s)", symbol, session)
+
         if not is_reportable(result):
             logger.info("%s on %s: not reportable, skipping email", result.committee, result.target)
             continue
         tag = "TRADED" if result.traded else ("OK" if result.status == "success" else result.status.upper())
-        subject = f"[Vibe-Trading] {result.committee} — {result.target} ({tag})"
+        # D16 (2026-10-08): regime appended inside the SAME parens as a
+        # ", REGIME" suffix -- _LOG_EMAILED_RE's capture group below was
+        # widened to match "tag" or "tag, REGIME" as one piece (see its own
+        # comment; a bare comma/space here used to silently break the match).
+        if result.regime:
+            tag = f"{tag}, {result.regime}"
+        # session kept OUTSIDE the trailing (tag) parens on purpose.
+        subject = f"[Vibe-Trading] {session}: {result.committee} — {result.target} ({tag})"
         try:
             html = _wrap_email_html(_status_header_html() + _format_body_html(result, tag))
             send_email(subject, _status_header() + _format_body(result), html_body=html)
@@ -2977,8 +4205,9 @@ def run_once() -> None:
 # --------------------------------------------------------------------------- #
 
 _LOG_RUN_START_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO running (.+)$")
-_LOG_EMAILED_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO emailed report: \[Vibe-Trading\] (.+?) \((\w+)\)")
-_LOG_INTERVAL_RE = re.compile(r"starting loop mode, interval=(\d+)s")
+_LOG_EMAILED_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO emailed report: \[Vibe-Trading\] (.+?) \((\w+(?:, \w+)?)\)"
+)
 
 
 def _status_lock_state() -> tuple[bool, int | None]:
@@ -2991,7 +4220,14 @@ def _status_lock_state() -> tuple[bool, int | None]:
 
 
 def _status_log_summary() -> dict:
-    """Parse the tail of reporter.log for the interval and the last pass's timing/outcome.
+    """Parse the tail of reporter.log for the last pass's timing/outcome.
+
+    "next_due" used to be derived here (last emailed timestamp + a fixed
+    --interval), but the loop no longer runs on a fixed interval (see
+    _next_session_boundary) -- --interval is accepted for CLI backward
+    compatibility only and no longer drives scheduling, so that arithmetic
+    would be silently wrong. _next_pass_due_text computes it directly from
+    the session schedule instead; see its call sites.
 
     Best-effort: returns an empty dict (never raises) if the log is missing
     or unreadable — --status must degrade gracefully, not crash, when e.g.
@@ -3002,13 +4238,9 @@ def _status_log_summary() -> dict:
     except OSError:
         return {}
 
-    interval = None
     last_start = None
     last_emailed = None
     for line in lines[-500:]:
-        m = _LOG_INTERVAL_RE.search(line)
-        if m:
-            interval = int(m.group(1))
         m = _LOG_RUN_START_RE.match(line)
         if m:
             last_start = (m.group(1), m.group(2))
@@ -3016,7 +4248,7 @@ def _status_log_summary() -> dict:
         if m:
             last_emailed = (m.group(1), m.group(2), m.group(3))
 
-    result: dict = {"interval": interval}
+    result: dict = {}
     if last_start:
         result["last_start_ts"], result["last_start_desc"] = last_start
     if last_emailed:
@@ -3024,12 +4256,6 @@ def _status_log_summary() -> dict:
         result["last_result_ts"] = ts_str
         result["last_result_desc"] = desc
         result["last_result_tag"] = tag
-        if interval:
-            try:
-                completed = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                result["next_due"] = (completed + timedelta(seconds=interval)).strftime("%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                pass
     return result
 
 
@@ -3051,8 +4277,7 @@ def _build_status_report() -> str:
         lines.append(f"Last pass started: {log['last_start_ts']} (still in progress or result not yet logged)")
     else:
         lines.append("Last pass: no reporter.log data found")
-    if log.get("next_due"):
-        lines.append(f"Next pass due: ~{log['next_due']} (interval {log.get('interval')}s)")
+    lines.append(f"Next pass due: ~{_next_pass_due_text(datetime.now(timezone.utc))}")
 
     sys.path.insert(0, str(AGENT_DIR))
     from src.live.halt import halt_flag_set
@@ -3146,8 +4371,17 @@ def print_status() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="Run one pass over TARGETS, then exit (default)")
-    parser.add_argument("--loop", action="store_true", help="Keep running, repeating every --interval seconds")
-    parser.add_argument("--interval", type=int, default=3600, help="Seconds between passes in --loop mode")
+    parser.add_argument("--loop", action="store_true", help="Keep running, one pass at each session boundary (see _next_session_boundary)")
+    parser.add_argument(
+        "--interval", type=int, default=3600,
+        help="Deprecated / no longer used for pass scheduling (kept for CLI backward compatibility only -- "
+        "--loop now fires at session boundaries, see --session)",
+    )
+    parser.add_argument(
+        "--session", choices=["asia", "london", "new_york"], default="new_york",
+        help="Session for a --once pass (only 'new_york' trades; others are research-only). Ignored in --loop mode, "
+        "which determines the session live from the schedule.",
+    )
     parser.add_argument("--status", action="store_true", help="Print a consolidated status report and exit (read-only, no lock)")
     args = parser.parse_args()
 
@@ -3180,23 +4414,49 @@ def main() -> int:
         return 1
 
     if args.loop:
+        # One live, uncached Finnhub call before the first pass -- a dead or
+        # misconfigured news-calendar key means every pass fails the news
+        # blackout closed (no trades at all) with nothing loud to say why.
+        # Real incident: the key returned 403 Forbidden starting 2026-10-02
+        # and four trading passes went by silently before anyone noticed.
+        if not fn_news.startup_self_test(alert_fn=send_email):
+            logger.critical("news calendar startup self-test failed -- refusing to start the loop")
+            return 1
+        # D17 (2026-10-08) -- see fundednext_reporter.py's identical line
+        # for the full rationale.
         logger.info(
-            "starting loop mode, interval=%ss (profit protection checked every %ss)",
-            args.interval, BREAKEVEN_POLL_SECONDS,
+            "regime config: calm<%.0f, %.0f<=volatile<=%.0f, extreme>%.0f, "
+            "volatile_size=%.1fx, volatile_stop_widen=%.1fx, atr_period=%d, lookback=%d, "
+            "skip_calm=%s, skip_extreme=%s",
+            strategy_tracking.REGIME_CALM_MAX_PERCENTILE, strategy_tracking.REGIME_VOLATILE_MIN_PERCENTILE,
+            strategy_tracking.REGIME_EXTREME_MIN_PERCENTILE, strategy_tracking.REGIME_EXTREME_MIN_PERCENTILE,
+            strategy_tracking.REGIME_VOLATILE_SIZE_MULTIPLIER, strategy_tracking.REGIME_VOLATILE_STOP_WIDEN_FACTOR,
+            strategy_tracking.REGIME_ATR_PERIOD, strategy_tracking.REGIME_LOOKBACK,
+            strategy_tracking.REGIME_SKIP_CALM, strategy_tracking.REGIME_SKIP_EXTREME,
+        )
+        next_boundary, next_session = _next_session_boundary(datetime.now(timezone.utc))
+        logger.info(
+            "starting loop mode, session-gated scheduling (only new_york trades; profit "
+            "protection checked every %ss) — next scheduled pass: %s (%s)",
+            BREAKEVEN_POLL_SECONDS, next_boundary.isoformat(), next_session,
         )
         # Two independent cadences share this one loop: the expensive,
-        # LLM-costly committee pass on args.interval, and the free,
-        # code-only profit protection check (breakeven + early-profit trail)
-        # on the much shorter BREAKEVEN_POLL_SECONDS -- see
-        # BREAKEVEN_POLL_SECONDS's comment for why waiting for the slow
-        # cadence to react would be wrong. A full
-        # pass fires immediately on the first tick (last_full_pass starts
-        # "due"), matching the loop's original always-run-on-start behavior.
-        last_full_pass = time.monotonic() - args.interval
+        # LLM-costly committee pass at each session boundary
+        # (_next_session_boundary), and the free, code-only profit
+        # protection check (breakeven + early-profit trail) on the much
+        # shorter BREAKEVEN_POLL_SECONDS -- see BREAKEVEN_POLL_SECONDS's
+        # comment for why waiting for the slow cadence to react would be
+        # wrong. Unlike the old fixed-interval loop, a fresh start does
+        # NOT fire an immediate pass -- deliberately: an ad-hoc pass at
+        # whatever moment the process happens to start (e.g. after a
+        # restart for a code fix) is exactly the kind of off-schedule
+        # execution this feature exists to avoid. Use `--once --session
+        # <s>` for a manual one-off pass instead.
         while True:
-            now = time.monotonic()
-            if now - last_full_pass >= args.interval:
-                last_full_pass = now
+            now_utc = datetime.now(timezone.utc)
+            if now_utc >= next_boundary:
+                session = next_session
+                next_boundary, next_session = _next_session_boundary(now_utc)
                 # XAUUSDm (and forex generally) is closed roughly Fri evening
                 # through Sun evening -- a pass during that window pays the
                 # full 4-agent committee cost for a trade that cannot
@@ -3204,28 +4464,26 @@ def main() -> int:
                 # opportunity. Checked every cycle (not slept-through-to-
                 # Monday) so it self-corrects cleanly across restarts/DST
                 # without extra scheduling logic.
-                if _in_weekend_window(datetime.now(timezone.utc)):
+                if _in_weekend_window(now_utc):
                     logger.info("weekend (UTC) — market closed, skipping this pass")
                     try:
                         _weekend_flatten_and_notify()
                     except Exception:
-                        logger.exception("weekend flatten/notify crashed; continuing after the normal interval")
+                        logger.exception("weekend flatten/notify crashed; continuing to the next scheduled pass")
                 else:
                     try:
-                        run_once()
+                        run_once(session)
                     except Exception:
                         # Defense in depth on top of run_once()'s own per-target
                         # try/except: nothing here should ever be able to kill an
                         # unattended loop that nobody is watching in real time.
-                        logger.exception("run_once() crashed; continuing after the normal interval")
+                        logger.exception("run_once() crashed; continuing to the next scheduled pass")
+                logger.info("next scheduled pass: %s (%s)", next_boundary.isoformat(), next_session)
             else:
-                try:
-                    _profit_protection_check()
-                except Exception:
-                    logger.exception("profit protection check crashed; continuing")
+                _between_passes_tick(now_utc)
             time.sleep(BREAKEVEN_POLL_SECONDS)
     else:
-        run_once()
+        run_once(args.session)
     return 0
 
 

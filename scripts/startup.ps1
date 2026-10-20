@@ -63,16 +63,14 @@ if ((Test-Path $HistoryLog) -and (Get-Item $HistoryLog).Length -gt $MaxHistoryBy
     Write-StartupLog "rotated reporter.history.log (exceeded ${MaxHistoryBytes} bytes)"
 }
 
-# A single committee run can take a long time (multi-agent debate + real data
-# fetches); a short interval risks overlapping runs and burns LLM API spend
-# for no benefit. Adjust freely, but keep it generous.
-#
-# 2 hours (was 3): shortened to raise the live gold target's opportunity count
-# toward ~10 trades/week now that a live mandate is committed, without going
-# all the way to the 1-hour cadence that would ~3x the DeepSeek spend the
-# 3-hour interval was specifically chosen to control. Tighten further only
-# after confirming the actual trade rate and API cost at this interval.
-$ReporterIntervalSeconds = 2 * 60 * 60   # 2 hours
+# DEPRECATED as a scheduling control 2026-09-21: committee_reporter.py's
+# --loop now fires at session boundaries (Asia/London/New York opens; only
+# the New York pass trades -- see _next_session_boundary in that file), not
+# on a fixed interval. --interval is still accepted by the CLI (backward
+# compatibility) but is otherwise ignored for scheduling purposes -- kept
+# here, unused, so this invocation doesn't need to change; safe to delete
+# once every script/doc referencing it is confirmed gone.
+$ReporterIntervalSeconds = 2 * 60 * 60   # 2 hours (vestigial, see above)
 
 Start-Process -FilePath (Join-Path $Venv "python.exe") `
     -ArgumentList @(
@@ -84,6 +82,6 @@ Start-Process -FilePath (Join-Path $Venv "python.exe") `
     -WindowStyle Hidden `
     -RedirectStandardOutput (Join-Path $LogDir "reporter.log") `
     -RedirectStandardError (Join-Path $LogDir "reporter.err.log")
-Write-StartupLog "launched committee_reporter.py --loop (every ${ReporterIntervalSeconds}s)"
+Write-StartupLog "launched committee_reporter.py --loop (session-gated: Asia/London/New York opens, only New York trades)"
 
 Write-StartupLog "startup.ps1 finished"

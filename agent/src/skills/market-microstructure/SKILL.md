@@ -10,14 +10,29 @@ category: analysis
 
 Study the micro-level mechanisms of price formation: who is trading, how they are trading, and how trades affect prices. For quantitative strategies, this matters because it improves transaction-cost estimation, identifies informed trading, and optimizes execution.
 
+## FX Session Liquidity & Spread Quick Reference
+
+Everything else in this skill (VPIN, Kyle lambda, LOB depth, China A-share call auctions) assumes tick/Level-2 equity data this account doesn't have. For a same-session/next-session spot FX liquidity check, use this instead:
+
+**Spread regime, not microstructure modeling:**
+- Compare the data pack's live spread against a normal baseline for the pair: EUR/USD and GBP/USD typically run ~0.5-1.5 pips in London/NY hours on a reasonable broker; anything materially wider (e.g. 2-3x a normal reading, or double-digit pips) signals either a thin-liquidity window or a stressed market -- treat it as a go/no-go flag, not just a cost input
+- Spread widens mechanically in low-participation windows: pre-London (late Tokyo), the ~5-minute rollover window around 17:00 ET, and the run-up to major holidays -- avoid entries in these windows even if a technical setup looks clean
+- Variable spreads (standard for retail FX brokers) widen further exactly when volatility spikes (news releases, illiquid session overlaps) -- a rejection-candle setup that forms seconds after a high-impact release is operating under a worse effective spread than the data pack's snapshot shows
+
+**Weekend/rollover gap risk:**
+- Any position still open into Friday's close carries weekend gap risk (no quotes between Friday close and Sunday open) -- this account's own flatten-by-Friday-20:00-UTC rule exists specifically to avoid this; don't recommend overriding it
+- A position held across a daily rollover accrues swap (interest-rate differential between the two currencies); immaterial for a same-session trade, worth a one-line note only if the position could extend to a second session
+
+**What actually matters for this account's "session, liquidity & event risk" check**: is the current spread reading normal for this pair/session, is there a high-impact release inside the intended holding window (see the data pack's calendar section), and does the position's expected hold survive to a sane flatten point -- not VPIN, not order-book depth, not call-auction mechanics, none of which apply to decentralized spot FX.
+
+## Core Concepts (equity/China A-share microstructure -- see above for the FX-relevant quick reference)
+
 Applicable scenarios:
 - Precise estimation of strategy trading costs (instead of simply assuming a flat 0.1% fee)
 - Designing large-order execution strategies (`TWAP / VWAP / IS`)
 - Detecting order-flow toxicity (avoid time windows dominated by informed traders)
 - Quantifying liquidity risk (flash-crash warning)
 - Capturing China A-share-specific microstructure features (call auction / closing auction / block trades)
-
-## Core Concepts
 
 ### Bid-Ask Spread
 

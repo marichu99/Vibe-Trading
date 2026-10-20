@@ -19,6 +19,8 @@ from src.agent.loop import (
     _fix_tool_pairs,
     _is_tool_success,
     _normalize_tool_run_dir,
+    _normalize_llm_usage,
+    _record_llm_usage,
 )
 
 
@@ -336,3 +338,87 @@ class TestNormalizeToolRunDir:
         args = {"run_dir": absolute_run_dir}
         out = _normalize_tool_run_dir(args, "/tmp/run_123")
         assert out["run_dir"] == absolute_run_dir
+
+
+# ---------------------------------------------------------------------------
+# _normalize_llm_usage / _record_llm_usage (cache_read_tokens surfacing --
+# see providers/llm.py's _apply_prompt_caching for why this matters: this
+# is the only place cache hits become visible without checking the
+# provider's own dashboard/API by hand)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeLlmUsage:
+    def test_basic_usage_without_cache_details(self) -> None:
+        result = _normalize_llm_usage({"input_tokens": 100, "output_tokens": 20, "total_tokens": 120})
+        assert result == {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}
+        assert "cache_read_tokens" not in result
+
+    def test_cache_read_tokens_surfaced_when_present(self) -> None:
+        usage = {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "input_token_details": {"cache_read": 80},
+        }
+        result = _normalize_llm_usage(usage)
+        assert result["cache_read_tokens"] == 80
+
+    def test_cache_read_zero_is_distinguishable_from_absent(self) -> None:
+        """A reported 0 (cache miss) must still surface the key -- omitting
+        it would look identical to a provider that never reports caching
+        at all, hiding a real cache-miss signal worth investigating."""
+        usage = {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "input_token_details": {"cache_read": 0},
+        }
+        result = _normalize_llm_usage(usage)
+        assert result["cache_read_tokens"] == 0
+
+    def test_missing_input_token_details_omits_cache_read(self) -> None:
+        result = _normalize_llm_usage({"input_tokens": 100, "output_tokens": 20, "total_tokens": 120})
+        assert "cache_read_tokens" not in result
+
+    def test_returns_none_for_empty_usage(self) -> None:
+        assert _normalize_llm_usage(None) is None
+        assert _normalize_llm_usage({}) is None
+
+
+class TestRecordLlmUsage:
+    def test_accumulates_cache_read_tokens_across_calls(self, tmp_path: Path) -> None:
+        summary = {"totals": {}, "per_iteration": []}
+        _record_llm_usage(
+            tmp_path, summary,
+            {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110, "input_token_details": {"cache_read": 70}},
+            iteration=1,
+        )
+        _record_llm_usage(
+            tmp_path, summary,
+            {"input_tokens": 90, "output_tokens": 10, "total_tokens": 100, "input_token_details": {"cache_read": 85}},
+            iteration=2,
+        )
+        assert summary["totals"]["cache_read_tokens"] == 155
+        assert summary["totals"]["input_tokens"] == 190
+        assert summary["per_iteration"][0]["cache_read_tokens"] == 70
+        assert summary["per_iteration"][1]["cache_read_tokens"] == 85
+
+    def test_no_cache_read_key_when_provider_never_reports_it(self, tmp_path: Path) -> None:
+        summary = {"totals": {}, "per_iteration": []}
+        _record_llm_usage(
+            tmp_path, summary, {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}, iteration=1,
+        )
+        assert "cache_read_tokens" not in summary["totals"]
+
+    def test_persists_cache_read_tokens_to_llm_usage_json(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        summary = {"totals": {}, "per_iteration": []}
+        _record_llm_usage(
+            run_dir, summary,
+            {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110, "input_token_details": {"cache_read": 70}},
+            iteration=1,
+        )
+        persisted = json.loads((run_dir / "llm_usage.json").read_text(encoding="utf-8"))
+        assert persisted["totals"]["cache_read_tokens"] == 70

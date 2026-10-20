@@ -98,7 +98,7 @@ def execute_live_order(
         )
     intent = normalized
 
-    positions = _safe_read(connector_module, "get_positions", config)
+    positions = _enrich_positions(connector_module, config, _safe_read(connector_module, "get_positions", config))
     balance = _safe_read(connector_module, "get_account_snapshot", config)
     daily_count = read_daily_count(broker)
 
@@ -221,7 +221,28 @@ def _normalize_notional(intent: OrderIntent, connector_module: Any, config: Any)
     before HK/CN are promoted past the structural asset-class gate.
     """
     if intent.quantity is None:
-        return intent
+        if intent.stop_loss is None or intent.notional_usd is None:
+            return intent
+        # Notional-sized order with a stop attached (e.g. MT5's `notional=`
+        # sizing, per trading_place_order's "give exactly one of quantity or
+        # notional" contract): max_loss_usd still needs computing from an
+        # implied quantity, or a mandate's max_loss_per_order_usd cap always
+        # fail-closed denies this order as if it had no stop at all.
+        price = _quote_price(intent, connector_module, config)
+        if price is None:
+            return None
+        multiplier = _contract_multiplier(connector_module, config, intent.symbol)
+        if multiplier is None or price * multiplier <= 0:
+            return None
+        implied_quantity = intent.notional_usd / (price * multiplier)
+        max_loss_usd = abs(price - intent.stop_loss) * multiplier * implied_quantity
+        if max_loss_usd != max_loss_usd:  # NaN
+            max_loss_usd = None
+        return OrderIntent(
+            symbol=intent.symbol, side=intent.side, notional_usd=intent.notional_usd,
+            quantity=None, instrument_type=intent.instrument_type, asset_class=intent.asset_class,
+            stop_loss=intent.stop_loss, max_loss_usd=max_loss_usd,
+        )
     price = _quote_price(intent, connector_module, config)
     if price is None:
         return None
@@ -314,6 +335,62 @@ def _connector_quote_price(connector_module: Any, config: Any, symbol: str) -> f
             if value == value and value > 0:
                 return value
     return None
+
+
+def _enrich_positions(connector_module: Any, config: Any, positions: object) -> object:
+    """Inject a lot-size-aware ``market_value`` into MT5-shaped position rows.
+
+    MT5's ``get_positions`` returns ``volume`` (lots) and ``price_current`` /
+    ``price_open`` (price per unit), with no dollar market-value field —
+    ``check_mandate``'s generic ``_position_market_value`` recognizes neither
+    name, so every MT5 position was previously unparseable, and the exposure/
+    leverage checks fail-closed DENIED any live order while the account held
+    ANY open position, regardless of its actual notional (real gap found by
+    /code-review). Naively teaching that generic parser "volume"/
+    "price_current" would trade that bug for a worse one: ``volume * price``
+    alone omits the contract-size multiplier (e.g. 100,000 units/lot on a
+    standard FX lot), silently understating real notional by orders of
+    magnitude instead of failing closed — the exposure cap would then almost
+    never trip for MT5. This computes the real value here instead, where the
+    connector's own ``contract_size`` lookup is available, and leaves a
+    position enriched with nothing (still unparseable, so still fail-closed)
+    when that lookup fails or a needed field is missing.
+
+    A no-op for connectors with no ``contract_size`` getter (share/coin
+    connectors, where ``quantity``/``price`` are already directly in USD
+    terms) — returns ``positions`` unchanged.
+    """
+    getter = getattr(connector_module, "contract_size", None)
+    if getter is None or not isinstance(positions, dict):
+        return positions
+    rows = positions.get("positions")
+    if not isinstance(rows, list):
+        return positions
+    return {**positions, "positions": [_enrich_one_position(getter, config, row) for row in rows]}
+
+
+def _enrich_one_position(getter: Any, config: Any, row: object) -> object:
+    if not isinstance(row, dict) or "market_value" in row:
+        return row
+    symbol = row.get("symbol")
+    volume = row.get("volume")
+    price = row.get("price_current") if row.get("price_current") is not None else row.get("price_open")
+    if symbol is None or volume is None or price is None:
+        return row
+    try:
+        size = getter(symbol, config=config)
+    except Exception as exc:  # noqa: BLE001 - a lookup failure leaves this row unparseable, not silently wrong
+        logger.warning("contract_size lookup failed for %s during position enrichment: %s", symbol, exc)
+        return row
+    try:
+        size = float(size) if size is not None else None
+        volume = float(volume)
+        price = float(price)
+    except (TypeError, ValueError):
+        return row
+    if size is None or size <= 0:
+        return row
+    return {**row, "market_value": abs(volume) * price * size}
 
 
 def _safe_read(connector_module: Any, fn_name: str, config: Any) -> object:

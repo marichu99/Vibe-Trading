@@ -10,6 +10,19 @@ category: analysis
 
 Correlation analysis is a foundational tool for pairs trading, portfolio construction, and risk management. This skill covers four analysis modes (co-movement discovery / return-correlation deep dive / sector clustering / realized correlation), a full cointegration-testing framework, cross-market linkage analysis, and the complete workflow from analytics to pair-trading signals.
 
+## FX Day-Desk Quick Reference (session/next-session horizon)
+
+For a same-session/next-session EUR/USD or GBP/USD trade, skip the cointegration/Kalman machinery below — there's no time to fit a model, and the data pack only gives single daily % changes, not full price series to run Engle-Granger or a Kalman filter on. Use these direct reads instead:
+
+| Check | Read from the data pack | Confirms / fights the trade |
+|---|---|---|
+| DXY | Synthetic DXY % change vs prior close and over 5 days | DXY rising = USD strength = fights a long EUR/USD or GBP/USD, confirms a short (and vice versa) |
+| Gold | % change vs prior close | Gold and DXY are usually inversely linked; gold moving with (not against) DXY on the same day is a mild warning that the "USD strength" read may be flow-driven, not conviction-driven |
+| USDJPY | % change vs prior close | A broad risk/yield proxy; USDJPY and EUR/USD or GBP/USD moving in the same direction as a "risk-on" cue, opposite as "risk-off" -- divergence from the expected co-movement is worth a one-line flag, not a thesis-killer |
+| EUR/USD vs GBP/USD | Direction of both, if both are in play | Same-direction moves confirm a broad USD theme; opposite-direction moves mean the thesis is pair-specific (EUR or GBP story), not a USD story -- say which one explicitly |
+
+This is a confirmation/divergence check, not a standalone signal: use it to corroborate or flag tension with the technical case, not to generate a direction on its own. The full cointegration toolkit below is for multi-day/portfolio pairs-trading research, not this use case.
+
 ---
 
 ## Mode 1: Co-Movement Discovery

@@ -45,8 +45,23 @@ $Action = New-ScheduledTaskAction -Execute "powershell.exe" `
 # symptom in the wild: LastTaskResult 0xC000013A with zero corresponding
 # entry in startup.log, i.e. it died before even the first Write-StartupLog
 # call. A short logon delay lets the session finish settling first.
-$Trigger = New-ScheduledTaskTrigger -AtLogOn
-$Trigger.Delay = "PT45S"
+$LogonTrigger = New-ScheduledTaskTrigger -AtLogOn
+$LogonTrigger.Delay = "PT45S"
+
+# 2026-10-17: this box has been losing power roughly once a day (8x since
+# Oct 9, confirmed via Kernel-Power Event 41 -- no BSOD/WHEA trail, so this
+# looks like an unstable supply, not a Windows crash) with no UPS. AtLogOn
+# alone only resumes the loop once a HUMAN physically logs back in, which
+# has cost up to ~32 hours of missed trading windows after a reboot nobody
+# noticed. An AtStartup trigger lets Task Scheduler bring the loop back the
+# moment Windows boots, PROVIDED a user session actually exists at boot --
+# i.e. this only closes the gap once Windows auto-logon is configured for
+# this account (see the repo's deploy docs / ask the maintainer). Without
+# auto-logon, AtStartup simply has nothing to attach to yet and is a no-op,
+# so it's safe to register now and ahead of that change.
+$StartupTrigger = New-ScheduledTaskTrigger -AtStartup
+$StartupTrigger.Delay = "PT60S"
+$Trigger = @($LogonTrigger, $StartupTrigger)
 
 # Belt-and-suspenders: if it still dies (any reason), have Task Scheduler
 # itself retry a few times rather than silently leaving the live-trading

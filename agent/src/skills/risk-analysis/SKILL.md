@@ -10,6 +10,25 @@ category: analysis
 
 Systematic risk-measurement methodology covering VaR/CVaR calculation, Monte Carlo simulation, stress-test design, and tail-risk analysis. It provides risk evaluation for backtest results and risk-control constraints for asset allocation.
 
+## Single-Position Intraday Stop Sizing (ATR-based)
+
+VaR/CVaR/Monte Carlo below are portfolio-level, multi-day tools -- they answer "how much could this book lose," not "where do I place the stop on this one FX position." For a single fixed-lot intraday trade, use ATR instead:
+
+```
+stop_distance = max(1.2 x ATR14_on_entry_timeframe, floor_from_spread/volatility fact)
+stop_distance must also be <= 1% of price (reject the trade, don't shrink the stop, if ATR alone already exceeds this)
+
+If regime = VOLATILE (a verified fact the system provides, not something to infer):
+  stop_distance = 1.3 x the standard distance above (not 1.3x ATR directly -- 1.3x the already-computed 1.2x-ATR distance)
+  position size = standard size x size_multiplier (0.5) -- this is set elsewhere, not a risk-analysis output
+
+net_reward:risk = (target_distance - round_trip_cost) / stop_distance
+  round_trip_cost = spread + commission, in the same price units as the distances
+  net R:R must be >= 1.5, or the correct call is to wait -- do not shrink the stop to force the ratio, and do not stretch the target past the nearest real structural level
+```
+
+**Why ATR and not VaR here**: VaR answers a probabilistic question over many trades/days; a single intraday FX position needs a stop that simply survives the instrument's current noise. ATR14 on the entry timeframe (M15/H1) is a direct, already-available measure of that noise (it's in the data pack) -- no distributional assumption or simulation needed. Reserve VaR/CVaR/Monte Carlo/stress-testing below for evaluating a strategy's behavior across a backtest or a multi-position book, not for sizing one trade's stop.
+
 ## Risk Measurement Methods
 
 ### 1. VaR (Value at Risk)

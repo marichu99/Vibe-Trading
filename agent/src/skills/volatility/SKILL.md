@@ -9,6 +9,8 @@ category: strategy
 
 Uses percentile ranking of historical volatility (HV) to capture volatility mean reversion: build positions in low-volatility regimes while waiting for volatility expansion, and exit or short in high-volatility regimes to capture contraction.
 
+**Not what this is for**: if you're here to size a stop distance for a single intraday FX position, this skill is the wrong one -- it's a standalone long/short signal based on HV percentile rank, not a stop-sizing method. For ATR-based stop distance on a single position, see `risk-analysis`'s "Single-Position Intraday Stop Sizing" section instead.
+
 ## Signal Logic
 
 1. **Compute HV**: annualized standard deviation of returns over the past `hv_window` days

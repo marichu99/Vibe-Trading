@@ -273,8 +273,18 @@ def get_positions(config: MT5Config | None = None) -> dict[str, Any]:
     return {"status": "ok", "profile": cfg.profile, "is_paper": cfg.is_paper, "positions": rows}
 
 
-def get_open_orders(config: MT5Config | None = None, *, include_executions: bool = False) -> dict[str, Any]:
-    """Fetch resting pending orders and, optionally, recent filled deals."""
+def get_open_orders(
+    config: MT5Config | None = None, *, include_executions: bool = False, executions_lookback_days: int = 7
+) -> dict[str, Any]:
+    """Fetch resting pending orders and, optionally, recent filled deals.
+
+    ``executions_lookback_days`` bounds how far back ``history_deals_get`` looks
+    for the ``executions`` list (default 7, matching the signal-service-activity
+    context feature's own 7-day window) — a caller checking for a LONGER drought
+    (e.g. committee_reporter.py's trade-drought alert) must pass a window wider
+    than the drought threshold it's testing, or the deal proving the drought
+    falls outside the fetch window and silently looks like "never traded."
+    """
     cfg = config or load_config()
     module = _connect(cfg)
     account = _call(module, "account_info")
@@ -287,7 +297,7 @@ def get_open_orders(config: MT5Config | None = None, *, include_executions: bool
         "open_orders": [_order_to_dict(item) for item in orders],
     }
     if include_executions:
-        result["executions"] = [_deal_to_dict(item) for item in _recent_deals(module)]
+        result["executions"] = [_deal_to_dict(item) for item in _recent_deals(module, days=executions_lookback_days)]
     return result
 
 
@@ -1118,11 +1128,27 @@ def _timeframe(module: ModuleType, period: str) -> Any:
 
 
 def _recent_deals(module: ModuleType, days: int = 7) -> list[Any]:
+    """Real incident 2026-09-18: MT5's raw deal ``time`` field is the
+    broker's own LOCAL server clock (EET/EEST for at least this broker,
+    confirmed live against this machine's independently-verified system
+    clock), encoded as if it were epoch/UTC seconds — not genuine UTC. A
+    deal that closed moments ago can carry a timestamp that reads as being
+    several hours AHEAD of true ``datetime.now(timezone.utc)``, which
+    history_deals_get's own upper bound would then exclude as "in the
+    future" — silently dropping the most recently closed deals from
+    reconciliation (a stop-out that closed minutes before a status check
+    came back with outcome "unknown" and no exit price). Pad the upper
+    (and, symmetrically, lower) bound generously past any plausible
+    broker-server UTC offset (+/-14h covers every real-world timezone) —
+    deals can't genuinely be in the true future, so padding the window has
+    no downside, only guards against this mislabeling.
+    """
     try:
         from datetime import timedelta
 
         now = datetime.now(timezone.utc)
-        deals = module.history_deals_get(now - timedelta(days=days), now)
+        skew_guard = timedelta(hours=14)
+        deals = module.history_deals_get(now - timedelta(days=days) - skew_guard, now + skew_guard)
         return list(deals) if deals else []
     except Exception:
         return []

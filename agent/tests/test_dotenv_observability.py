@@ -83,6 +83,49 @@ def test_logs_redacted_base_url_without_credentials(tmp_path, fresh, monkeypatch
     assert "api_key" not in msg
 
 
+def test_stale_env_config_refreshed_after_load(tmp_path, fresh, monkeypatch, caplog):
+    """A cached EnvConfig built before the .env load must not outlive it.
+
+    theme.py builds the EnvConfig singleton at import time — before any
+    dotenv load — so callers of _ensure_dotenv() that did not also call
+    reset_env_config() (welcome panel, /settings, the diagnostic log
+    below) read bare-environ defaults instead of the .env values.
+    _ensure_dotenv() now resets the singleton itself after loading a
+    file, so a plain get_env_config() is fresh for every caller.
+    """
+    from src.config.accessor import get_env_config
+
+    # setenv-then-delenv records the pre-test absence so the values
+    # _load_env_file writes into os.environ are removed at teardown.
+    for name in ("LANGCHAIN_PROVIDER", "LANGCHAIN_MODEL_NAME"):
+        monkeypatch.setenv(name, "sentinel")
+        monkeypatch.delenv(name)
+
+    env = tmp_path / ".env"
+    env.write_text(
+        "LANGCHAIN_PROVIDER=deepseek\nLANGCHAIN_MODEL_NAME=deepseek-chat\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(llm, "_ENV_CANDIDATES", [env])
+    monkeypatch.setattr(llm, "_ENV_LABELS", ("<TEST_SLOT>",))
+
+    # Simulate theme.py: the singleton caches bare-environ defaults
+    # before the .env file is ever loaded.
+    assert get_env_config().llm.langchain_provider == "openai"
+
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        llm._ensure_dotenv()
+
+    # No manual reset_env_config() here — this is the whole point.
+    assert get_env_config().llm.langchain_provider == "deepseek"
+    assert get_env_config().llm.langchain_model_name == "deepseek-chat"
+
+    # The diagnostic line reports the freshly loaded values, not the
+    # stale singleton it was created to make observable.
+    msg = "\n".join(r.getMessage() for r in caplog.records)
+    assert "provider=deepseek model=deepseek-chat" in msg
+
+
 def test_latch_still_skips_second_call(tmp_path, fresh, monkeypatch, caplog):
     """Behavior preserved: still loads once per process (no log on re-entry)."""
     monkeypatch.setattr(llm, "_ENV_CANDIDATES", [tmp_path / "nope.env"])

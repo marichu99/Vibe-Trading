@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -58,6 +59,320 @@ class TestInWeekendWindow:
 
 
 # ---------------------------------------------------------------------------
+# _next_session_boundary -- session-gated trading (2026-09-21): 3 passes/
+# day anchored to session opens, only "new_york" trades. Must stay correct
+# across DST transitions (America/New_York and Europe/London both observe
+# it, on different dates) without a hardcoded UTC offset.
+# ---------------------------------------------------------------------------
+
+
+class TestNextSessionBoundary:
+    def test_winter_standard_time_offsets(self) -> None:
+        """Mid-January: both London (GMT, UTC+0) and New York (EST, UTC-5)
+        are in standard time."""
+        now = datetime(2026, 1, 15, 0, 0, 1, tzinfo=timezone.utc)  # just after Asia's 00:00 boundary
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 1, 15, 8, 0, tzinfo=timezone.utc), "london")
+
+        now = boundary + timedelta(seconds=1)
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc), "new_york")
+
+    def test_summer_dst_offsets(self) -> None:
+        """Mid-June: both London (BST, UTC+1) and New York (EDT, UTC-4)
+        are in daylight time."""
+        now = datetime(2026, 6, 15, 0, 0, 1, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 6, 15, 7, 0, tzinfo=timezone.utc), "london")
+
+        now = boundary + timedelta(seconds=1)
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc), "new_york")
+
+    def test_before_asia_open_returns_asia(self) -> None:
+        now = datetime(2026, 9, 21, 0, 0, 0, tzinfo=timezone.utc) - timedelta(seconds=1)
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 9, 21, 0, 0, tzinfo=timezone.utc), "asia")
+
+    def test_after_last_boundary_rolls_to_tomorrows_asia(self) -> None:
+        # 2026-09-21 is a weekday in BST/EDT: NY opens 12:00 UTC that day.
+        now = datetime(2026, 9, 21, 12, 0, 1, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(now)
+        assert (boundary, session) == (datetime(2026, 9, 22, 0, 0, tzinfo=timezone.utc), "asia")
+
+    def test_exactly_at_a_boundary_is_not_returned_again(self) -> None:
+        """A boundary equal to `now` must not be selected as "next" -- the
+        caller (main()'s loop) treats now_utc >= next_boundary as "fire
+        now", so the boundary that just fired must roll forward, not repeat."""
+        asia_open = datetime(2026, 9, 21, 0, 0, 0, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(asia_open)
+        assert session != "asia"
+
+    def test_america_new_york_dst_spring_forward_2026(self) -> None:
+        """US DST starts 2026-03-08 (2nd Sunday of March) -- the day before
+        is still EST (UTC-5), the day itself/after is EDT (UTC-4)."""
+        before = datetime(2026, 3, 7, 12, 0, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(before)
+        assert (boundary, session) == (datetime(2026, 3, 7, 13, 0, tzinfo=timezone.utc), "new_york")
+
+        after = datetime(2026, 3, 9, 11, 59, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(after)
+        assert (boundary, session) == (datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc), "new_york")
+
+    def test_europe_london_dst_spring_forward_2026(self) -> None:
+        """UK DST (BST) starts 2026-03-29 (last Sunday of March)."""
+        before = datetime(2026, 3, 28, 1, 0, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(before)
+        assert (boundary, session) == (datetime(2026, 3, 28, 8, 0, tzinfo=timezone.utc), "london")
+
+        after = datetime(2026, 3, 30, 1, 0, tzinfo=timezone.utc)
+        boundary, session = cr._next_session_boundary(after)
+        assert (boundary, session) == (datetime(2026, 3, 30, 7, 0, tzinfo=timezone.utc), "london")
+
+
+# ---------------------------------------------------------------------------
+# _check_trade_drought -- regression: this used to fetch executions via mt5_
+# sdk's own fixed 7-day default lookback, the SAME length as NO_TRADE_ALERT_
+# DAYS itself. Once a symbol's last trade aged past that same ~7-day window,
+# the deal proving the drought fell OUTSIDE the fetch window too --
+# "executions" came back empty, and the function read that as "never traded,
+# nothing to check," silently never alerting on exactly the multi-week
+# droughts this feature exists to catch.
+# ---------------------------------------------------------------------------
+
+
+class TestCheckTradeDrought:
+    SYMBOL = "EURUSDm"
+    CONNECTION = "mt5-live-trade"
+
+    def _patch(self, monkeypatch, tmp_path, *, executions):
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+        import src.trading.profiles as profiles_module
+
+        monkeypatch.setattr(
+            cr, "TARGETS",
+            [{
+                "committee": "x", "target": "x", "market": "forex",
+                "trade": {"symbol": self.SYMBOL, "connection": self.CONNECTION, "lots": 0.01},
+            }],
+        )
+        monkeypatch.setattr(cr, "NO_TRADE_ALERT_STATE_PATH", tmp_path / "no_trade_alert_state.json")
+
+        class _FakeProfile:
+            config: dict = {}
+
+        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: _FakeProfile())
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: "FAKE_CONFIG")
+
+        captured: dict = {}
+
+        def _get_open_orders(config, *, include_executions=False, executions_lookback_days=7):
+            captured["executions_lookback_days"] = executions_lookback_days
+            return {"executions": executions}
+
+        monkeypatch.setattr(mt5_sdk, "get_open_orders", _get_open_orders)
+
+        emailed: list[tuple[str, str]] = []
+        monkeypatch.setattr(cr, "send_email", lambda subject, text: emailed.append((subject, text)))
+        return captured, emailed
+
+    def test_requests_a_lookback_wider_than_the_alert_threshold(self, monkeypatch, tmp_path) -> None:
+        captured, _ = self._patch(monkeypatch, tmp_path, executions=[])
+        cr._check_trade_drought()
+        assert captured["executions_lookback_days"] > cr.NO_TRADE_ALERT_DAYS
+
+    def test_alerts_on_a_drought_older_than_the_old_fixed_7_day_window(self, monkeypatch, tmp_path) -> None:
+        """The real bug: a deal that opened 10 days ago used to fall outside
+        the connector's old fixed 7-day executions window, so this silently
+        never alerted on a drought of exactly the kind NO_TRADE_ALERT_DAYS=7
+        exists to catch."""
+        last_trade_time = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        executions = [{"symbol": self.SYMBOL, "magic": cr.OUR_MAGIC, "entry": 0, "time": last_trade_time}]
+        _, emailed = self._patch(monkeypatch, tmp_path, executions=executions)
+        cr._check_trade_drought()
+        assert len(emailed) == 1
+        assert "No trades in" in emailed[0][0]
+
+    def test_no_trade_history_at_all_does_not_alert(self, monkeypatch, tmp_path) -> None:
+        _, emailed = self._patch(monkeypatch, tmp_path, executions=[])
+        cr._check_trade_drought()
+        assert emailed == []
+
+
+# ---------------------------------------------------------------------------
+# Session bias carry-over: Asia/London (research-only) passes' Decision/
+# Reasoning get recorded and read back into the New York (trading) pass's
+# prompt instead of being thrown away.
+# ---------------------------------------------------------------------------
+
+
+class TestParseDecisionReasoning:
+    def test_parses_well_formed_report(self) -> None:
+        text = "Decision: long, momentum favors EURUSD\nReasoning: broke resistance on volume\nConfidence: high"
+        assert cr._parse_decision_reasoning(text) == ("long, momentum favors EURUSD", "broke resistance on volume")
+
+    def test_missing_decision_returns_none(self) -> None:
+        assert cr._parse_decision_reasoning("Reasoning: because\nConfidence: high") is None
+
+    def test_missing_reasoning_returns_none(self) -> None:
+        assert cr._parse_decision_reasoning("Decision: wait\nConfidence: high") is None
+
+    def test_garbage_text_returns_none(self) -> None:
+        assert cr._parse_decision_reasoning("the committee had an error") is None
+
+
+class TestSessionBiasReadWrite:
+    def test_record_then_fact_round_trip(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        cr._record_session_bias("EURUSDm", "asia", "Decision: long\nReasoning: broke resistance")
+
+        fact = cr._session_bias_fact("EURUSDm")
+
+        assert "Asia session read on EURUSDm today" in fact
+        assert "long" in fact and "broke resistance" in fact
+
+    def test_both_sessions_appear_when_both_recorded(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        cr._record_session_bias("EURUSDm", "asia", "Decision: long\nReasoning: asia reason")
+        cr._record_session_bias("EURUSDm", "london", "Decision: short\nReasoning: london reason")
+
+        fact = cr._session_bias_fact("EURUSDm")
+
+        assert "Asia session read" in fact and "asia reason" in fact
+        assert "London session read" in fact and "london reason" in fact
+
+    def test_no_entries_returns_empty_string(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        assert cr._session_bias_fact("EURUSDm") == ""
+
+    def test_stale_prior_day_entry_is_ignored(self, tmp_path, monkeypatch) -> None:
+        path = tmp_path / "session_bias.json"
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", path)
+        path.write_text(
+            json.dumps({"EURUSDm": {"asia": {"date": "2020-01-01", "decision": "long", "reasoning": "old"}}}),
+            encoding="utf-8",
+        )
+        assert cr._session_bias_fact("EURUSDm") == ""
+
+    def test_unparseable_report_text_records_nothing(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        cr._record_session_bias("EURUSDm", "asia", "the committee had an error, no structured report")
+        assert cr._session_bias_fact("EURUSDm") == ""
+
+    def test_different_symbol_does_not_leak(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "SESSION_BIAS_STATE_PATH", tmp_path / "session_bias.json")
+        cr._record_session_bias("EURUSDm", "asia", "Decision: long\nReasoning: eur reason")
+        assert cr._session_bias_fact("AUDUSDm") == ""
+
+
+# ---------------------------------------------------------------------------
+# run_once session gating (2026-09-21): only "new_york" trades; "asia"/
+# "london" force trade=None on every TARGETS spec and record the bias.
+# ---------------------------------------------------------------------------
+
+
+class TestRunOnceSessionGating:
+    def _patch(self, monkeypatch, *, report_text: str = "Decision: long\nReasoning: because") -> list[dict]:
+        calls: list[dict] = []
+        # Existing tests cover the research-pass path itself; the kill
+        # switch (off in production) is covered by the tests below.
+        monkeypatch.setattr(cr, "RESEARCH_PASSES_ENABLED", True)
+        monkeypatch.setattr(cr, "_check_trade_drought", lambda: None)
+        monkeypatch.setattr(cr, "_check_cap_fit_alert", lambda: None)
+        monkeypatch.setattr(cr, "_check_llm_balance_alert", lambda: None)
+        monkeypatch.setattr(cr, "_log_cap_gap", lambda: None)
+        monkeypatch.setattr(cr, "is_reportable", lambda result: False)
+        monkeypatch.setattr(cr, "_symbol_position_summary", lambda symbol, connection: {"count": 0, "side": None})
+        monkeypatch.setattr(
+            cr, "TARGETS",
+            [{
+                "committee": "investment_committee", "target": "EURUSD", "market": "forex",
+                "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1},
+            }],
+        )
+
+        def _fake_run_committee(**kwargs):
+            calls.append(kwargs)
+            return cr.CommitteeResult(
+                committee=kwargs["committee"], target=kwargs["target"], market=kwargs["market"],
+                status="success", run_id="r1", report_text=report_text, traded=False,
+            )
+
+        monkeypatch.setattr(cr, "run_committee", _fake_run_committee)
+        return calls
+
+    def test_asia_session_strips_trade_and_records_bias(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        recorded = []
+        monkeypatch.setattr(cr, "_record_session_bias", lambda symbol, session, text: recorded.append((symbol, session, text)))
+
+        cr.run_once("asia")
+
+        assert calls[0]["trade"] is None
+        assert recorded == [("EURUSDm", "asia", "Decision: long\nReasoning: because")]
+
+    def test_london_session_strips_trade(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        monkeypatch.setattr(cr, "_record_session_bias", lambda *a: None)
+
+        cr.run_once("london")
+
+        assert calls[0]["trade"] is None
+
+    def test_new_york_session_keeps_trade_and_does_not_record_bias(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        recorded = []
+        monkeypatch.setattr(cr, "_record_session_bias", lambda *a: recorded.append(a))
+
+        cr.run_once("new_york")
+
+        assert calls[0]["trade"] == {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+        assert recorded == []
+
+    def test_research_passes_disabled_skips_committee_on_asia_and_london(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        monkeypatch.setattr(cr, "RESEARCH_PASSES_ENABLED", False)
+        recorded = []
+        monkeypatch.setattr(cr, "_record_session_bias", lambda *a: recorded.append(a))
+
+        cr.run_once("asia")
+        cr.run_once("london")
+
+        assert calls == []
+        assert recorded == []
+
+    def test_research_passes_disabled_still_runs_new_york(self, monkeypatch) -> None:
+        calls = self._patch(monkeypatch)
+        monkeypatch.setattr(cr, "RESEARCH_PASSES_ENABLED", False)
+        monkeypatch.setattr(cr, "_record_session_bias", lambda *a: None)
+
+        cr.run_once("new_york")
+
+        assert len(calls) == 1
+        assert calls[0]["trade"] is not None
+
+    def test_research_passes_disabled_still_runs_alerts(self, monkeypatch) -> None:
+        self._patch(monkeypatch)
+        monkeypatch.setattr(cr, "RESEARCH_PASSES_ENABLED", False)
+        fired = []
+        monkeypatch.setattr(cr, "_check_llm_balance_alert", lambda: fired.append("balance"))
+        monkeypatch.setattr(cr, "_check_trade_drought", lambda: fired.append("drought"))
+
+        cr.run_once("london")
+
+        assert fired == ["drought", "balance"]
+
+    def test_targets_list_itself_is_never_mutated(self, monkeypatch) -> None:
+        self._patch(monkeypatch)
+        monkeypatch.setattr(cr, "_record_session_bias", lambda *a: None)
+        original_trade = cr.TARGETS[0]["trade"]
+
+        cr.run_once("asia")
+
+        assert cr.TARGETS[0]["trade"] is original_trade
+
+
+# ---------------------------------------------------------------------------
 # _read_journal / _write_journal
 # ---------------------------------------------------------------------------
 
@@ -84,6 +399,48 @@ class TestJournalReadWrite:
         monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", path)
         cr._write_journal([{"ticket": "1"}])
         assert path.exists()
+
+
+# ---------------------------------------------------------------------------
+# _journal_summary_text
+# ---------------------------------------------------------------------------
+
+
+class TestJournalSummaryText:
+    def test_none_when_no_closed_trades(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        cr._write_journal([{"symbol": "EURUSDm", "status": "open"}])
+        assert cr._journal_summary_text("EURUSDm") is None
+
+    def test_reversal_note_does_not_bias_toward_stop_management(self, tmp_path, monkeypatch) -> None:
+        """D5 (2026-10-06): the old wording ("a stop-management issue, not
+        an entry-quality one") biased the committee toward active stop
+        management on exactly the pattern the replay evidence (n=39) shows
+        is negative-expectancy to touch. New wording states the count
+        neutrally and points to entry/stop-sizing discipline instead."""
+        monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        cr._write_journal([
+            {"symbol": "EURUSDm", "status": "closed", "outcome": "loss", "profit": -0.5, "side": "buy",
+             "excursion_tag": "reversal"},
+            {"symbol": "EURUSDm", "status": "closed", "outcome": "win", "profit": 1.0, "side": "sell",
+             "excursion_tag": "clean"},
+        ])
+        summary = cr._journal_summary_text("EURUSDm")
+        assert summary is not None
+        assert "stop-management issue" not in summary
+        assert "1 of last 2 closed trades moved favorably before reversing" in summary
+        assert "negative-expectancy" in summary
+        assert "entry/stop-sizing discipline, not exit management" in summary
+
+    def test_no_reversal_note_when_no_reversals(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        cr._write_journal([
+            {"symbol": "EURUSDm", "status": "closed", "outcome": "win", "profit": 1.0, "side": "buy",
+             "excursion_tag": "clean"},
+        ])
+        summary = cr._journal_summary_text("EURUSDm")
+        assert summary is not None
+        assert "moved favorably before reversing" not in summary
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +639,43 @@ class TestExtractPlacedOrder:
             lambda run_id: [{"type": "tool_result", "tool": "trading_place_order", "result": "{not json"}],
         )
         assert cr._extract_placed_order("run-1") is None
+
+
+class TestExtractPlacedOrders:
+    def test_returns_every_ok_result_not_just_the_first(self, monkeypatch) -> None:
+        """Regression: a pass that places two orders (e.g. the LLM misreads an
+        ambiguous first result and "retries" an order that already filled)
+        used to only ever have its FIRST fill checked by the post-trade
+        guardrail chain / journaled -- a second live position could silently
+        escape spec/trend/stop-floor/reward:risk enforcement entirely."""
+        first = {"status": "ok", "ticket": "1", "symbol": "EURUSDm"}
+        second = {"status": "ok", "ticket": "2", "symbol": "EURUSDm"}
+        monkeypatch.setattr(
+            cr, "_trace_entries",
+            lambda run_id: [
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(first)},
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(second)},
+            ],
+        )
+        assert cr._extract_placed_orders("run-1") == [first, second]
+
+    def test_skips_non_ok_results_between_ok_ones(self, monkeypatch) -> None:
+        first = {"status": "ok", "ticket": "1"}
+        rejected = {"status": "blocked", "reason": "denied"}
+        second = {"status": "ok", "ticket": "2"}
+        monkeypatch.setattr(
+            cr, "_trace_entries",
+            lambda run_id: [
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(first)},
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(rejected)},
+                {"type": "tool_result", "tool": "trading_place_order", "result": json.dumps(second)},
+            ],
+        )
+        assert cr._extract_placed_orders("run-1") == [first, second]
+
+    def test_empty_when_no_placements(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_trace_entries", lambda run_id: [{"type": "tool_result", "tool": "trading_quote"}])
+        assert cr._extract_placed_orders("run-1") == []
 
 
 class TestBlockedOrderNote:
@@ -654,23 +1048,26 @@ class TestStatusLogSummary:
         monkeypatch.setattr(cr, "REPORTER_LOG_PATH", tmp_path / "nope.log")
         assert cr._status_log_summary() == {}
 
-    def test_parses_interval_last_start_and_last_emailed(self, tmp_path, monkeypatch) -> None:
+    def test_parses_last_start_and_last_emailed(self, tmp_path, monkeypatch) -> None:
         log = tmp_path / "reporter.log"
         log.write_text(
-            "2026-09-07 19:17:45,724 INFO starting loop mode, interval=7200s (profit protection checked every 300s)\n"
+            "2026-09-07 19:17:45,724 INFO starting loop mode, session-gated scheduling\n"
             "2026-09-07 19:17:46,606 INFO running investment_committee on EURUSD (forex) [trade-enabled]\n"
-            "2026-09-07 19:31:12,000 INFO emailed report: [Vibe-Trading] investment_committee — EURUSD (OK)\n",
+            "2026-09-07 19:31:12,000 INFO emailed report: [Vibe-Trading] new_york: investment_committee — EURUSD (OK)\n",
             encoding="utf-8",
         )
         monkeypatch.setattr(cr, "REPORTER_LOG_PATH", log)
 
         result = cr._status_log_summary()
 
-        assert result["interval"] == 7200
         assert result["last_start_ts"] == "2026-09-07 19:17:46"
         assert result["last_result_ts"] == "2026-09-07 19:31:12"
         assert result["last_result_tag"] == "OK"
-        assert result["next_due"] == "2026-09-07 21:31:12"
+        # next_due is no longer derived from the log (see _status_log_summary's
+        # docstring) -- _next_pass_due_text computes it straight from the
+        # session schedule, tested separately below.
+        assert "next_due" not in result
+        assert "interval" not in result
 
     def test_no_next_due_without_interval(self, tmp_path, monkeypatch) -> None:
         log = tmp_path / "reporter.log"
@@ -719,7 +1116,7 @@ class TestProfitProtectionCheckTimeDecay:
         pos = {
             "ticket": ticket, "symbol": self.SYMBOL, "magic": cr.OUR_MAGIC, "side": side,
             "price_open": entry, "stop_loss": sl, "take_profit": tp, "price_current": price,
-            "time": opened, "profit": profit,
+            "time": opened, "profit": profit, "volume": 0.01,  # matches _trade's default lots
         }
         pos.update(overrides)
         return pos
@@ -733,6 +1130,9 @@ class TestProfitProtectionCheckTimeDecay:
         import src.trading.profiles as profiles_module
         import src.trading.service as service
 
+        # These tests exercise the stop-moving rules themselves, which are
+        # off in production (STOP_TRAILING_ENABLED) but kept behind the switch.
+        monkeypatch.setattr(cr, "STOP_TRAILING_ENABLED", True)
         monkeypatch.setattr(cr, "TARGETS", [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade()}])
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
 
@@ -871,6 +1271,7 @@ class TestProfitProtectionCheckTimeDecay:
         import src.trading.profiles as profiles_module
         import src.trading.connectors.mt5.sdk as mt5_sdk
 
+        monkeypatch.setattr(cr, "STOP_TRAILING_ENABLED", True)  # exercises rule 2 itself
         custom_trigger = 1.00  # trigger_distance = 1.00 / (100_000 * 0.01) = 0.001
         # Price has moved 0.0015 above entry -- past the custom trigger_
         # distance (0.001) but nowhere near the module default's 0.008, and
@@ -919,6 +1320,28 @@ class TestProfitProtectionCheckTimeDecay:
         assert calls["close"] == []
         assert calls["modify"] == []
 
+    def test_trail_trigger_sizes_off_real_position_volume_not_stale_trade_lots(self, monkeypatch) -> None:
+        """Regression: the regime gate (strategy_tracking.regime_adjusted_lots)
+        can fill a VOLATILE pass at HALF of TARGETS' configured lots. The
+        trail's $ trigger must size off the position's own real volume
+        (0.01 here), not the stale, larger static trade["lots"] (0.02) --
+        otherwise it understates the real per-point $ value and arms the
+        trail before the position has actually earned early_profit_
+        trigger_usd. trigger_distance at the real 0.01-lot fill: 1.00 /
+        (100_000 * 0.01) = 0.0010; at the stale 0.02 TARGETS lots it would
+        be half that (0.0005). gained=0.0007 sits strictly between the
+        two -- the bug would arm here, the fix must not."""
+        pos = self._position(hours_open=1.0, ticket="T14", side="buy", entry=1.1600, sl=1.1580, tp=1.2000,
+                              price=1.1607, volume=0.01)
+        calls = self._patch_broker(monkeypatch, positions=[pos], atr_floor=0.0010)
+        trade = self._trade(lots=0.02, early_profit_trigger_usd=1.00)
+        monkeypatch.setattr(cr, "TARGETS", [{"committee": "x", "target": "x", "market": "forex", "trade": trade}])
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == []
+        assert calls["modify"] == []
+
     def test_close_position_error_status_does_not_raise(self, monkeypatch) -> None:
         pos = self._position(hours_open=cr.MAX_HOLD_HOURS + 1, ticket="T9")
         self._patch_broker(monkeypatch, positions=[pos], close_result={"status": "error", "error": "broker rejected"})
@@ -957,6 +1380,149 @@ class TestProfitProtectionCheckTimeDecay:
         # entry for a buy) -- tighter than the original sl, still below entry.
         new_sl = calls["modify"][0]["stop_loss"]
         assert pos["stop_loss"] < new_sl < pos["price_open"]
+
+
+class TestStopTrailingDisabled:
+    """Production setting (STOP_TRAILING_ENABLED=False): plain stop+target."""
+
+    _fixture = TestProfitProtectionCheckTimeDecay()
+
+    def _position(self, **kwargs):
+        return self._fixture._position(**kwargs)
+
+    def _patch_broker(self, monkeypatch, **kwargs):
+        calls = self._fixture._patch_broker(monkeypatch, **kwargs)
+        monkeypatch.setattr(cr, "STOP_TRAILING_ENABLED", False)
+        return calls
+
+    def test_production_default_is_off(self) -> None:
+        assert cr.STOP_TRAILING_ENABLED is False
+
+    def test_never_moves_stop_even_deep_in_profit_and_late(self, monkeypatch) -> None:
+        # Past halfway to target, past the early-profit trigger, and inside
+        # the time-decay window -- all three old rules would have fired.
+        pos = self._position(hours_open=cr.MAX_HOLD_HOURS * 0.9, ticket="T9")
+        pos["price_current"] = pos["take_profit"] - (pos["take_profit"] - pos["price_open"]) * 0.1
+        calls = self._patch_broker(monkeypatch, positions=[pos])
+
+        cr._profit_protection_check()
+
+        assert calls["modify"] == [] and calls["close"] == []
+
+    def test_time_stop_still_flattens(self, monkeypatch) -> None:
+        pos = self._position(hours_open=cr.MAX_HOLD_HOURS + 1, ticket="T10")
+        calls = self._patch_broker(monkeypatch, positions=[pos])
+
+        cr._profit_protection_check()
+
+        assert calls["close"] == [{"ticket": "T10"}]
+
+
+class TestProfitProtectionCheckSilentLookupFailures:
+    """2026-09-21: found while investigating two gold reversal trades that
+    moved well past every protection trigger and still closed at a near-
+    full loss. point_size/contract_size used to fail completely silently
+    (bare except, no log) inside the two rules that need them -- these
+    confirm a lookup failure now logs a warning AND the position still
+    gets whatever protection the OTHER rule can still provide (fails open,
+    not fails silent-and-total). Own copy of TestProfitProtectionCheckTimeDecay's
+    small helpers (not inherited) so this class's test output doesn't also
+    silently re-run that class's unrelated tests under a new name."""
+
+    SYMBOL = "EURUSDm"
+    CONNECTION = "mt5-live-trade"
+
+    def _trade(self, **overrides) -> dict:
+        base = {"symbol": self.SYMBOL, "connection": self.CONNECTION, "lots": 0.01, "max_stack": 1}
+        base.update(overrides)
+        return base
+
+    def _position(self, *, hours_open: float, side="buy", entry=1.1600, sl=1.1580, tp=1.1650,
+                   price=1.1605, ticket="1", profit=0.0) -> dict:
+        opened = (datetime.now(timezone.utc) - timedelta(hours=hours_open)).isoformat()
+        return {
+            "ticket": ticket, "symbol": self.SYMBOL, "magic": cr.OUR_MAGIC, "side": side,
+            "price_open": entry, "stop_loss": sl, "take_profit": tp, "price_current": price,
+            "time": opened, "profit": profit, "volume": 0.01,  # matches _trade's default lots
+        }
+
+    def _patch_broker(self, monkeypatch, *, positions, atr_floor=0.0010, modify_result=None, trade_overrides=None) -> dict:
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+        import src.trading.profiles as profiles_module
+        import src.trading.service as service
+
+        trade = self._trade(**(trade_overrides or {}))
+        # These tests exercise the stop-moving rules themselves, which are
+        # off in production (STOP_TRAILING_ENABLED) but kept behind the switch.
+        monkeypatch.setattr(cr, "STOP_TRAILING_ENABLED", True)
+        monkeypatch.setattr(cr, "TARGETS", [{"committee": "x", "target": "x", "market": "forex", "trade": trade}])
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+
+        class _FakeProfile:
+            config: dict = {}
+
+        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: _FakeProfile())
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: "FAKE_CONFIG")
+        monkeypatch.setattr(mt5_sdk, "point_size", lambda symbol, config=None: 0.00001)
+        monkeypatch.setattr(mt5_sdk, "contract_size", lambda symbol, config=None: 100_000)
+        monkeypatch.setattr(cr, "_atr_stop_floor", lambda symbol, connection: atr_floor)
+
+        calls = {"modify": [], "close": []}
+
+        def _modify(config, *, ticket, stop_loss, take_profit):
+            calls["modify"].append({"ticket": ticket, "stop_loss": stop_loss, "take_profit": take_profit})
+            return modify_result or {"status": "ok"}
+
+        def _close(config, *, ticket):
+            calls["close"].append({"ticket": ticket})
+            return {"status": "ok", "fill_price": 1.0, "closed_volume": 0.01}
+
+        monkeypatch.setattr(mt5_sdk, "modify_position", _modify)
+        monkeypatch.setattr(mt5_sdk, "close_position", _close)
+        return calls
+
+    def test_point_size_failure_is_logged_and_trail_rule_still_applies(self, monkeypatch, caplog) -> None:
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+
+        def _raise_point_size(symbol, config=None):
+            raise RuntimeError("symbol not found")
+
+        # entry 1.1600, tp 1.1620 -> halfway 1.1610; price 1.1615 is past
+        # halfway (arms the point_size call/warning) AND, with a $1
+        # early_profit_trigger_usd override (trigger_distance = 1 /
+        # (100_000 * 0.01) = 0.001), past the trail's own $ trigger too --
+        # so trail_candidate can independently protect this position even
+        # with point_size broken.
+        pos = self._position(hours_open=1.0, ticket="T4", side="buy", entry=1.1600, sl=1.1580, tp=1.1620, price=1.1615)
+        calls = self._patch_broker(
+            monkeypatch, positions=[pos], atr_floor=0.0010, trade_overrides={"early_profit_trigger_usd": 1.00},
+        )
+        monkeypatch.setattr(mt5_sdk, "point_size", _raise_point_size)
+
+        with caplog.at_level("WARNING"):
+            cr._profit_protection_check()
+
+        assert any("point_size lookup failed" in r.message for r in caplog.records)
+        assert calls["modify"], "trail rule should still have protected the position"
+
+    def test_contract_size_failure_is_logged_and_breakeven_rule_still_applies(self, monkeypatch, caplog) -> None:
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+
+        def _raise_contract_size(symbol, config=None):
+            raise RuntimeError("symbol not found")
+
+        # Past the breakeven halfway point (halfway to 1.1650 tp is
+        # 1.1625) so breakeven_candidate can independently protect this
+        # position even with contract_size broken.
+        pos = self._position(hours_open=1.0, ticket="T5", side="buy", entry=1.1600, sl=1.1580, tp=1.1650, price=1.1630)
+        calls = self._patch_broker(monkeypatch, positions=[pos])
+        monkeypatch.setattr(mt5_sdk, "contract_size", _raise_contract_size)
+
+        with caplog.at_level("WARNING"):
+            cr._profit_protection_check()
+
+        assert any("contract_size lookup failed" in r.message for r in caplog.records)
+        assert calls["modify"], "breakeven rule should still have protected the position"
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1596,7 @@ class TestLiveCircuitBreakerCheck:
         targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
         calls = self._patch_broker(
             monkeypatch, tmp_path, targets=targets, positions=[],
-            equity=90.0, baseline={"date": today, "equity": 100.0},  # 10% drawdown, under 50%
+            equity=98.5, baseline={"date": today, "equity": 100.0},  # 1.5%: under both the 2% daily stop and 50% halt
         )
 
         result = cr._live_circuit_breaker_check(targets[0]["trade"])
@@ -1038,6 +1604,49 @@ class TestLiveCircuitBreakerCheck:
         assert result is None
         assert calls["trip"] == []
         assert calls["close"] == []
+
+    def test_daily_loss_stop_blocks_without_tripping_kill_switch(self, monkeypatch, tmp_path) -> None:
+        # Rulebook 2026-09-30: 2%+ below today's baseline -> no new trades today,
+        # but the persistent kill switch (50%) is NOT tripped and nothing is flattened.
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
+        calls = self._patch_broker(
+            monkeypatch, tmp_path, targets=targets, positions=[],
+            equity=90.0, baseline={"date": today, "equity": 100.0},
+        )
+
+        result = cr._live_circuit_breaker_check(targets[0]["trade"])
+
+        assert result is not None and "[DAILY LOSS STOP]" in result
+        assert calls["trip"] == []
+        assert calls["close"] == []
+
+    def test_daily_loss_stop_persists_after_equity_recovers_same_day(self, monkeypatch, tmp_path) -> None:
+        """Real bug: the daily loss stop's own comment promises "research-only
+        for the rest of the day," but the check used to just re-compare the
+        INSTANTANEOUS drawdown every call with nothing persisted -- so a
+        later same-day check (a second scheduled pass, a manual re-run) that
+        catches equity having recovered above the 2% threshold would
+        silently let live trading resume the same day."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
+        calls = self._patch_broker(
+            monkeypatch, tmp_path, targets=targets, positions=[],
+            equity=90.0, baseline={"date": today, "equity": 100.0},  # 10%: trips the daily stop
+        )
+        first = cr._live_circuit_breaker_check(targets[0]["trade"])
+        assert first is not None and "[DAILY LOSS STOP]" in first
+
+        # Equity recovers above the 2% threshold on a later same-day check --
+        # must STILL be research-only, not silently resume live trading.
+        import src.trading.service as service
+        monkeypatch.setattr(service, "get_account", lambda conn: {"account": {"equity": 99.0}})
+        second = cr._live_circuit_breaker_check(targets[0]["trade"])
+
+        assert second is not None and "[DAILY LOSS STOP]" in second
+        assert calls["trip"] == []  # still just the soft stop, not the persistent kill switch
+        saved = json.loads((tmp_path / "live_baseline.json").read_text(encoding="utf-8"))
+        assert saved["daily_loss_stop_tripped"] is True
 
     def test_already_halted_returns_message_without_re_tripping(self, monkeypatch, tmp_path) -> None:
         targets = [{"committee": "x", "target": "x", "market": "forex", "trade": self._trade("EURUSDm")}]
@@ -1141,47 +1750,85 @@ class TestPostTradeSpecCheck:
     run_committee's comment on the hallucinated 1.0-lot order)."""
 
     TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+    NEW_TICKET = "999"
 
-    def _patch(self, monkeypatch, *, closed=None):
+    def _patch(self, monkeypatch, *, positions=None):
         import src.live.halt as halt
         import src.trading.connectors.mt5.sdk as mt5_sdk
-        import src.trading.profiles as profiles_module
         import src.trading.service as service
 
-        tripped = {}
+        tripped: dict = {}
+        closed_tickets: list = []
         monkeypatch.setattr(halt, "trip_halt", lambda by, reason, broker: tripped.update(by=by, reason=reason, broker=broker))
-        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": [{"ticket": "1", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC}] if closed else []})
-        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: type("P", (), {"config": {}})())
-        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: {})
-        monkeypatch.setattr(mt5_sdk, "close_position", lambda config, ticket: {"status": "ok"})
-        return tripped
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions if positions is not None else []})
+        monkeypatch.setattr(cr, "_mt5_config_for", lambda connection: {})
+
+        def _close(config, ticket):
+            closed_tickets.append(ticket)
+            return {"status": "ok"}
+
+        monkeypatch.setattr(mt5_sdk, "close_position", _close)
+        return tripped, closed_tickets
 
     def test_matching_order_is_a_no_op(self, monkeypatch) -> None:
-        tripped = self._patch(monkeypatch)
-        order = {"symbol": "EURUSDm", "quantity": 0.01, "order_type": "market"}
+        tripped, closed_tickets = self._patch(monkeypatch)
+        order = {"symbol": "EURUSDm", "quantity": 0.01, "order_type": "market", "order_id": self.NEW_TICKET}
         assert cr._post_trade_spec_check(self.TRADE, order) == ""
-        assert tripped == {}
+        assert tripped == {} and closed_tickets == []
 
     def test_wrong_symbol_closes_and_halts(self, monkeypatch) -> None:
-        tripped = self._patch(monkeypatch, closed=True)
-        order = {"symbol": "EURUSDcm", "quantity": 0.01, "order_type": "market"}
+        positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSDcm", "magic": cr.OUR_MAGIC}]
+        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        order = {"symbol": "EURUSDcm", "quantity": 0.01, "order_type": "market", "order_id": self.NEW_TICKET}
         note = cr._post_trade_spec_check(self.TRADE, order)
         assert "CRITICAL" in note and "AUTO-CLOSED" in note
         assert tripped.get("broker") == "mt5"
+        assert closed_tickets == [self.NEW_TICKET]
 
     def test_wrong_quantity_closes_and_halts(self, monkeypatch) -> None:
-        tripped = self._patch(monkeypatch, closed=True)
-        order = {"symbol": "EURUSDm", "quantity": 1.0, "order_type": "market"}
+        positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSDm", "magic": cr.OUR_MAGIC}]
+        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        order = {"symbol": "EURUSDm", "quantity": 1.0, "order_type": "market", "order_id": self.NEW_TICKET}
         note = cr._post_trade_spec_check(self.TRADE, order)
         assert "CRITICAL" in note and "1.0" in note
         assert tripped.get("broker") == "mt5"
+        assert closed_tickets == [self.NEW_TICKET]
 
     def test_limit_order_closes_and_halts(self, monkeypatch) -> None:
-        tripped = self._patch(monkeypatch, closed=True)
-        order = {"symbol": "EURUSDm", "quantity": 0.01, "order_type": "limit"}
+        positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSDm", "magic": cr.OUR_MAGIC}]
+        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        order = {"symbol": "EURUSDm", "quantity": 0.01, "order_type": "limit", "order_id": self.NEW_TICKET}
         note = cr._post_trade_spec_check(self.TRADE, order)
         assert "CRITICAL" in note and "not a market order" in note
         assert tripped.get("broker") == "mt5"
+        assert closed_tickets == [self.NEW_TICKET]
+
+    def test_does_not_close_other_legitimate_stacked_positions(self, monkeypatch) -> None:
+        """Real bug found by /code-review: matching by symbol+magic alone
+        force-closed ALL positions on the symbol, including healthy
+        pre-existing stacked ones (a real, expected state under
+        max_stack > 1) -- must only touch the new violating fill."""
+        positions = [
+            {"ticket": "111", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC},  # pre-existing, healthy
+            {"ticket": "222", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC},  # pre-existing, healthy
+            {"ticket": self.NEW_TICKET, "symbol": "EURUSDm", "magic": cr.OUR_MAGIC},  # the new, bad fill
+        ]
+        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        order = {"symbol": "EURUSDm", "quantity": 1.0, "order_type": "market", "order_id": self.NEW_TICKET}
+        note = cr._post_trade_spec_check(self.TRADE, order)
+        assert "CRITICAL" in note
+        assert closed_tickets == [self.NEW_TICKET]
+
+    def test_missing_order_id_refuses_to_close_anything(self, monkeypatch) -> None:
+        """Without a way to identify which position is actually the new
+        one, blindly closing everything on the symbol would repeat the
+        same bug -- must refuse and surface for manual review instead."""
+        positions = [{"ticket": "111", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC}]
+        tripped, closed_tickets = self._patch(monkeypatch, positions=positions)
+        order = {"symbol": "EURUSDm", "quantity": 1.0, "order_type": "market"}  # no order_id
+        note = cr._post_trade_spec_check(self.TRADE, order)
+        assert "CRITICAL" in note and "refusing to blindly close" in note
+        assert closed_tickets == []
 
 
 class TestResolveFillPrice:
@@ -1209,6 +1856,29 @@ class TestResolveFillPrice:
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": []})
         assert cr._resolve_fill_price(self.TRADE, {"fill_price": 0.0, "symbol": "EURUSDm"}) is None
 
+    def test_matches_new_ticket_not_older_stacked_position(self, monkeypatch) -> None:
+        """Real bug: with more than one same-symbol position open (this
+        module's own default cap is 4), matching by symbol+magic alone
+        could silently return an OLDER position's entry price instead of
+        the new fill's -- must match by the new order's own ticket."""
+        import src.trading.service as service
+
+        positions = [
+            {"ticket": "111", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.1000},  # older, unrelated
+            {"ticket": "999", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.1050},  # the new fill
+        ]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        order = {"fill_price": 0.0, "symbol": "EURUSDm", "order_id": "999"}
+        assert cr._resolve_fill_price(self.TRADE, order) == 1.1050
+
+    def test_falls_back_to_broad_match_when_order_has_no_ticket(self, monkeypatch) -> None:
+        import src.trading.service as service
+
+        positions = [{"symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.1500}]
+        monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions})
+        order = {"fill_price": 0.0, "symbol": "EURUSDm"}  # no order_id
+        assert cr._resolve_fill_price(self.TRADE, order) == 1.1500
+
 
 class TestPostTradeRewardRiskCheck:
     """Ported 2026-09-18 -- see MIN_REWARD_RISK_RATIO's own comment for the
@@ -1216,20 +1886,19 @@ class TestPostTradeRewardRiskCheck:
     motivated this on the FundedNext side first."""
 
     TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01}
+    NEW_TICKET = "999"
 
     def _patch(self, monkeypatch, *, atr_floor=0.0002, spread_floor=0.0001, positions=None, modify_result=None):
         import src.trading.connectors.mt5.sdk as mt5_sdk
-        import src.trading.profiles as profiles_module
         import src.trading.service as service
 
         calls = {}
         monkeypatch.setattr(cr, "_symbol_live_quote", lambda symbol, conn: {"bid": 1.1000, "ask": 1.1001})
         monkeypatch.setattr(cr, "_atr_stop_floor", lambda symbol, connection: atr_floor)
         monkeypatch.setattr(cr, "_spread_stop_floor", lambda quote: spread_floor)
-        default_positions = [{"ticket": "999", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC}]
+        default_positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSDm", "magic": cr.OUR_MAGIC}]
         monkeypatch.setattr(service, "get_positions", lambda conn: {"positions": positions if positions is not None else default_positions})
-        monkeypatch.setattr(profiles_module, "profile_by_id", lambda conn: type("P", (), {"config": {}})())
-        monkeypatch.setattr(mt5_sdk, "build_config", lambda profile_config, overrides: {})
+        monkeypatch.setattr(cr, "_mt5_config_for", lambda connection: {})
 
         def _modify(config, ticket=None, stop_loss=None, take_profit=None):
             calls.update(ticket=ticket, stop_loss=stop_loss, take_profit=take_profit)
@@ -1240,36 +1909,62 @@ class TestPostTradeRewardRiskCheck:
 
     def test_ratio_already_healthy_is_a_no_op(self, monkeypatch) -> None:
         calls = self._patch(monkeypatch)
-        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1020}
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1020, "order_id": self.NEW_TICKET}
         assert cr._post_trade_reward_risk_check(self.TRADE, order) == ""
         assert calls == {}
 
     def test_tightens_stop_when_floor_allows(self, monkeypatch) -> None:
         calls = self._patch(monkeypatch, atr_floor=0.0002, spread_floor=0.0001)
-        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010}
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
         note = cr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "tightened stop-loss" in note
+        assert calls["ticket"] == self.NEW_TICKET
         assert calls["take_profit"] == 1.1010
-        assert calls["stop_loss"] == pytest.approx(1.1000 - 0.0010 / 1.5)
+        assert calls["stop_loss"] == pytest.approx(1.0995)
+        assert order["stop_loss"] == pytest.approx(1.0995)
+        assert order["take_profit"] == 1.1010
 
     def test_widens_target_when_tightening_would_violate_floor(self, monkeypatch) -> None:
         calls = self._patch(monkeypatch, atr_floor=0.0009, spread_floor=0.0001)
-        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010}
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
         note = cr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "widened take-profit" in note
         assert calls["stop_loss"] == 1.0990
-        assert calls["take_profit"] == pytest.approx(1.1015)
+        assert calls["take_profit"] == pytest.approx(1.10175)  # (0.0010 + s) * 1.5 + s, s = 0.0001
 
     def test_zero_fill_price_falls_back_to_live_position(self, monkeypatch) -> None:
-        positions = [{"ticket": "999", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.1000}]
+        positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "price_open": 1.1000}]
         calls = self._patch(monkeypatch, atr_floor=0.0002, spread_floor=0.0001, positions=positions)
-        order = {"side": "buy", "fill_price": 0.0, "stop_loss": 1.0990, "take_profit": 1.1010}
+        order = {"side": "buy", "fill_price": 0.0, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
         note = cr._post_trade_reward_risk_check(self.TRADE, order)
         assert "CORRECTED" in note and "tightened stop-loss" in note
 
     def test_no_matching_position_reports_without_crashing(self, monkeypatch) -> None:
         calls = self._patch(monkeypatch, positions=[])
-        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010}
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
+        note = cr._post_trade_reward_risk_check(self.TRADE, order)
+        assert "no matching open position" in note
+        assert calls == {}
+
+    def test_does_not_correct_other_legitimate_stacked_positions(self, monkeypatch) -> None:
+        """Real bug found by /code-review: matching ours[0] (whatever the
+        broker happened to return first) could silently modify an older,
+        already-compliant stacked position while leaving the actual
+        sub-floor new fill uncorrected -- must only touch the new ticket."""
+        positions = [
+            {"ticket": "111", "symbol": "EURUSDm", "magic": cr.OUR_MAGIC},  # pre-existing, healthy
+            {"ticket": self.NEW_TICKET, "symbol": "EURUSDm", "magic": cr.OUR_MAGIC},  # the new, sub-floor one
+        ]
+        calls = self._patch(monkeypatch, atr_floor=0.0002, spread_floor=0.0001, positions=positions)
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
+        note = cr._post_trade_reward_risk_check(self.TRADE, order)
+        assert "CORRECTED" in note
+        assert calls["ticket"] == self.NEW_TICKET
+
+    def test_missing_order_id_reports_without_crashing(self, monkeypatch) -> None:
+        positions = [{"ticket": self.NEW_TICKET, "symbol": "EURUSDm", "magic": cr.OUR_MAGIC}]
+        calls = self._patch(monkeypatch, positions=positions)
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010}  # no order_id
         note = cr._post_trade_reward_risk_check(self.TRADE, order)
         assert "no matching open position" in note
         assert calls == {}
@@ -1278,3 +1973,852 @@ class TestPostTradeRewardRiskCheck:
         calls = self._patch(monkeypatch)
         assert cr._post_trade_reward_risk_check(self.TRADE, {"side": "buy", "fill_price": 1.1}) == ""
         assert calls == {}
+
+    def test_widens_target_instead_of_tightening_when_floor_unreadable(self, monkeypatch) -> None:
+        """Real bug: _atr_stop_floor/_spread_stop_floor both fail open to
+        None (e.g. a transient bars/quote read error right after the fill --
+        the rest of this file treats that as routine), which used to make
+        floor_distance 0.0 and let the stop get tightened with NO floor
+        check at all -- the opposite of what the docstring promises ("never
+        past the ATR/spread volatility floor"), and inconsistent with
+        _post_trade_stop_floor_check's own `if floor_distance <= 0` guard
+        for the identical case. Must fall back to widening the target
+        instead, which never needs the floor."""
+        calls = self._patch(monkeypatch, atr_floor=None, spread_floor=None)
+        order = {"side": "buy", "fill_price": 1.1000, "stop_loss": 1.0990, "take_profit": 1.1010, "order_id": self.NEW_TICKET}
+        note = cr._post_trade_reward_risk_check(self.TRADE, order)
+        assert "CORRECTED" in note and "widened take-profit" in note
+        assert calls["stop_loss"] == 1.0990  # stop left untouched -- no floor to safely tighten against
+        assert calls["take_profit"] == pytest.approx(1.10175)  # (0.0010 + s) * 1.5 + s, s = 0.0001
+        assert order["stop_loss"] == 1.0990
+
+
+class TestHandleFilledOrder:
+    """Real bug found by /code-review: the journal write used to live only in
+    run_committee's "no violation" branch, so a fill a guardrail immediately
+    closed (spec/trend/stop-floor-budget violation) silently never reached
+    the trade journal -- see _handle_filled_order's own docstring."""
+
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def test_journals_even_when_spec_violation_closes_it(self, monkeypatch) -> None:
+        journaled = []
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "\n\n[CRITICAL -- SPEC VIOLATION, AUTO-CLOSED] ...")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDcm", "side": "buy", "quantity": 0.25, "order_id": "1",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+
+        note, traded = cr._handle_filled_order(self.TRADE, order, None)
+
+        assert traded is False
+        assert "SPEC VIOLATION" in note
+        # Journaled under the order's OWN (wrong) symbol, not trade["symbol"]
+        # -- misfiling it into "EURUSDm"'s history would be its own bug.
+        assert journaled == [("EURUSDcm", "mt5-live-trade", order)]
+
+    def test_journals_even_when_trend_gate_closes_it(self, monkeypatch) -> None:
+        journaled = []
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "\n\n[TREND GATE -- ORDER CLOSED] ...")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDm", "side": "sell", "quantity": 0.01, "order_id": "2",
+                 "stop_loss": 1.1, "take_profit": 1.0}
+
+        note, traded = cr._handle_filled_order(self.TRADE, order, {"buy"})
+
+        assert traded is False
+        assert "TREND GATE" in note
+        assert journaled == [("EURUSDm", "mt5-live-trade", order)]
+
+    def test_journals_normally_when_no_violation(self, monkeypatch) -> None:
+        journaled = []
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(cr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDm", "side": "buy", "quantity": 0.01, "order_id": "3",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+
+        note, traded = cr._handle_filled_order(self.TRADE, order, {"buy"})
+
+        assert traded is True
+        assert journaled == [("EURUSDm", "mt5-live-trade", order)]
+        assert order["trend_alignment"] == "with"
+        # D13 (2026-10-08) -- see fundednext_reporter.py's identical test
+        # for the full rationale.
+        assert order["regime"] == "NORMAL"
+
+    def test_journals_the_trade_s_regime_label_when_present(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(cr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: None)
+        order = {"symbol": "EURUSDm", "side": "buy", "quantity": 0.01, "order_id": "4",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+        trade = {**self.TRADE, "regime_label": "VOLATILE"}
+
+        cr._handle_filled_order(trade, order, {"buy"})
+
+        assert order["regime"] == "VOLATILE"
+
+    def test_research_only_fill_is_closed_and_journaled_as_violation(self, monkeypatch) -> None:
+        """D3 (2026-10-06): a research-only pass's prompt never offers
+        trading_place_order, but the tool is still technically reachable. If
+        it fires anyway, this is the code-level backstop -- close it, trip
+        the kill switch, journal it as a violation (not a trade), and this
+        takes priority over the normal spec/trend checks, not alongside
+        them (they're never even called)."""
+        journaled = []
+        spec_called = []
+        monkeypatch.setattr(cr, "_post_trade_research_only_violation",
+                             lambda *a, **k: "\n\n[CRITICAL — RESEARCH-ONLY VIOLATION, AUTO-CLOSED] ...")
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: spec_called.append(1) or "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: spec_called.append(1) or "")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: journaled.append((symbol, connection, order)))
+        order = {"symbol": "EURUSDm", "side": "buy", "quantity": 0.01, "order_id": "4",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+
+        note, traded = cr._handle_filled_order(
+            self.TRADE, order, None, research_only=True, research_only_reason="[NEWS BLACKOUT] ...",
+        )
+
+        assert traded is False
+        assert "RESEARCH-ONLY VIOLATION" in note
+        assert journaled == [("EURUSDm", "mt5-live-trade", order)]
+        assert spec_called == []  # normal spec/trend checks never run for a research-only violation
+
+
+class TestJournalAnyPlacedOrders:
+    """Real incident 2026-10-05 (FundedNext GBPUSD empty_model_response),
+    found by the daily-repair agent's 2026-10-06 review: a run that places
+    an order and THEN fails on a later step used to skip every guardrail and
+    the journal entirely, because run_committee's non-success/empty-answer
+    branches returned before ever looking at the trace. This incident itself
+    happened not to have placed an order, but the gap was real and live --
+    _journal_any_placed_orders is now shared by every return point."""
+
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def test_empty_when_run_id_is_none(self, monkeypatch) -> None:
+        # The "could not parse CLI output" branch has no run_id at all --
+        # genuinely nothing to recover there.
+        called = []
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: called.append(run_id) or [])
+        notes, traded, any_placed = cr._journal_any_placed_orders(self.TRADE, None, None)
+        assert (notes, traded, any_placed) == ("", False, False)
+        assert called == []  # never even looked -- there's no run_id to look with
+
+    def test_empty_when_trade_is_none(self, monkeypatch) -> None:
+        # A research-only pass (trade=None) has nothing to journal against.
+        called = []
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: called.append(run_id) or [])
+        notes, traded, any_placed = cr._journal_any_placed_orders(None, "run-1", None)
+        assert (notes, traded, any_placed) == ("", False, False)
+        assert called == []
+
+    def test_journals_an_order_placed_before_a_later_failure(self, monkeypatch) -> None:
+        """The actual regression: a run that places an order and then fails
+        (empty_model_response, max-iterations, ...) must still run that
+        order through the guardrail chain and journal it -- any_placed=True
+        is what lets run_committee's error branches append the
+        [POST-FAILURE GUARDRAIL CHECK] note instead of silently dropping it."""
+        order = {"status": "ok", "ticket": "1", "symbol": "EURUSDm"}
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: [order])
+        monkeypatch.setattr(cr, "_resolve_fill_price", lambda trade, o: 1.1234)
+        monkeypatch.setattr(cr, "_handle_filled_order", lambda trade, o, trend, **kw: ("\n\n[JOURNALED]", True))
+
+        notes, traded, any_placed = cr._journal_any_placed_orders(self.TRADE, "run-1", None)
+
+        assert any_placed is True
+        assert traded is True
+        assert "[JOURNALED]" in notes
+        assert order["fill_price"] == 1.1234  # patched in before _handle_filled_order ran
+
+    def test_any_placed_true_even_when_every_order_gets_closed(self, monkeypatch) -> None:
+        # A placed order that a guardrail immediately closes still counts as
+        # "placed" for the caller's post-failure note, even though traded
+        # ends up False -- the point is that it was journaled, not that it
+        # survived.
+        order = {"status": "ok", "ticket": "1", "symbol": "EURUSDcm"}
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: [order])
+        monkeypatch.setattr(cr, "_resolve_fill_price", lambda trade, o: None)
+        monkeypatch.setattr(cr, "_handle_filled_order", lambda trade, o, trend, **kw: ("\n\n[SPEC VIOLATION]", False))
+
+        notes, traded, any_placed = cr._journal_any_placed_orders(self.TRADE, "run-1", None)
+
+        assert any_placed is True
+        assert traded is False
+        assert "[SPEC VIOLATION]" in notes
+
+    def test_multiple_orders_all_run_and_aggregated(self, monkeypatch) -> None:
+        first = {"status": "ok", "ticket": "1", "symbol": "EURUSDm"}
+        second = {"status": "ok", "ticket": "2", "symbol": "EURUSDm"}
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: [first, second])
+        monkeypatch.setattr(cr, "_resolve_fill_price", lambda trade, o: None)
+        calls = []
+
+        def _fake_handle(trade, o, trend, **kw):
+            calls.append(o["ticket"])
+            return f"\n\n[{o['ticket']}]", o["ticket"] == "2"
+
+        monkeypatch.setattr(cr, "_handle_filled_order", _fake_handle)
+        notes, traded, any_placed = cr._journal_any_placed_orders(self.TRADE, "run-1", None)
+
+        assert calls == ["1", "2"]  # both orders run, not just the first
+        assert any_placed is True
+        assert traded is True  # True if ANY order ended up traded
+        assert "[1]" in notes and "[2]" in notes
+
+
+class TestLlmBalanceAlert:
+    def _patch(self, monkeypatch, tmp_path, *, provider: str, balance):
+        monkeypatch.setenv("LANGCHAIN_PROVIDER", provider)
+        monkeypatch.setattr(cr, "LLM_BALANCE_ALERT_STATE_PATH", tmp_path / "state.json")
+        monkeypatch.setitem(cr._LLM_BALANCE_READERS, "openrouter", ("OpenRouter", lambda: balance))
+        monkeypatch.setitem(cr._LLM_BALANCE_READERS, "deepseek", ("DeepSeek", lambda: balance))
+        sent = []
+        monkeypatch.setattr(cr, "send_email", lambda subject, text, **kw: sent.append(subject))
+        return sent
+
+    def test_openrouter_low_balance_alerts_once(self, monkeypatch, tmp_path) -> None:
+        sent = self._patch(monkeypatch, tmp_path, provider="openrouter", balance=0.11)
+
+        cr._check_llm_balance_alert()
+        cr._check_llm_balance_alert()
+
+        assert sent == ["[Vibe-Trading] LOW BALANCE — OpenRouter $0.11"]
+
+    def test_stale_alert_flag_from_other_provider_does_not_mute(self, monkeypatch, tmp_path) -> None:
+        # The real on-disk state at switch-over was a DeepSeek-era {"alerted": true}
+        # with no provider key -- it must not suppress OpenRouter's first alert.
+        sent = self._patch(monkeypatch, tmp_path, provider="openrouter", balance=0.11)
+        (tmp_path / "state.json").write_text('{"alerted": true}', encoding="utf-8")
+
+        cr._check_llm_balance_alert()
+
+        assert len(sent) == 1
+
+    def test_healthy_balance_does_not_alert(self, monkeypatch, tmp_path) -> None:
+        sent = self._patch(monkeypatch, tmp_path, provider="openrouter", balance=15.0)
+
+        cr._check_llm_balance_alert()
+
+        assert sent == []
+
+    def test_unknown_provider_is_not_checked(self, monkeypatch, tmp_path) -> None:
+        sent = self._patch(monkeypatch, tmp_path, provider="anthropic", balance=0.0)
+
+        cr._check_llm_balance_alert()
+
+        assert sent == []
+
+    def test_openrouter_reader_computes_remaining_credit(self, monkeypatch) -> None:
+        monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+        monkeypatch.setattr(cr, "_fetch_json_or_none", lambda url, key: {"data": {"total_credits": 20, "total_usage": 19.8866347}})
+
+        assert abs(cr._openrouter_balance_usd() - 0.1133653) < 1e-9
+
+    def test_openrouter_reader_fails_open(self, monkeypatch) -> None:
+        monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+        monkeypatch.setattr(cr, "_fetch_json_or_none", lambda url, key: None)
+
+        assert cr._openrouter_balance_usd() is None
+
+
+class TestExclusiveGroup:
+    def _patch(self, monkeypatch, open_by_symbol: dict):
+        calls, sent = [], []
+        for name in ("_check_trade_drought", "_check_cap_fit_alert", "_check_llm_balance_alert", "_log_cap_gap"):
+            monkeypatch.setattr(cr, name, lambda: None)
+        monkeypatch.setattr(
+            cr, "TARGETS",
+            [
+                {"committee": "investment_committee", "target": "EURUSD", "market": "forex",
+                 "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}},
+                {"committee": "investment_committee", "target": "GBPUSD", "market": "forex",
+                 "trade": {"symbol": "GBPUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}},
+            ],
+        )
+        monkeypatch.setattr(
+            cr, "_symbol_position_summary",
+            lambda symbol, connection: open_by_symbol.get(symbol, {"count": 0, "side": None}),
+        )
+        monkeypatch.setattr(cr, "is_reportable", lambda result: False)
+        monkeypatch.setattr(cr, "_status_header", lambda: "")
+        monkeypatch.setattr(cr, "send_email", lambda subject, text, **kw: sent.append((subject, text)))
+
+        def _fake_run_committee(**kwargs):
+            calls.append(kwargs["target"])
+            return cr.CommitteeResult(
+                committee=kwargs["committee"], target=kwargs["target"], market=kwargs["market"],
+                status="success", run_id="r1", report_text="", traded=False,
+            )
+
+        monkeypatch.setattr(cr, "run_committee", _fake_run_committee)
+        return calls, sent
+
+    def test_gbpusd_skipped_while_eurusd_open(self, monkeypatch) -> None:
+        calls, sent = self._patch(monkeypatch, {"EURUSDm": {"count": 1, "side": "buy"}})
+
+        cr.run_once("new_york")
+
+        assert calls == ["EURUSD"]
+        assert len(sent) == 1 and sent[0][0].endswith("GBPUSD (SKIPPED)") and "EURUSDm" in sent[0][1]
+
+    def test_eurusd_skipped_while_gbpusd_open(self, monkeypatch) -> None:
+        calls, sent = self._patch(monkeypatch, {"GBPUSDm": {"count": 1, "side": "sell"}})
+
+        cr.run_once("new_york")
+
+        assert calls == ["GBPUSD"]
+        assert sent[0][0].endswith("EURUSD (SKIPPED)")
+
+    def test_both_run_when_nothing_open(self, monkeypatch) -> None:
+        calls, sent = self._patch(monkeypatch, {})
+
+        cr.run_once("new_york")
+
+        assert calls == ["EURUSD", "GBPUSD"]
+        assert sent == []
+
+    def test_fails_closed_when_positions_unreadable(self, monkeypatch) -> None:
+        def _boom(symbol, connection):
+            raise RuntimeError("terminal not connected")
+        monkeypatch.setattr(cr, "_symbol_position_summary", _boom)
+
+        note = cr._exclusive_group_conflict({"symbol": "GBPUSDm", "connection": "mt5-live-trade"})
+
+        assert note is not None and "could not read" in note
+
+    def test_symbol_outside_group_is_never_blocked(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_symbol_position_summary", lambda symbol, connection: {"count": 1, "side": "buy"})
+
+        assert cr._exclusive_group_conflict({"symbol": "XAUUSDm", "connection": "mt5-live-trade"}) is None
+
+    def test_live_targets_are_eurusd_and_gbpusd(self) -> None:
+        assert [t["trade"]["symbol"] for t in cr.TARGETS] == ["EURUSDm", "GBPUSDm"]
+
+
+class TestWeekendFlattenTiming:
+    def test_friday_after_cutoff_flattens_between_passes(self, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(cr, "_weekend_flatten_and_notify", lambda: calls.append("flatten"))
+        monkeypatch.setattr(cr, "_profit_protection_check", lambda: calls.append("protect"))
+
+        # Fri 2026-09-25 20:05 UTC -- the gap the old boundary-only check missed.
+        cr._between_passes_tick(datetime(2026, 9, 25, 20, 5, tzinfo=timezone.utc))
+
+        assert calls == ["flatten"]
+
+    def test_weekday_runs_profit_protection(self, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(cr, "_weekend_flatten_and_notify", lambda: calls.append("flatten"))
+        monkeypatch.setattr(cr, "_profit_protection_check", lambda: calls.append("protect"))
+
+        cr._between_passes_tick(datetime(2026, 9, 25, 19, 55, tzinfo=timezone.utc))
+
+        assert calls == ["protect"]
+
+    def test_flatten_crash_does_not_propagate(self, monkeypatch) -> None:
+        def _boom():
+            raise RuntimeError("terminal gone")
+        monkeypatch.setattr(cr, "_weekend_flatten_and_notify", _boom)
+
+        cr._between_passes_tick(datetime(2026, 9, 26, 3, 0, tzinfo=timezone.utc))
+
+    def _patch_flatten(self, monkeypatch, tmp_path, close_result):
+        import types
+        monkeypatch.setattr(cr, "WEEKEND_STATE_PATH", tmp_path / "weekend.json")
+        monkeypatch.setattr(
+            cr, "TARGETS",
+            [{"committee": "investment_committee", "target": "EURUSD", "market": "forex",
+              "trade": {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}}],
+        )
+        pos = {"ticket": 1, "symbol": "EURUSDm", "magic": cr.OUR_MAGIC, "side": "buy", "volume": 0.01, "profit": -1.0}
+        import src.trading.service as service
+        import src.trading.connectors.mt5.sdk as mt5_sdk
+        import src.trading.profiles as profiles
+        monkeypatch.setattr(service, "get_positions", lambda connection: {"positions": [pos]})
+        monkeypatch.setattr(profiles, "profile_by_id", lambda cid: types.SimpleNamespace(config={}))
+        monkeypatch.setattr(mt5_sdk, "build_config", lambda a, b: {})
+        monkeypatch.setattr(mt5_sdk, "close_position", lambda config, ticket: close_result)
+        monkeypatch.setattr(cr, "_status_header", lambda: "")
+        sent = []
+        monkeypatch.setattr(cr, "send_email", lambda subject, text, **kw: sent.append(text))
+        return sent
+
+    def test_repeated_failed_close_emails_once_per_week(self, monkeypatch, tmp_path) -> None:
+        sent = self._patch_flatten(monkeypatch, tmp_path, {"status": "error", "error": "retcode=10018 Market closed"})
+
+        for _ in range(3):
+            cr._weekend_flatten_and_notify()
+
+        assert len(sent) == 1 and "FAILED to close" in sent[0]
+
+    def test_successful_close_always_emails(self, monkeypatch, tmp_path) -> None:
+        sent = self._patch_flatten(monkeypatch, tmp_path, {"status": "ok", "closed_volume": 0.01, "fill_price": 1.139})
+
+        cr._weekend_flatten_and_notify()
+        cr._weekend_flatten_and_notify()
+
+        assert len(sent) == 2 and all("Closed BUY" in text for text in sent)
+
+
+# ---------------------------------------------------------------------------
+# D2 (2026-10-06): no fresh data pack -> hard PASS, LLM never invoked
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPromptDataPackGate:
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def _patch_facts(self, monkeypatch) -> None:
+        """Everything _build_prompt's trade branch reads, stubbed inert --
+        only market_data_pack.write_data_pack's return value matters here."""
+        monkeypatch.setattr(cr, "_symbol_position_summary", lambda s, c: {"count": 0, "side": None})
+        monkeypatch.setattr(cr, "_symbol_live_quote", lambda s, c: None)
+        for name in ("_signal_service_activity", "_journal_summary_text", "_session_bias_fact"):
+            monkeypatch.setattr(cr, name, lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_journal_reconcile_closed", lambda *a, **k: None, raising=False)
+        monkeypatch.setattr(cr, "_effective_max_loss_usd", lambda c: 4.0)
+        monkeypatch.setattr(cr, "_max_stop_distance", lambda *a, **k: 0.004)
+        monkeypatch.setattr(cr, "_atr_stop_floor", lambda *a, **k: 0.001)
+        # v5.1 (D6): isolate from this machine's real FINNHUB_API_KEY/cache --
+        # news_api_status() makes no network call but does read real state.
+        monkeypatch.setattr(cr.fn_news, "news_api_status", lambda: "OK")
+
+    def test_returns_none_when_data_pack_unavailable(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: None)
+        assert cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE) is None
+
+    def test_returns_a_prompt_when_data_pack_available(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: Path("fake_pack.md"))
+        prompt = cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE)
+        assert prompt is not None and "DATA PACK FILE" in prompt
+
+    def test_research_only_pass_is_unaffected(self, monkeypatch) -> None:
+        # trade=None never reaches the data-pack gate at all (D3's job, not
+        # D2's) -- write_data_pack must not even be called.
+        called = []
+        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: called.append(1) or None)
+        prompt = cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", None)
+        assert prompt is not None
+        assert called == []
+
+
+class TestRunCommitteeDataPackGate:
+    """The actual deliverable: no fresh data pack -> the LLM subprocess is
+    never spawned at all, and the pass is recorded as a PASS with reason
+    data_pack_unavailable, not an error."""
+
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def _patch_pre_checks_inert(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_live_circuit_breaker_check", lambda trade: None)
+        monkeypatch.setattr(cr, "_exclusive_group_conflict", lambda trade: None)
+        monkeypatch.setattr(cr.fn_news, "is_news_blackout", lambda *a, **k: (False, None))
+        monkeypatch.setattr(cr, "TREND_FILTER_ENABLED", False)
+        # D12 (2026-10-08): without this, run_committee's regime gate makes a
+        # REAL live MT5 call before ever reaching the data-pack gate this
+        # class actually tests -- flaky (depends on real-time market
+        # conditions; caught live 2026-10-09 when the real market happened
+        # to classify CALM and short-circuited before _build_prompt's mock
+        # was ever reached). Force NORMAL so the gate this class is testing
+        # is the one that actually runs.
+        monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: cr.strategy_tracking.RegimeResult("NORMAL", 50.0, 1.0, "INVOKE_LLM", "normal_regime"))
+
+    def test_no_llm_subprocess_spawned_when_data_pack_unavailable(self, monkeypatch) -> None:
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(cr, "_build_prompt", lambda *a, **k: None)
+        popen_calls = []
+        monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: popen_calls.append((a, k)) or (_ for _ in ()).throw(AssertionError("Popen must not be called")))
+
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert popen_calls == []
+        assert result.status == "success"
+        assert result.traded is False
+        assert "DECISION: PASS" in result.report_text
+        assert "data_pack_unavailable" in result.report_text
+
+
+class TestRunCommitteeRegimeGate:
+    """D12 (2026-10-08) -- see fundednext_reporter.py's identical test class
+    for the full rationale."""
+
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def _patch_pre_checks_inert(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_live_circuit_breaker_check", lambda trade: None)
+        monkeypatch.setattr(cr, "_exclusive_group_conflict", lambda trade: None)
+        monkeypatch.setattr(cr.fn_news, "is_news_blackout", lambda *a, **k: (False, None))
+        monkeypatch.setattr(cr, "TREND_FILTER_ENABLED", False)
+
+    def _regime(self, label, action, size_mult=1.0, pct=50.0, reason="x"):
+        return cr.strategy_tracking.RegimeResult(label, pct, size_mult, action, reason)
+
+    @pytest.mark.parametrize("label,reason", [("CALM", "calm_regime"), ("EXTREME", "extreme_volatility")])
+    def test_pass_no_llm_regime_spawns_no_subprocess(self, monkeypatch, label, reason) -> None:
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: self._regime(label, "PASS_NO_LLM", 0.0, 92.0, reason))
+        monkeypatch.setattr(cr.fn_news, "news_api_status", lambda: "OK")
+        popen_calls = []
+        monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: popen_calls.append((a, k)) or (_ for _ in ()).throw(AssertionError("Popen must not be called")))
+
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert popen_calls == []
+        assert result.status == "success"
+        assert result.traded is False
+        assert "DECISION: PASS" in result.report_text
+        assert reason in result.report_text
+
+    @pytest.mark.parametrize("label,size_mult", [("NORMAL", 1.0), ("VOLATILE", 0.5)])
+    def test_invoke_llm_regime_proceeds_to_build_prompt(self, monkeypatch, label, size_mult) -> None:
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: self._regime(label, "INVOKE_LLM", size_mult, 50.0, "x"))
+
+        class _Stop(Exception):
+            pass
+
+        reached = {}
+
+        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
+            reached["called"] = True
+            reached["trade"] = trade
+            raise _Stop
+
+        monkeypatch.setattr(cr, "_build_prompt", _fake_build_prompt)
+
+        with pytest.raises(_Stop):
+            cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert reached.get("called") is True
+        assert f"regime: {label}" in reached["trade"]["regime_rule"]
+        # D-repair (2026-10-09) -- see fundednext_reporter.py's identical
+        # test for the full rationale. At this account's 0.01-lot minimum,
+        # a VOLATILE 0.5x multiplier floors back to 0.01 (no smaller size
+        # exists), but it must still be computed via regime_adjusted_lots
+        # rather than silently left untouched.
+        assert reached["trade"]["lots"] == cr.strategy_tracking.regime_adjusted_lots(
+            self.TRADE["lots"], self._regime(label, "INVOKE_LLM", size_mult, 50.0, "x"),
+        )
+
+    @pytest.mark.parametrize("label,toggle_name", [("CALM", "REGIME_SKIP_CALM"), ("EXTREME", "REGIME_SKIP_EXTREME")])
+    def test_skip_toggle_off_invokes_llm_anyway(self, monkeypatch, label, toggle_name) -> None:
+        # D17 (2026-10-08) -- see fundednext_reporter.py's identical test
+        # for the full rationale.
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(cr.strategy_tracking, toggle_name, False)
+        monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: self._regime(label, "PASS_NO_LLM", 0.0, 92.0, "x"))
+
+        class _Stop(Exception):
+            pass
+
+        reached = {}
+        monkeypatch.setattr(cr, "_build_prompt", lambda *a, **k: reached.update(called=True) or (_ for _ in ()).throw(_Stop))
+
+        with pytest.raises(_Stop):
+            cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert reached.get("called") is True
+
+    def test_regime_gate_skipped_when_already_research_only(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_live_circuit_breaker_check", lambda trade: "[LIVE CIRCUIT BREAKER] ...")
+        called = []
+        monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: called.append(1) or self._regime("CALM", "PASS_NO_LLM"))
+
+        class _Stop(Exception):
+            pass
+
+        monkeypatch.setattr(cr, "_build_prompt", lambda *a, **k: (_ for _ in ()).throw(_Stop))
+
+        with pytest.raises(_Stop):
+            cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert called == []
+
+    @pytest.mark.parametrize("label,reason", [("CALM", "calm_regime"), ("EXTREME", "extreme_volatility")])
+    def test_regime_short_circuit_satisfies_d4_schema(self, monkeypatch, label, reason) -> None:
+        # D15 (2026-10-08) -- see fundednext_reporter.py's identical test
+        # for the full rationale.
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: self._regime(label, "PASS_NO_LLM", 0.0, 92.0, reason))
+        monkeypatch.setattr(cr.fn_news, "news_api_status", lambda: "OK")
+        monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Popen must not be called")))
+
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert cr.strategy_tracking.validate_committee_fields(result.report_text) == []
+
+
+# ---------------------------------------------------------------------------
+# D3 (2026-10-06): research-only passes get the v4 schema + data pack,
+# trading_place_order is never offered, and `trade` is no longer nulled out
+# by a pre-check trip (research_only is its own flag now).
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPromptResearchOnly:
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def _patch_facts(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_symbol_position_summary", lambda s, c: {"count": 0, "side": None})
+        monkeypatch.setattr(cr, "_symbol_live_quote", lambda s, c: None)
+        for name in ("_signal_service_activity", "_journal_summary_text", "_session_bias_fact"):
+            monkeypatch.setattr(cr, name, lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_journal_reconcile_closed", lambda *a, **k: None, raising=False)
+        monkeypatch.setattr(cr, "_effective_max_loss_usd", lambda c: 4.0)
+        monkeypatch.setattr(cr, "_max_stop_distance", lambda *a, **k: 0.004)
+        monkeypatch.setattr(cr, "_atr_stop_floor", lambda *a, **k: 0.001)
+        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: Path("fake_pack.md"))
+        monkeypatch.setattr(cr.fn_news, "news_api_status", lambda: "OK")
+
+    def test_research_only_prompt_has_mode_and_no_order_instructions(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        prompt = cr._build_prompt(
+            "fx_commodity_day_desk", "EURUSD", "forex", self.TRADE,
+            research_only=True, research_only_reason="[NEWS BLACKOUT] EURUSD unreachable.",
+        )
+        assert prompt is not None
+        assert "DATA PACK FILE" in prompt  # still gets the data pack, unlike the old no-trade path
+        assert "MODE: RESEARCH_ONLY" in prompt
+        assert "DECISION: PASS" in prompt
+        assert "trading_place_order(\n" not in prompt  # the order-call template is never offered
+        assert "[NEWS BLACKOUT] EURUSD unreachable." in prompt
+
+    def test_live_prompt_has_mode_live_and_order_instructions(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        prompt = cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE)
+        assert prompt is not None
+        assert "MODE: LIVE" in prompt
+        assert "trading_place_order(\n" in prompt
+
+    def test_data_pack_gate_still_applies_in_research_only_mode(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(cr.market_data_pack, "write_data_pack", lambda s, c: None)
+        assert cr._build_prompt(
+            "fx_commodity_day_desk", "EURUSD", "forex", self.TRADE, research_only=True,
+        ) is None
+
+    def test_prompt_carries_v51_schema_fields_and_rules(self, monkeypatch) -> None:
+        """D6/v5.1 (2026-10-06): DATA_MISSING/NEWS_API_STATUS/INPUT_PROVENANCE
+        fields, the verified NEWS_API_STATUS fact echoed from fn_news (not
+        asked of the LLM), and the "PASS is a success" framing rule."""
+        self._patch_facts(monkeypatch)
+        monkeypatch.setattr(cr.fn_news, "news_api_status", lambda: "STALE")
+        prompt = cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE)
+        assert prompt is not None
+        assert "DATA_MISSING:" in prompt
+        assert "NEWS_API_STATUS:" in prompt
+        assert "INPUT_PROVENANCE:" in prompt
+        assert "NEWS_API_STATUS verified fact: STALE." in prompt
+        assert "INPUT PROVENANCE verified facts" in prompt
+        assert "PASS is a successful outcome" in prompt
+
+    def test_prompt_carries_regime_rule_when_present(self, monkeypatch) -> None:
+        # D13 (2026-10-08) -- see fundednext_reporter.py's identical test
+        # for the full rationale.
+        self._patch_facts(monkeypatch)
+        regime = cr.strategy_tracking.RegimeResult("VOLATILE", 82.0, 0.5, "INVOKE_LLM", "volatile_regime")
+        trade = {**self.TRADE, "regime_rule": cr.strategy_tracking.regime_rule_prompt(regime)}
+        prompt = cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", trade)
+        assert prompt is not None
+        assert "regime: VOLATILE" in prompt
+        assert "size_multiplier: 0.5" in prompt
+
+    def test_prompt_omits_regime_rule_when_absent(self, monkeypatch) -> None:
+        self._patch_facts(monkeypatch)
+        prompt = cr._build_prompt("fx_commodity_day_desk", "EURUSD", "forex", self.TRADE)
+        assert prompt is not None
+        assert "regime:" not in prompt
+
+
+class TestRunCommitteePreChecksPreserveTrade:
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+
+    def test_circuit_breaker_trip_keeps_trade_and_sets_research_only(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_live_circuit_breaker_check", lambda trade: "[LIVE CIRCUIT BREAKER] ...")
+        seen = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
+            seen["trade"] = trade
+            seen["research_only"] = research_only
+            seen["research_only_reason"] = research_only_reason
+            raise _Stop
+
+        monkeypatch.setattr(cr, "_build_prompt", _fake_build_prompt)
+
+        try:
+            cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        except _Stop:
+            pass
+
+        assert seen["trade"] is not None and seen["trade"]["symbol"] == "EURUSDm"
+        assert seen["research_only"] is True
+        assert "LIVE CIRCUIT BREAKER" in seen["research_only_reason"]
+
+
+# ---------------------------------------------------------------------------
+# D4 (2026-10-06): malformed committee output (missing a required field) is
+# rejected as status="error" rather than trusted as a clean decision record.
+# ---------------------------------------------------------------------------
+
+
+class _FakePopen:
+    """Minimal stand-in for subprocess.Popen: communicate() returns a canned
+    (stdout, stderr), matching what run_committee reads via _last_json_line."""
+
+    def __init__(self, stdout: str, returncode: int = 0) -> None:
+        self._stdout = stdout
+        self.returncode = returncode
+        self.pid = 12345
+
+    def communicate(self, timeout=None):
+        return self._stdout, ""
+
+
+class TestRunCommitteeMalformedOutputGate:
+    TRADE = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+    VALID_REPORT = (
+        "DECISION: PASS\nCONFIDENCE: 50\nMODE: LIVE\nDATA_MISSING: none\nNEWS_API_STATUS: OK\n"
+        "EDGE: none\nCHECKLIST: n/a\n"
+        "ORDER: none\nINVALIDATION: n/a\nINPUT_PROVENANCE: mt5-live-trade, quote 12:00:00 UTC, pack 12:00:00 UTC\n"
+        "PROPOSAL: none\nREASON FOR PASS: no setup qualified"
+    )
+
+    def _patch_run(self, monkeypatch, *, report_text: str, placed_orders: list | None = None) -> None:
+        import json as _json
+        monkeypatch.setattr(cr, "_live_circuit_breaker_check", lambda trade: None)
+        monkeypatch.setattr(cr, "_exclusive_group_conflict", lambda trade: None)
+        monkeypatch.setattr(cr.fn_news, "is_news_blackout", lambda *a, **k: (False, None))
+        monkeypatch.setattr(cr, "TREND_FILTER_ENABLED", False)
+        # D12 -- see TestRunCommitteeDataPackGate's identical mock for the
+        # full rationale (without it, this hits real live MT5 and is flaky).
+        monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: cr.strategy_tracking.RegimeResult("NORMAL", 50.0, 1.0, "INVOKE_LLM", "normal_regime"))
+        monkeypatch.setattr(cr, "_build_prompt", lambda *a, **k: "fake prompt")
+        payload = _json.dumps({"status": "success", "run_id": "fake-run-1"})
+        monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: _FakePopen(payload))
+        monkeypatch.setattr(cr, "_read_final_answer", lambda run_id: report_text)
+        monkeypatch.setattr(cr, "_extract_placed_orders", lambda run_id: placed_orders or [])
+        monkeypatch.setattr(cr, "_blocked_order_note", lambda run_id: None)
+
+    def test_valid_output_is_accepted(self, monkeypatch) -> None:
+        self._patch_run(monkeypatch, report_text=self.VALID_REPORT)
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        assert result.status == "success"
+
+    def test_missing_field_is_rejected(self, monkeypatch) -> None:
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")  # drop a required field
+        self._patch_run(monkeypatch, report_text=broken)
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        assert result.status == "error"
+        assert "MALFORMED_OUTPUT" in result.error
+        assert "MODE" in result.error
+
+    def test_rejection_with_no_order_placed_journals_nothing(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")
+        self._patch_run(monkeypatch, report_text=broken, placed_orders=[])
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        assert result.status == "error"
+        assert result.traded is False
+        assert cr._read_journal() == []
+
+    def test_rejection_with_a_real_fill_still_journals_it(self, monkeypatch, tmp_path) -> None:
+        """Deliberate: a malformed REPORT still gets rejected as a decision
+        record, but a REAL fill is never dropped because of it -- same
+        principle as the empty_model_response fix (D3/the 2026-10-05
+        incident). Flagged for the user: this is a chosen interpretation of
+        D4's "do NOT write to journal," not a literal block-everything
+        reading, since the latter would reopen the exact gap D3 just closed."""
+        monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
+        order = {"status": "ok", "ticket": "1", "symbol": "EURUSDm", "side": "buy", "quantity": 0.01,
+                 "order_id": "1", "stop_loss": 1.1, "take_profit": 1.2, "order_type": "market"}
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(cr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_resolve_fill_price", lambda trade, o: None)
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")
+        self._patch_run(monkeypatch, report_text=broken, placed_orders=[order])
+
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert result.status == "error"  # the report itself is still rejected
+        assert "MALFORMED_OUTPUT" in result.error
+        assert result.traded is True  # but the real fill is not lost
+        assert len(cr._read_journal()) == 1
+
+
+class TestLogEmailedRegimeParsing:
+    """D16 (2026-10-08) -- see fundednext_reporter.py's identical test
+    class for the full rationale."""
+
+    def test_regex_captures_tag_alone(self) -> None:
+        line = "2026-10-08 15:11:04,712 INFO emailed report: [Vibe-Trading] new_york: fx_commodity_day_desk — EURUSD (ERROR)"
+        m = cr._LOG_EMAILED_RE.match(line)
+        assert m is not None
+        assert m.group(3) == "ERROR"
+
+    def test_regex_captures_tag_with_regime_suffix(self) -> None:
+        line = "2026-10-08 15:11:04,712 INFO emailed report: [Vibe-Trading] new_york: fx_commodity_day_desk — EURUSD (PASS, EXTREME)"
+        m = cr._LOG_EMAILED_RE.match(line)
+        assert m is not None
+        assert m.group(3) == "PASS, EXTREME"
+
+    def test_status_summary_surfaces_regime_in_last_result_tag(self, monkeypatch, tmp_path) -> None:
+        log_path = tmp_path / "reporter.log"
+        log_path.write_text(
+            "2026-10-08 15:16:32,738 INFO emailed report: [Vibe-Trading] new_york: fx_commodity_day_desk — "
+            "GBPUSD (OK, VOLATILE)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cr, "REPORTER_LOG_PATH", log_path)
+        summary = cr._status_log_summary()
+        assert summary["last_result_tag"] == "OK, VOLATILE"
+
+
+class TestRunOnceRecordsRegime:
+    def test_record_decision_receives_result_regime(self, monkeypatch) -> None:
+        trade = {"symbol": "EURUSDm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+        monkeypatch.setattr(cr, "TARGETS", [{"target": "EURUSD", "committee": "fx_commodity_day_desk",
+                                              "market": "forex", "trade": trade}])
+        monkeypatch.setattr(cr, "_exclusive_group_conflict", lambda t: None)
+        monkeypatch.setattr(cr, "_rulebook_skip_reason", lambda s: None)
+        fake_result = cr.CommitteeResult(
+            "fx_commodity_day_desk", "EURUSD", "forex", "success", "run1",
+            "DECISION: PASS\n...", traded=False, regime="EXTREME",
+        )
+        monkeypatch.setattr(cr, "run_committee", lambda **k: fake_result)
+        monkeypatch.setattr(cr, "is_reportable", lambda r: False)
+        seen = {}
+        monkeypatch.setattr(cr.strategy_tracking, "record_decision",
+                             lambda *a, **k: seen.update(k))
+
+        cr.run_once("new_york")
+
+        assert seen.get("regime") == "EXTREME"
