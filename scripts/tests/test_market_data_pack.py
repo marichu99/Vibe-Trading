@@ -85,6 +85,14 @@ class TestPullbackStructure:
         assert p["origin"] == pytest.approx(1.0) and p["extreme"] == pytest.approx(0.90)
         assert p["reaction_extreme"] == pytest.approx(0.95) and p["zone"] == "gartley"
 
+    def test_reaction_past_origin_re_anchors_on_the_newer_impulse(self) -> None:
+        # Rally 1.00->1.10, crash through the origin to 0.95, new rally to 1.05, dip to 1.02.
+        path = [1.00, 1.04, 1.08, 1.10, 1.03, 0.98, 0.95, 0.99, 1.02, 1.05, 1.04, 1.03, 1.02, 1.03, 1.03]
+        bars = [_vbar(p + 0.001, p - 0.001, p) for p in path]
+        p = mdp.pullback_structure(bars, "up")
+        assert p["origin"] == pytest.approx(0.949) and p["extreme"] == pytest.approx(1.051)
+        assert p["zone"] == "shallow" and not p["origin_at_window_start"]
+
     def test_heavier_pullback_volume_is_flagged(self) -> None:
         lines = mdp.pullback_lines(_uptrend_with_dip(1.05, dip_vol=400), "up", "up", 5, 0.0001)
         assert any("expanding" in line for line in lines)

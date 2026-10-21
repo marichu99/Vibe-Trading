@@ -178,16 +178,25 @@ TARGETS: list[dict[str, object]] = [
     # EURUSD/AUDUSD triggers above use).
     #
     # Briefly re-enabled 2026-09-24, then PAUSED again the same day at the
-    # user's request in favor of GBPUSD (below). Last live check: 15m-ATR
-    # stop floor 12.73 price units -> ~$25.47 risk at 0.02 lots, inside the
-    # ~$59.46 effective cap -- still valid to re-enable by uncommenting.
-    # {
-    #     "committee": "investment_committee", "target": "XAUUSD", "market": "commodity/forex",
-    #     "trade": {
-    #         "symbol": "XAUUSD", "connection": "mt5fn-live-trade", "lots": 0.02, "max_stack": 1,
-    #         "early_profit_trigger_usd": 30.00,
-    #     },
-    # },
+    # user's request in favor of GBPUSD (below).
+    #
+    # RE-ENABLED 2026-10-21 at the user's request, on fx_commodity_day_desk
+    # (the old investment_committee predates the data pack and rulebook).
+    # Live check: 1.2x H1 ATR stop ~$12.53 -> ~$12.5 risk at 0.01 lots, the
+    # same halved ~$12-16 band as EURUSD/GBPUSD and well inside the ~$44
+    # effective cap; spread $0.45 + $0.07 round-trip commission per 0.01 lot;
+    # notional ~$4.1k, so the mandate's $45k/order and $75k total caps hold
+    # with gold open alongside either forex pair. Deliberately NOT in
+    # EXCLUSIVE_SYMBOL_GROUP: gold isn't a doubled USD-pair bet, and one forex
+    # + one gold loss (~$29) stays far inside the 2% daily-loss halt.
+    # early_profit_trigger_usd halved with lots from the earlier $30 @ 0.02.
+    {
+        "committee": "fx_commodity_day_desk", "target": "XAUUSD", "market": "commodity",
+        "trade": {
+            "symbol": "XAUUSD", "connection": "mt5fn-live-trade", "lots": 0.01, "max_stack": 1,
+            "early_profit_trigger_usd": 15.00,
+        },
+    },
     {
         # Added 2026-09-24 at the user's request, replacing gold. Chosen over
         # US oil (USOUSD, -0.06 corr to EURUSD) for cost and predictability:

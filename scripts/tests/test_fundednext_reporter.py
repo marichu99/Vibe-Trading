@@ -1032,10 +1032,16 @@ class TestExclusiveGroupConflict:
         assert seen["research_only"] is True
         assert "CORRELATION LIMIT" in seen["research_only_reason"]
 
-    def test_targets_are_eurusd_and_gbpusd(self) -> None:
-        assert [t["trade"]["symbol"] for t in fr.TARGETS] == ["EURUSD", "GBPUSD"]
+    def test_targets_are_eurusd_gold_and_gbpusd(self) -> None:
+        assert [t["trade"]["symbol"] for t in fr.TARGETS] == ["EURUSD", "XAUUSD", "GBPUSD"]
         gbp = next(t["trade"] for t in fr.TARGETS if t["trade"]["symbol"] == "GBPUSD")
         assert gbp["lots"] == 0.15 and gbp["max_stack"] == 1
+        gold = next(t for t in fr.TARGETS if t["trade"]["symbol"] == "XAUUSD")
+        assert gold["committee"] == "fx_commodity_day_desk" and gold["trade"]["lots"] == 0.01
+
+    def test_gold_is_outside_the_correlation_group(self) -> None:
+        assert "XAUUSD" not in fr.EXCLUSIVE_SYMBOL_GROUP
+        assert fr._symbol_currencies("XAUUSD") == {"XAU", "USD"}
 
 
 class TestRunOnceSkipsOnCorrelationConflict:
@@ -1169,7 +1175,7 @@ class TestBrokerTimeToUtc:
 
     def test_halved_lots(self) -> None:
         lots = {t["trade"]["symbol"]: t["trade"]["lots"] for t in fr.TARGETS}
-        assert lots == {"EURUSD": 0.12, "GBPUSD": 0.15}
+        assert lots == {"EURUSD": 0.12, "XAUUSD": 0.01, "GBPUSD": 0.15}
 
 
 # ---------------------------------------------------------------------------

@@ -117,20 +117,27 @@ def pullback_structure(bars: list[dict], direction: str) -> dict | None:
         return None
     sign = 1 if direction == "up" else -1
     extreme_key, origin_key = ("high", "low") if sign == 1 else ("low", "high")
-    pick = max if sign == 1 else min
-    ia = pick(range(len(bars)), key=lambda i: bars[i][extreme_key])
-    if ia == 0:
-        return None
-    ix = (min if sign == 1 else max)(range(ia), key=lambda i: bars[i][origin_key])
-    x, a = bars[ix][origin_key], bars[ia][extreme_key]
+    pick, counter_pick = (max, min) if sign == 1 else (min, max)
+    window_start = 0
+    while True:
+        seg = range(window_start, len(bars))
+        ia = pick(seg, key=lambda i: bars[i][extreme_key])
+        if ia == window_start:
+            return None
+        ix = counter_pick(range(window_start, ia), key=lambda i: bars[i][origin_key])
+        x, a = bars[ix][origin_key], bars[ia][extreme_key]
+        after = bars[ia + 1:]
+        ib = counter_pick(range(ia + 1, len(bars)), key=lambda i: bars[i][origin_key]) if after else ia
+        b = bars[ib][origin_key]
+        # A reaction past the origin is itself the start of a newer impulse:
+        # re-measure from it, so a stale window extreme doesn't void a live setup.
+        if (b - x) * sign <= 0 and len(bars) - ib >= 5:
+            window_start = ib
+            continue
+        break
     leg = abs(a - x)
     if leg == 0:
         return None
-    after = bars[ia + 1:]
-    if after:
-        b = (min if sign == 1 else max)(bar[origin_key] for bar in after)
-    else:
-        b = a
     retrace = abs(a - b) / leg
     current = abs(a - bars[-1]["close"]) / leg
 
@@ -155,7 +162,7 @@ def pullback_structure(bars: list[dict], direction: str) -> dict | None:
         "origin": x, "extreme": a, "reaction_extreme": b,
         "retrace": retrace, "current_retrace": current, "zone": zone,
         "bars_since_extreme": len(after), "volume_ratio": volume_ratio,
-        "origin_at_window_start": ix == 0,
+        "origin_at_window_start": ix == 0 and window_start == 0,
     }
 
 
@@ -207,6 +214,9 @@ def build_data_pack(symbol: str, connection: str, *, now: datetime | None = None
     base, quote_ccy = symbol[:3], symbol[3:6]
     digits = 2 if base in ("XAU", "XAG") else (3 if quote_ccy == "JPY" else 5)
     pip = 0.01 if digits <= 3 else 0.0001
+    unit = "pips"
+    if base in ("XAU", "XAG"):
+        pip, unit = 1.0, "$"
 
     lines = [
         f"# DATA PACK — {symbol} ({connection})",
@@ -228,7 +238,7 @@ def build_data_pack(symbol: str, connection: str, *, now: datetime | None = None
         q = get_quote(symbol, connection).get("quote") or {}
         bid, ask = float(q["bid"]), float(q["ask"])
         lines += ["## Live quote",
-                  f"bid {_fmt(bid, digits)} / ask {_fmt(ask, digits)} — spread {(ask - bid) / pip:.1f} pips", ""]
+                  f"bid {_fmt(bid, digits)} / ask {_fmt(ask, digits)} — spread {(ask - bid) / pip:.{2 if unit == '$' else 1}f} {unit}", ""]
         price = (bid + ask) / 2
     except Exception as exc:
         lines += ["## Live quote", f"(unavailable: {exc})", ""]
@@ -236,7 +246,7 @@ def build_data_pack(symbol: str, connection: str, *, now: datetime | None = None
 
     # Multi-timeframe trend / momentum / volatility
     lines += ["## Trend, momentum, volatility",
-              "| TF | close | EMA20 | EMA50 | trend | RSI14 | ATR14 (pips) |",
+              f"| TF | close | EMA20 | EMA50 | trend | RSI14 | ATR14 ({unit}) |",
               "| --- | ---: | ---: | ---: | --- | ---: | ---: |"]
     daily: list[dict] = []
     h1: list[dict] = []
@@ -297,7 +307,7 @@ def build_data_pack(symbol: str, connection: str, *, now: datetime | None = None
                      f"{', '.join(_fmt(x, digits) for x in below) or 'none in last 3 days'}")
     lines.append("")
 
-    lines += pullback_lines(h1, trends.get("H4"), trends.get("D1"), digits, pip)
+    lines += pullback_lines(h1, trends.get("H4"), trends.get("D1"), digits, pip, unit)
 
     # Dollar & cross-asset
     lines.append("## Dollar and cross-asset (daily closes, same broker)")
@@ -348,7 +358,7 @@ _ZONE_TEXT = {
 
 
 def pullback_lines(h1: list[dict], h4_trend: str | None, d1_trend: str | None,
-                   digits: int, pip: float) -> list[str]:
+                   digits: int, pip: float, unit: str = "pips") -> list[str]:
     """Markdown section reading the H1 pullback against the aligned H4/D1 trend."""
     lines = ["## H1 pullback structure (Gartley 1/3-2/3 retracement check)"]
     if not h1:
@@ -364,7 +374,7 @@ def pullback_lines(h1: list[dict], h4_trend: str | None, d1_trend: str | None,
     leg_pips = abs(p["extreme"] - p["origin"]) / pip
     lines += [
         f"- Impulse ({word}, in the H4/D1 trend direction): origin {_fmt(p['origin'], digits)} -> "
-        f"extreme {_fmt(p['extreme'], digits)} ({leg_pips:.1f} pips)"
+        f"extreme {_fmt(p['extreme'], digits)} ({leg_pips:.1f} {unit})"
         + (" -- origin is at the start of the 120-bar window, so the true impulse may be longer"
            if p["origin_at_window_start"] else ""),
         f"- Pullback so far: reaction {react} {_fmt(p['reaction_extreme'], digits)} = "
