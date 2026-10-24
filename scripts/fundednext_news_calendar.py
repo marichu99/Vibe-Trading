@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -79,6 +80,19 @@ _FOREXFACTORY_TIMEOUT_S = 15.0
 # published SLA, hence the stale-cache/CalendarUnavailable fallbacks below
 # still apply to it exactly as they do to Finnhub.
 _FOREXFACTORY_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+# 2026-10-23 (user's request, after a zero-trade week): real incident
+# 2026-10-21 -- Finnhub's expected/permanent 403 (see module docstring)
+# coincided with a transient ForexFactory ConnectionResetError at the exact
+# moment startup_self_test ran, and that single uncached attempt had no
+# retry, so the loop refused to start for ~2 minutes until the next restart
+# attempt happened to catch both sources healthy. A short retry here is a
+# much better bet than either (a) treating one blip as proof the pipeline
+# is dead, or (b) silently trusting stale cache at boot (which is exactly
+# the failure mode this self-test exists to catch loudly -- see its own
+# docstring). Tests monkeypatch this to 0 to stay fast.
+STARTUP_SELF_TEST_RETRIES = 2
+STARTUP_SELF_TEST_RETRY_DELAY_S = 15.0
 
 
 def _api_key() -> str | None:
@@ -308,36 +322,50 @@ def startup_self_test(*, alert_fn=None) -> bool:
     now-common case of no Finnhub key/access (2026-10-06: Finnhub's
     /calendar/economic now requires a paid plan; a key rotation alone does
     NOT fix that, see D8 follow-up), since ForexFactory alone is enough to
-    run the blackout check. Returns False only when BOTH fail -- logs
-    CRITICAL and, if `alert_fn` is given (the caller's own send_email,
-    passed in rather than imported here to avoid an SMTP-env dependency in
-    this module), sends an alert. The caller decides what to do with a
-    False return (see each reporter's startup: exit(1) rather than proceed
-    to trade on a known-broken check).
+    run the blackout check. Retries up to STARTUP_SELF_TEST_RETRIES times
+    (STARTUP_SELF_TEST_RETRY_DELAY_S apart) before giving up -- a single
+    transient blip on both sources at once (real incident 2026-10-21: a
+    ForexFactory ConnectionResetError landed in the same instant as
+    Finnhub's permanent 403) must not block an entire day's trading when a
+    second attempt moments later would have gone through cleanly. Returns
+    False only when every attempt fails -- logs CRITICAL and, if `alert_fn`
+    is given (the caller's own send_email, passed in rather than imported
+    here to avoid an SMTP-env dependency in this module), sends an alert.
+    The caller decides what to do with a False return (see each reporter's
+    startup: exit(1) rather than proceed to trade on a known-broken check).
     """
-    try:
-        _, source = _fetch_live_events_any_source()
-        if source == "forexfactory":
-            logger.info("news calendar startup self-test: Finnhub unavailable, using ForexFactory fallback")
-        return True
-    except CalendarUnavailable as exc:
-        reason = str(exc)
-        logger.critical("news calendar startup self-test failed: %s", reason)
-        if alert_fn:
-            try:
-                alert_fn(
-                    "[Vibe-Trading] CRITICAL: news calendar startup self-test failed",
-                    "Both the Finnhub economic calendar and the ForexFactory fallback "
-                    "failed at startup:\n\n"
-                    f"{reason}\n\n"
-                    "This process is exiting rather than trading with a known-broken news "
-                    "check. Every pass would fail the news blackout closed (no trades at "
-                    "all) until this is fixed -- check network access to finnhub.io and "
-                    "nfs.faireconomy.media, and restart the reporter.",
+    last_reason = ""
+    for attempt in range(1, STARTUP_SELF_TEST_RETRIES + 1):
+        try:
+            _, source = _fetch_live_events_any_source()
+            if source == "forexfactory":
+                logger.info("news calendar startup self-test: Finnhub unavailable, using ForexFactory fallback")
+            return True
+        except CalendarUnavailable as exc:
+            last_reason = str(exc)
+            if attempt < STARTUP_SELF_TEST_RETRIES:
+                logger.warning(
+                    "news calendar startup self-test attempt %d/%d failed (%s); retrying in %.0fs",
+                    attempt, STARTUP_SELF_TEST_RETRIES, last_reason, STARTUP_SELF_TEST_RETRY_DELAY_S,
                 )
-            except Exception:
-                logger.exception("news calendar startup self-test: alert email failed")
-        return False
+                time.sleep(STARTUP_SELF_TEST_RETRY_DELAY_S)
+
+    logger.critical("news calendar startup self-test failed: %s", last_reason)
+    if alert_fn:
+        try:
+            alert_fn(
+                "[Vibe-Trading] CRITICAL: news calendar startup self-test failed",
+                "Both the Finnhub economic calendar and the ForexFactory fallback "
+                f"failed at startup, across {STARTUP_SELF_TEST_RETRIES} attempts:\n\n"
+                f"{last_reason}\n\n"
+                "This process is exiting rather than trading with a known-broken news "
+                "check. Every pass would fail the news blackout closed (no trades at "
+                "all) until this is fixed -- check network access to finnhub.io and "
+                "nfs.faireconomy.media, and restart the reporter.",
+            )
+        except Exception:
+            logger.exception("news calendar startup self-test: alert email failed")
+    return False
 
 
 def _normalize_events(raw_events: list) -> list[dict]:

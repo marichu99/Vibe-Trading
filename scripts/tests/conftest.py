@@ -36,4 +36,18 @@ def _isolate_strategy_tracking(monkeypatch, tmp_path):
     monkeypatch.setattr(strategy_tracking, "DECISION_LOG_PATH", tmp_path / "decision_log.jsonl")
     monkeypatch.setattr(strategy_tracking, "_mid_price", lambda symbol, connection: None)
     monkeypatch.setattr(strategy_tracking, "trend_gate", lambda symbol, connection: (None, "stubbed in tests"))
+    monkeypatch.setattr(
+        strategy_tracking, "trend_continuation_fallback",
+        lambda symbol, connection: strategy_tracking.TrendFallback(False, reason="stubbed in tests"),
+    )
     monkeypatch.setattr(strategy_tracking, "openrouter_balance_usd", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_news_calendar_retry_delay(monkeypatch):
+    """startup_self_test retries (2026-10-23) sleep between attempts in
+    production; tests zero that out so a test exercising every retry
+    doesn't actually wait STARTUP_SELF_TEST_RETRY_DELAY_S seconds."""
+    import fundednext_news_calendar
+
+    monkeypatch.setattr(fundednext_news_calendar, "STARTUP_SELF_TEST_RETRY_DELAY_S", 0.0)

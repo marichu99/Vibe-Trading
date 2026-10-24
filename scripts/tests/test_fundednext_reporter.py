@@ -1268,9 +1268,45 @@ class TestRunCommitteeRegimeGate:
     def _regime(self, label, action, size_mult=1.0, pct=50.0, reason="x"):
         return fr.strategy_tracking.RegimeResult(label, pct, size_mult, action, reason)
 
+    def test_calm_default_now_invokes_llm_at_half_size(self, monkeypatch) -> None:
+        # 2026-10-23 (user's request, after a zero-trade week): CALM used
+        # to be a flat no-LLM PASS; REGIME_SKIP_CALM's live default is now
+        # False, so a real CALM classification (from classify_regime, not
+        # a hand-built stub) must actually reach _build_prompt, at half
+        # size -- exercised with NO explicit REGIME_SKIP_CALM override, to
+        # catch a regression back to the old always-skip default.
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: fr.strategy_tracking.classify_regime(10.0))
+
+        class _Stop(Exception):
+            pass
+
+        reached = {}
+
+        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
+            reached["trade"] = trade
+            raise _Stop
+
+        monkeypatch.setattr(fr, "_build_prompt", _fake_build_prompt)
+
+        with pytest.raises(_Stop):
+            fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert "regime: CALM" in reached["trade"]["regime_rule"]
+        assert reached["trade"]["lots"] == fr.strategy_tracking.regime_adjusted_lots(
+            self.TRADE["lots"], fr.strategy_tracking.classify_regime(10.0),
+        )
+
     @pytest.mark.parametrize("label,reason", [("CALM", "calm_regime"), ("EXTREME", "extreme_volatility")])
     def test_pass_no_llm_regime_spawns_no_subprocess(self, monkeypatch, label, reason) -> None:
         self._patch_pre_checks_inert(monkeypatch)
+        # 2026-10-23: REGIME_SKIP_CALM's live default flipped to False (CALM
+        # now trades at reduced size); this test verifies the skip
+        # mechanism itself still works when the toggle IS on, independent
+        # of today's live default -- see test_calm_default_now_invokes_llm
+        # below for the new default behavior.
+        monkeypatch.setattr(fr.strategy_tracking, "REGIME_SKIP_CALM", True)
         monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
                              lambda s, c, **k: self._regime(label, "PASS_NO_LLM", 0.0, 92.0, reason))
         monkeypatch.setattr(fr.fn_news, "news_api_status", lambda: "OK")
@@ -1285,7 +1321,7 @@ class TestRunCommitteeRegimeGate:
         assert "DECISION: PASS" in result.report_text
         assert reason in result.report_text
 
-    @pytest.mark.parametrize("label,size_mult", [("NORMAL", 1.0), ("VOLATILE", 0.5)])
+    @pytest.mark.parametrize("label,size_mult", [("NORMAL", 1.0), ("VOLATILE", 0.5), ("CALM", 0.5)])
     def test_invoke_llm_regime_proceeds_to_build_prompt(self, monkeypatch, label, size_mult) -> None:
         self._patch_pre_checks_inert(monkeypatch)
         monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
@@ -1355,6 +1391,40 @@ class TestRunCommitteeRegimeGate:
             self.TRADE["lots"], self._regime("VOLATILE", "INVOKE_LLM", 0.5, pct, "x"),
         )
 
+    def test_trend_fallback_overrides_normal_regime_to_volatile_sizing(self, monkeypatch) -> None:
+        # 2026-10-23 (user's request): the H1 trend-continuation fallback
+        # edge is only offered when H4/D1 disagree, and whenever it's
+        # offered the pass must be downgraded to VOLATILE sizing in code
+        # (0.5x lots), same mechanism as the news-momentum override above --
+        # not just advertised as "mandatory" in the prompt text.
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(fr, "TREND_FILTER_ENABLED", True)
+        monkeypatch.setattr(fr.strategy_tracking, "trend_gate", lambda s, c: (None, "H4 up, D1 down"))
+        fallback = fr.strategy_tracking.TrendFallback(True, h1="down", h4="up", d1="down", reason="x")
+        monkeypatch.setattr(fr.strategy_tracking, "trend_continuation_fallback", lambda s, c: fallback)
+        monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: self._regime("NORMAL", "INVOKE_LLM", 1.0, 50.0, "x"))
+
+        class _Stop(Exception):
+            pass
+
+        reached = {}
+
+        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
+            reached["trade"] = trade
+            raise _Stop
+
+        monkeypatch.setattr(fr, "_build_prompt", _fake_build_prompt)
+
+        with pytest.raises(_Stop):
+            fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert "regime: VOLATILE" in reached["trade"]["regime_rule"]
+        assert "H1 TREND-CONTINUATION FALLBACK" in reached["trade"]["trend_fallback_rule"]
+        assert reached["trade"]["lots"] == fr.strategy_tracking.regime_adjusted_lots(
+            self.TRADE["lots"], self._regime("VOLATILE", "INVOKE_LLM", 0.5, 50.0, "x"),
+        )
+
     @pytest.mark.parametrize("label,toggle_name", [("CALM", "REGIME_SKIP_CALM"), ("EXTREME", "REGIME_SKIP_EXTREME")])
     def test_skip_toggle_off_invokes_llm_anyway(self, monkeypatch, label, toggle_name) -> None:
         # D17 (2026-10-08): flipping the toggle off makes the gate fall
@@ -1401,6 +1471,10 @@ class TestRunCommitteeRegimeGate:
         # from run_committee before any subprocess call). No no_llm flag or
         # validator exemption needed.
         self._patch_pre_checks_inert(monkeypatch)
+        # 2026-10-23: see test_pass_no_llm_regime_spawns_no_subprocess above
+        # for why this is pinned explicitly rather than relying on the
+        # (now-False) live default.
+        monkeypatch.setattr(fr.strategy_tracking, "REGIME_SKIP_CALM", True)
         monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
                              lambda s, c, **k: self._regime(label, "PASS_NO_LLM", 0.0, 92.0, reason))
         monkeypatch.setattr(fr.fn_news, "news_api_status", lambda: "OK")

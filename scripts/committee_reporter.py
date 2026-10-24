@@ -1993,7 +1993,13 @@ _REPORT_FORMAT_TRADE = (
     "UNCONDITIONALLY, including when trading_place_order is denied, blocked, or errors -- report that "
     "outcome ONLY inside ORDER (\"none\") and REASON FOR PASS (quoting the gate's error text verbatim); "
     "never switch to a narrative explanation, a status table, or markdown formatting just because "
-    "something unusual happened on the order call. The swarm's own final decision-maker (the head trader) "
+    "something unusual happened on the order call. There is no conditional, pending, or 'armed' order "
+    "concept -- trading_place_order only supports an immediate market order, full stop. If the entry zone "
+    "or trigger price has not been reached right now, that is a PASS: DECISION must be PASS and ORDER must "
+    "be \"none\"; the unfired level belongs only inside REASON FOR PASS as plain text (e.g. \"entry zone "
+    "1.12047-1.12086 not reached, live price 1.11907\"), never as a separate 'armed'/'conditional' decision, "
+    "a proposed limit order, or a table laying out what would happen if price moved there. The swarm's own "
+    "final decision-maker (the head trader) "
     "already answered in this exact schema -- copy that text verbatim for DECISION/CONFIDENCE/EDGE/"
     "CHECKLIST/INVALIDATION rather than re-deriving or re-wording it yourself; your only added job is "
     "filling in ORDER with the real trading_place_order outcome and INPUT_PROVENANCE/NEWS_API_STATUS with "
@@ -2247,6 +2253,7 @@ def _build_prompt(
     session_bias_fact = _session_bias_fact(symbol)
     session_bias_block = f"{session_bias_fact}\n\n" if session_bias_fact else ""
     trend_block = trade.get("trend_rule", "")
+    trend_fallback_block = trade.get("trend_fallback_rule", "")
     regime_block = trade.get("regime_rule", "")
     strategic_context_block = strategy_tracking.strategic_context_prompt()
 
@@ -2274,6 +2281,7 @@ def _build_prompt(
             f"{journal_block}"
             f"{session_bias_block}"
             f"{trend_block}"
+            f"{trend_fallback_block}"
             f"{regime_block}"
             f"{_DAY_TRADE_FRAMING}"
             f"THIS PASS IS RESEARCH-ONLY: {research_only_reason} Do NOT call trading_place_order under "
@@ -2299,6 +2307,7 @@ def _build_prompt(
         f"{journal_block}"
         f"{session_bias_block}"
         f"{trend_block}"
+        f"{trend_fallback_block}"
         f"{regime_block}"
         f"{_DAY_TRADE_FRAMING}"
         f"{_RULEBOOK_V51_RULES}"
@@ -2416,11 +2425,19 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             research_only = True
 
     trend_allowed = None
+    trend_fallback = None
     if trade and not research_only and TREND_FILTER_ENABLED:
         trend_allowed, trend_reason = strategy_tracking.trend_gate(trade["symbol"], trade["connection"])
         logger.info("trend gate for %s: %s", target, trend_reason)
         if trend_allowed:
             trade = {**trade, "trend_rule": strategy_tracking.trend_rule_prompt(trend_allowed, trend_reason)}
+        else:
+            # 2026-10-23 -- see fundednext_reporter.py's identical fallback
+            # for the full rationale.
+            trend_fallback = strategy_tracking.trend_continuation_fallback(trade["symbol"], trade["connection"])
+            logger.info("trend fallback for %s: %s", target, trend_fallback.reason)
+            if trend_fallback.available:
+                trade = {**trade, "trend_fallback_rule": strategy_tracking.trend_fallback_rule_prompt(trend_fallback)}
 
     # D12 (2026-10-08) -- see fundednext_reporter.py's identical gate for
     # the full rationale.
@@ -2430,6 +2447,17 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             "REGIME_GATE symbol=%s label=%s atr_pct=%.0f action=%s reason=%s",
             trade["symbol"], regime.label, regime.atr_percentile, regime.action, regime.reason,
         )
+        # 2026-10-23 -- see fundednext_reporter.py's identical override for
+        # the full rationale.
+        if regime.label == "NORMAL" and trend_fallback and trend_fallback.available:
+            logger.info(
+                "REGIME_GATE override: NORMAL (atr_pct=%.0f) downgraded to VOLATILE sizing for %s -- "
+                "H4/D1 trend conflict, H1 fallback edge in play", regime.atr_percentile, target,
+            )
+            regime = strategy_tracking.RegimeResult(
+                "VOLATILE", regime.atr_percentile, strategy_tracking.REGIME_VOLATILE_SIZE_MULTIPLIER,
+                "INVOKE_LLM", "trend_fallback_regime_override",
+            )
         # D17 (2026-10-08) -- see fundednext_reporter.py's identical toggle
         # for the full rationale.
         skip = (

@@ -403,6 +403,41 @@ class TestStartupSelfTest:
                              lambda: (_ for _ in ()).throw(RuntimeError("also down")))
         assert fn_news.startup_self_test(alert_fn=None) is False
 
+    def test_retries_a_transient_blip_before_failing(self, monkeypatch) -> None:
+        # 2026-10-23: real incident 2026-10-21 -- a transient ForexFactory
+        # blip coinciding with Finnhub's permanent 403 killed the whole
+        # loop on one bad attempt. First call fails both sources, second
+        # call succeeds -- the self-test must retry rather than give up
+        # after attempt 1.
+        monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+        calls = {"n": 0}
+
+        def _flaky_forexfactory():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("ConnectionResetError")
+            return []
+
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events", _flaky_forexfactory)
+        alerts = []
+        assert fn_news.startup_self_test(alert_fn=lambda *a: alerts.append(a)) is True
+        assert calls["n"] == 2
+        assert alerts == []
+
+    def test_fails_and_alerts_only_after_exhausting_every_retry(self, monkeypatch) -> None:
+        monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+        calls = {"n": 0}
+
+        def _always_down():
+            calls["n"] += 1
+            raise RuntimeError("ConnectionResetError")
+
+        monkeypatch.setattr(fn_news, "_fetch_forexfactory_events", _always_down)
+        alerts = []
+        assert fn_news.startup_self_test(alert_fn=lambda subject, body: alerts.append((subject, body))) is False
+        assert calls["n"] == fn_news.STARTUP_SELF_TEST_RETRIES
+        assert len(alerts) == 1
+
 
 class TestNewsApiStatus:
     """D6/v5.1 (2026-10-06): feeds the committee prompt's NEWS_API_STATUS

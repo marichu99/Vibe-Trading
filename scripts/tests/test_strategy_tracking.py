@@ -13,6 +13,12 @@ import committee_reporter as cr
 import fundednext_reporter as fr
 import strategy_tracking as st
 
+# Captured at collection time, before conftest's autouse fixture stubs
+# st.trend_continuation_fallback for every test (that stub exists so
+# run_committee tests don't hit the real MT5 terminal) -- tests of the
+# function itself call this real reference directly instead.
+_REAL_TREND_CONTINUATION_FALLBACK = st.trend_continuation_fallback
+
 
 class TestParseDecision:
     @pytest.mark.parametrize("line, expected", [
@@ -101,6 +107,63 @@ class TestTrendRulePrompt:
         assert "HARD TREND RULE" in text and "long/buy" in text and "trading_place_order" in text
 
 
+class TestTrendContinuationFallback:
+    """2026-10-23 (user's request): a week with zero trades traced mostly
+    to H4/D1 disagreement starving HTF_TREND_CONTINUATION of any
+    qualifying setup. This fallback only ever RELAXES the edge taxonomy,
+    so unlike trend_gate it must fail CLOSED on any data problem."""
+
+    def _fake_bars_sdk(self, monkeypatch, closes_by_period: dict):
+        def fake_bars(mt5_sdk, config, symbol, period, limit):
+            return [{"close": c} for c in closes_by_period[period]]
+        fake_sdk = types.SimpleNamespace()
+        monkeypatch.setattr(st.mdp, "_config_for", lambda connection: (fake_sdk, None))
+        monkeypatch.setattr(st.mdp, "_bars", fake_bars)
+
+    def _closes(self, label: str) -> list[float]:
+        # mdp.trend_label needs >= 55 closes; build a clean up/down/mixed
+        # series for each label the same way its own docstring describes.
+        if label == "up":
+            return [100.0 + i * 0.1 for i in range(60)]
+        if label == "down":
+            return [100.0 - i * 0.1 for i in range(60)]
+        return [100.0 for _ in range(60)]  # flat -- price==EMA20==EMA50, neither up nor down
+
+    def test_available_when_h4_d1_disagree_but_h1_has_a_clear_trend(self, monkeypatch) -> None:
+        self._fake_bars_sdk(monkeypatch, {"1h": self._closes("down"), "4h": self._closes("up"), "1d": self._closes("down")})
+        result = _REAL_TREND_CONTINUATION_FALLBACK("EURUSD", "mt5-live-trade")
+        assert result.available is True
+        assert result.h1 == "down" and result.h4 == "up" and result.d1 == "down"
+
+    def test_not_available_when_h4_d1_already_aligned(self, monkeypatch) -> None:
+        self._fake_bars_sdk(monkeypatch, {"1h": self._closes("up"), "4h": self._closes("up"), "1d": self._closes("up")})
+        result = _REAL_TREND_CONTINUATION_FALLBACK("EURUSD", "mt5-live-trade")
+        assert result.available is False
+        assert "already aligned" in result.reason
+
+    def test_not_available_when_h1_itself_is_mixed(self, monkeypatch) -> None:
+        self._fake_bars_sdk(monkeypatch, {"1h": self._closes("mixed"), "4h": self._closes("up"), "1d": self._closes("down")})
+        result = _REAL_TREND_CONTINUATION_FALLBACK("EURUSD", "mt5-live-trade")
+        assert result.available is False
+        assert "no clear single-timeframe trend" in result.reason
+
+    def test_fails_closed_on_data_error(self, monkeypatch) -> None:
+        monkeypatch.setattr(st.mdp, "_config_for", lambda connection: (_ for _ in ()).throw(RuntimeError("MT5 down")))
+        result = _REAL_TREND_CONTINUATION_FALLBACK("EURUSD", "mt5-live-trade")
+        assert result.available is False
+        assert "unavailable" in result.reason
+
+
+class TestTrendFallbackRulePrompt:
+    def test_mentions_mandatory_sizing_and_stop_widen(self) -> None:
+        fallback = st.TrendFallback(True, h1="down", h4="up", d1="down", reason="H4/D1 disagree but H1 is a clear downtrend")
+        text = st.trend_fallback_rule_prompt(fallback)
+        assert "H1 TREND-CONTINUATION FALLBACK" in text
+        assert "MANDATORY" in text
+        assert "1.3x" in text
+        assert "n/a -- H1 fallback" in text
+
+
 class TestComputeAtrPercentile:
     """D10 (2026-10-08): deterministic ATR-percentile helper for regime
     detection. Synthetic OHLC series constructed so the True Range is known
@@ -160,8 +223,8 @@ class TestClassifyRegime:
     in strategy_tracking.py)."""
 
     @pytest.mark.parametrize("pct,label,size_mult,action,reason", [
-        (0.0, "CALM", 0.0, "PASS_NO_LLM", "calm_regime"),
-        (24.9, "CALM", 0.0, "PASS_NO_LLM", "calm_regime"),
+        (0.0, "CALM", 0.5, "PASS_NO_LLM", "calm_regime"),
+        (24.9, "CALM", 0.5, "PASS_NO_LLM", "calm_regime"),
         (25.0, "NORMAL", 1.0, "INVOKE_LLM", "normal_regime"),
         (50.0, "NORMAL", 1.0, "INVOKE_LLM", "normal_regime"),
         (74.9, "NORMAL", 1.0, "INVOKE_LLM", "normal_regime"),

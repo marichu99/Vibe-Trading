@@ -2468,9 +2468,39 @@ class TestRunCommitteeRegimeGate:
     def _regime(self, label, action, size_mult=1.0, pct=50.0, reason="x"):
         return cr.strategy_tracking.RegimeResult(label, pct, size_mult, action, reason)
 
+    def test_calm_default_now_invokes_llm_at_half_size(self, monkeypatch) -> None:
+        # 2026-10-23 -- see fundednext_reporter.py's identical test for the
+        # full rationale.
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: cr.strategy_tracking.classify_regime(10.0))
+
+        class _Stop(Exception):
+            pass
+
+        reached = {}
+
+        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
+            reached["trade"] = trade
+            raise _Stop
+
+        monkeypatch.setattr(cr, "_build_prompt", _fake_build_prompt)
+
+        with pytest.raises(_Stop):
+            cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert "regime: CALM" in reached["trade"]["regime_rule"]
+        assert reached["trade"]["lots"] == cr.strategy_tracking.regime_adjusted_lots(
+            self.TRADE["lots"], cr.strategy_tracking.classify_regime(10.0),
+        )
+
     @pytest.mark.parametrize("label,reason", [("CALM", "calm_regime"), ("EXTREME", "extreme_volatility")])
     def test_pass_no_llm_regime_spawns_no_subprocess(self, monkeypatch, label, reason) -> None:
         self._patch_pre_checks_inert(monkeypatch)
+        # 2026-10-23 -- see fundednext_reporter.py's identical test for why
+        # this is pinned explicitly rather than relying on the (now-False)
+        # live default.
+        monkeypatch.setattr(cr.strategy_tracking, "REGIME_SKIP_CALM", True)
         monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
                              lambda s, c, **k: self._regime(label, "PASS_NO_LLM", 0.0, 92.0, reason))
         monkeypatch.setattr(cr.fn_news, "news_api_status", lambda: "OK")
@@ -2485,7 +2515,7 @@ class TestRunCommitteeRegimeGate:
         assert "DECISION: PASS" in result.report_text
         assert reason in result.report_text
 
-    @pytest.mark.parametrize("label,size_mult", [("NORMAL", 1.0), ("VOLATILE", 0.5)])
+    @pytest.mark.parametrize("label,size_mult", [("NORMAL", 1.0), ("VOLATILE", 0.5), ("CALM", 0.5)])
     def test_invoke_llm_regime_proceeds_to_build_prompt(self, monkeypatch, label, size_mult) -> None:
         self._patch_pre_checks_inert(monkeypatch)
         monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
@@ -2515,6 +2545,37 @@ class TestRunCommitteeRegimeGate:
         # rather than silently left untouched.
         assert reached["trade"]["lots"] == cr.strategy_tracking.regime_adjusted_lots(
             self.TRADE["lots"], self._regime(label, "INVOKE_LLM", size_mult, 50.0, "x"),
+        )
+
+    def test_trend_fallback_overrides_normal_regime_to_volatile_sizing(self, monkeypatch) -> None:
+        # 2026-10-23 -- see fundednext_reporter.py's identical test for the
+        # full rationale.
+        self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(cr, "TREND_FILTER_ENABLED", True)
+        monkeypatch.setattr(cr.strategy_tracking, "trend_gate", lambda s, c: (None, "H4 up, D1 down"))
+        fallback = cr.strategy_tracking.TrendFallback(True, h1="down", h4="up", d1="down", reason="x")
+        monkeypatch.setattr(cr.strategy_tracking, "trend_continuation_fallback", lambda s, c: fallback)
+        monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: self._regime("NORMAL", "INVOKE_LLM", 1.0, 50.0, "x"))
+
+        class _Stop(Exception):
+            pass
+
+        reached = {}
+
+        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
+            reached["trade"] = trade
+            raise _Stop
+
+        monkeypatch.setattr(cr, "_build_prompt", _fake_build_prompt)
+
+        with pytest.raises(_Stop):
+            cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert "regime: VOLATILE" in reached["trade"]["regime_rule"]
+        assert "H1 TREND-CONTINUATION FALLBACK" in reached["trade"]["trend_fallback_rule"]
+        assert reached["trade"]["lots"] == cr.strategy_tracking.regime_adjusted_lots(
+            self.TRADE["lots"], self._regime("VOLATILE", "INVOKE_LLM", 0.5, 50.0, "x"),
         )
 
     @pytest.mark.parametrize("label,toggle_name", [("CALM", "REGIME_SKIP_CALM"), ("EXTREME", "REGIME_SKIP_EXTREME")])
@@ -2558,6 +2619,7 @@ class TestRunCommitteeRegimeGate:
         # D15 (2026-10-08) -- see fundednext_reporter.py's identical test
         # for the full rationale.
         self._patch_pre_checks_inert(monkeypatch)
+        monkeypatch.setattr(cr.strategy_tracking, "REGIME_SKIP_CALM", True)
         monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
                              lambda s, c, **k: self._regime(label, "PASS_NO_LLM", 0.0, 92.0, reason))
         monkeypatch.setattr(cr.fn_news, "news_api_status", lambda: "OK")

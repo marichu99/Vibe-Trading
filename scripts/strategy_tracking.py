@@ -145,6 +145,14 @@ REGIME_CALM_MAX_PERCENTILE = 25.0
 REGIME_VOLATILE_MIN_PERCENTILE = 75.0
 REGIME_EXTREME_MIN_PERCENTILE = 90.0
 REGIME_VOLATILE_SIZE_MULTIPLIER = 0.5
+# 2026-10-23 (user's request, after a zero-trade week): same 0.5x reduction
+# as VOLATILE, but for the opposite reason -- not wider stops from danger,
+# but smaller size because a clean, confirmed setup is rarer in a quiet
+# tape and a real breakout from compression can run further than the
+# current (low) ATR implies. Only takes effect when REGIME_SKIP_CALM is
+# False; classify_regime still returns this value unconditionally, same
+# as every other regime, since it stays a pure percentile->label mapping.
+REGIME_CALM_SIZE_MULTIPLIER = 0.5
 # Mirrors the "1.3x" the REGIME ADAPTATION block in fx_commodity_day_desk.yaml
 # tells the LLM to apply to the VOLATILE stop distance -- that yaml prompt is
 # static text, not Python-templated, so this constant and that prompt's
@@ -165,12 +173,20 @@ REGIME_LOOKBACK = 100
 # broker will record, instead of drifting from it by a step and
 # self-triggering a false spec-violation halt.
 REGIME_LOT_STEP = 0.01
-# When True (default), a CALM/EXTREME regime short-circuits to a no-LLM PASS
+# When True, a CALM/EXTREME regime short-circuits to a no-LLM PASS
 # (run_committee's regime gate). Set False to still invoke the LLM in that
 # regime -- useful for A/B-style comparison without touching the gate logic
 # itself. Checked only in run_committee, not inside classify_regime (which
 # stays a pure percentile->label mapping with no behavioral toggle).
-REGIME_SKIP_CALM = True
+#
+# REGIME_SKIP_CALM flipped to False 2026-10-23 (user's request, after a
+# zero-trade week): CALM was pure opportunity cost -- a compressed, quiet
+# tape can still produce a clean HTF_LEVEL_REJECTION/SESSION_RANGE_BREAKOUT
+# setup, and the regime gate was refusing to even let the LLM look.
+# REGIME_CALM_SIZE_MULTIPLIER above (0.5x, same as VOLATILE) and the yaml
+# preset's REGIME ADAPTATION CALM rule are the compensating risk control --
+# this is not a free lunch, it's "look, but size down and be stricter."
+REGIME_SKIP_CALM = False
 REGIME_SKIP_EXTREME = True
 
 logger = logging.getLogger(__name__)
@@ -427,6 +443,68 @@ def trend_rule_prompt(allowed: set[str], reason: str) -> str:
     )
 
 
+@dataclass
+class TrendFallback:
+    available: bool
+    h1: str = "n/a"
+    h4: str = "n/a"
+    d1: str = "n/a"
+    reason: str = ""
+
+
+def trend_continuation_fallback(symbol: str, connection: str) -> TrendFallback:
+    """When H4 and D1 disagree (trend_gate above found no restriction),
+    check whether H1 alone shows a clear trend that HTF_TREND_CONTINUATION
+    may use as a lower-conviction fallback edge.
+
+    Added 2026-10-23 (user's request, after a week of zero trades traced
+    mostly to H4/D1 conflicts starving HTF_TREND_CONTINUATION of any
+    qualifying setup, with HTF_LEVEL_REJECTION/SESSION_RANGE_BREAKOUT also
+    not firing). Unlike trend_gate, this function fails CLOSED: it only
+    ever RELAXES the edge taxonomy (opens up a setup that would otherwise
+    be a flat PASS), so an unreadable or ambiguous H1 read must not expand
+    risk-taking the way trend_gate's fail-open philosophy is allowed to for
+    a *restriction*.
+    """
+    try:
+        mt5_sdk, config = mdp._config_for(connection)
+        labels = {}
+        for period, label in (("1h", "H1"), ("4h", "H4"), ("1d", "D1")):
+            closes = [b["close"] for b in mdp._bars(mt5_sdk, config, symbol, period, mdp.TREND_BARS)]
+            labels[label] = mdp.trend_label(closes)
+    except Exception as exc:
+        return TrendFallback(False, reason=f"H1 trend-fallback unavailable ({exc})")
+    if labels["H4"] == labels["D1"]:
+        return TrendFallback(
+            False, labels["H1"], labels["H4"], labels["D1"],
+            "H4/D1 already aligned -- standard HTF_TREND_CONTINUATION applies, no fallback needed",
+        )
+    if labels["H1"] not in ("up", "down"):
+        return TrendFallback(
+            False, labels["H1"], labels["H4"], labels["D1"],
+            f"H1 trend is '{labels['H1']}' -- no clear single-timeframe trend to fall back to",
+        )
+    return TrendFallback(
+        True, labels["H1"], labels["H4"], labels["D1"],
+        f"H4/D1 disagree (H4 {labels['H4']}, D1 {labels['D1']}) but H1 is a clear {labels['H1']}trend",
+    )
+
+
+def trend_fallback_rule_prompt(fallback: TrendFallback) -> str:
+    return (
+        f"H1 TREND-CONTINUATION FALLBACK (verified fact, computed in code before you were invoked): "
+        f"{fallback.reason}. HTF_TREND_CONTINUATION may still be used off this H1 trend alone, under the "
+        f"SAME pullback/Gartley depth rules as always (the data pack's H1 pullback structure section), but "
+        f"this is a lower-conviction setup than full H4/D1 alignment, so it is MANDATORY regardless of what "
+        f"the REGIME verified fact below says: this pass has already been downgraded to VOLATILE sizing in "
+        f"code (0.5x size, already applied to the quantity below -- do not ask for more) and you must widen "
+        f"the stop 1.3x versus the normal 1.2x-ATR rule, exactly like an ordinary VOLATILE pass. Recompute "
+        f"net reward:risk on this WIDENED stop; if it falls below 1.5, PASS. Checklist item 1 may be "
+        f"answered 'n/a -- H1 fallback, H4/D1 disagree' instead of forcing a PASS purely for timeframe "
+        f"conflict.\n\n"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Regime detection (D10, 2026-10-08): deterministic, code-level ATR-percentile
 # classifier -- see classify_regime below for the label/action mapping this
@@ -498,7 +576,7 @@ def classify_regime(atr_percentile: float | None) -> RegimeResult:
         logger.warning("REGIME_PERCENTILE_UNAVAILABLE: insufficient ATR history, defaulting to NORMAL")
         return RegimeResult("NORMAL", 50.0, 1.0, "INVOKE_LLM", "insufficient_history_default_normal")
     if atr_percentile < REGIME_CALM_MAX_PERCENTILE:
-        return RegimeResult("CALM", atr_percentile, 0.0, "PASS_NO_LLM", "calm_regime")
+        return RegimeResult("CALM", atr_percentile, REGIME_CALM_SIZE_MULTIPLIER, "PASS_NO_LLM", "calm_regime")
     if atr_percentile < REGIME_VOLATILE_MIN_PERCENTILE:
         return RegimeResult("NORMAL", atr_percentile, 1.0, "INVOKE_LLM", "normal_regime")
     if atr_percentile <= REGIME_EXTREME_MIN_PERCENTILE:
