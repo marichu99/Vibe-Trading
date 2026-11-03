@@ -145,6 +145,20 @@ def test_unknown_fill_on_quantity_drift(live_runtime: Path) -> None:
     assert report.requires_halt is True
 
 
+def test_unknown_fill_on_position_vanished_entirely(live_runtime: Path) -> None:
+    """A recorded non-zero position the broker no longer reports at all (not even
+    a zero-qty row — most broker APIs simply omit a flat symbol) must still
+    surface as unknown_fill, not silently disappear from the diff with zero
+    deltas raised."""
+    _seed_state("robinhood", positions=[{"symbol": "NVDA", "qty": 3}])
+    rp, rb, ro = _readers(positions=[])
+    report = reconcile("robinhood", rp, rb, ro)
+
+    assert DeltaKind.UNKNOWN_FILL in _kinds(report)
+    assert report.requires_halt is True
+    assert report.is_safe is False
+
+
 # ---------------------------------------------------------------------------
 # orphan_order  (we recorded a CONFIRMED order the broker no longer shows)
 # ---------------------------------------------------------------------------

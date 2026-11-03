@@ -446,7 +446,15 @@ def _diff_positions(
 
     A broker position (or quantity) we have no record of is an ``unknown_fill``:
     real money moved without a matching audit record. A recorded position that
-    still matches broker truth is ``matched``.
+    still matches broker truth is ``matched``. Symmetrically, a recorded
+    *non-zero* position the broker no longer reports at all is ALSO an
+    ``unknown_fill``: most broker APIs simply omit a flat symbol from the
+    positions list rather than echoing a zero-quantity row, so a position that
+    was fully closed while the process was down (stopped out, liquidated,
+    closed through another channel) would otherwise never appear in either
+    side of this diff and vanish from reconciliation with zero deltas raised —
+    exactly the silent money-moved-without-audit case this module exists to
+    catch.
 
     Args:
         recorded_positions: Positions we persisted before shutdown.
@@ -463,10 +471,12 @@ def _diff_positions(
     }
 
     deltas: list[ReconcileDelta] = []
+    seen_symbols: set[str] = set()
     for position in broker_positions:
         symbol = _position_symbol(position)
         if symbol is None:
             continue
+        seen_symbols.add(symbol)
         broker_qty = _position_qty(position)
         recorded_qty = recorded_by_symbol.get(symbol)
         if recorded_qty is not None and recorded_qty == broker_qty:
@@ -501,6 +511,25 @@ def _diff_positions(
                     broker=dict(position),
                 )
             )
+
+    for symbol, recorded_qty in recorded_by_symbol.items():
+        if symbol in seen_symbols or recorded_qty == 0:
+            continue
+        deltas.append(
+            ReconcileDelta(
+                kind=DeltaKind.UNKNOWN_FILL,
+                subject="position",
+                identity=symbol,
+                client_order_id=None,
+                detail=(
+                    f"recorded position (qty={recorded_qty}) no longer reported by "
+                    "the broker at all (fully closed while down); real money moved "
+                    "without a matching audit record"
+                ),
+                recorded={"symbol": symbol, "qty": recorded_qty},
+                broker=None,
+            )
+        )
     return deltas
 
 
