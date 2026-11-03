@@ -70,8 +70,14 @@ def _write_alpha(zoo_dir: Path, short_id: str, zoo_id: str, *, body: str = GOOD_
 
 
 @pytest.fixture
-def mini_zoo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Build a fake zoo tree and make src.factors.zoo resolve into it."""
+def mini_zoo(tmp_path: Path) -> Path:
+    """Build a fake zoo tree for a ``Registry`` pointed at a non-default root.
+
+    A non-default ``zoo_root`` makes ``Registry`` load modules by file path
+    (``importlib.util.spec_from_file_location``), not by package name — see
+    ``Registry._load_module``. So the fake tree never needs to be importable
+    as `src.factors.zoo...`; no ``sys.path``/symlink wiring is needed.
+    """
     zoo_root = tmp_path / "factors" / "zoo"
     fake_zoo = zoo_root / "fakezoo"
     fake_zoo.mkdir(parents=True)
@@ -84,12 +90,6 @@ def mini_zoo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     _write_alpha(fake_zoo, "alpha_003", "fakezoo", body=BAD_COMPUTE_WRONG_TYPE)
     _write_alpha(fake_zoo, "alpha_004", "fakezoo", body=BAD_COMPUTE_INF)
 
-    # Make `src.factors.zoo.fakezoo.<id>` importable from tmp_path's tree by
-    # monkey-patching sys.path to include tmp_path, then creating an `src`
-    # alias that points to `factors/`-as-`src.factors`.
-    src_alias = tmp_path / "src"
-    src_alias.symlink_to(tmp_path)
-    monkeypatch.syspath_prepend(str(tmp_path))
     # Reset any cached modules from previous test
     for mod_name in list(sys.modules):
         if mod_name.startswith("src.factors.zoo.fakezoo"):

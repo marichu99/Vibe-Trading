@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -365,6 +366,10 @@ def test_settings_writes_reject_remote_dev_mode_clients(
     assert not env_path.exists()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="NTFS has no POSIX permission bits to assert against",
+)
 def test_update_settings_writes_env_file_with_0600_mode(
     client: TestClient, tmp_path: Path,
 ) -> None:
@@ -403,6 +408,10 @@ def test_atomic_write_secret_is_crash_safe(
     assert list(tmp_path.glob(".env.*")) == []
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="NTFS has no POSIX permission bits to assert against",
+)
 def test_atomic_write_secret_creates_0600_file(tmp_path: Path) -> None:
     """Fresh secret files are created owner-only via the atomic path."""
     from src.api import helpers

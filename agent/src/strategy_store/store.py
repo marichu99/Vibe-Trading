@@ -194,19 +194,20 @@ class InMemoryStrategyStore:
         limit: int = 100,
     ) -> Sequence[Artifact]:
         """List artifacts with composable filters, newest first."""
-        results: list[Artifact] = []
-        for art in self._artifacts.values():
+        results: list[tuple[int, Artifact]] = []
+        for idx, art in enumerate(self._artifacts.values()):
             if type is not None and art.type != type:
                 continue
             if status is not None and art.status != status:
                 continue
             if universe is not None and art.universe != universe:
                 continue
-            results.append(art)
+            results.append((idx, art))
 
-        # Sort by created_at descending (newest first).
-        results.sort(key=lambda a: a.created_at or "", reverse=True)
-        return results[:limit]
+        # Sort by created_at descending (newest first); break ties by
+        # insertion order, since equal-resolution timestamps are common.
+        results.sort(key=lambda pair: (pair[1].created_at or "", pair[0]), reverse=True)
+        return [art for _, art in results[:limit]]
 
     @_synchronized
     def update_status(
@@ -284,7 +285,9 @@ class InMemoryStrategyStore:
     ) -> Sequence[BenchResult]:
         """Return bench results for an artifact, newest first."""
         matched = [r for r in self._bench_results if r.artifact_id == artifact_id]
-        matched.sort(key=lambda r: r.created_at or "", reverse=True)
+        # Break ties on created_at by id, since equal-resolution timestamps
+        # are common when records are inserted in quick succession.
+        matched.sort(key=lambda r: (r.created_at or "", r.id or 0), reverse=True)
         return matched[:limit]
 
     # -- Decay snapshots -----------------------------------------------------
@@ -312,5 +315,7 @@ class InMemoryStrategyStore:
     ) -> Sequence[DecaySnapshot]:
         """Return decay snapshots for an artifact, newest first."""
         matched = [s for s in self._decay_snapshots if s.artifact_id == artifact_id]
-        matched.sort(key=lambda s: s.created_at or "", reverse=True)
+        # Break ties on created_at by id, since equal-resolution timestamps
+        # are common when records are inserted in quick succession.
+        matched.sort(key=lambda s: (s.created_at or "", s.id or 0), reverse=True)
         return matched[:limit]

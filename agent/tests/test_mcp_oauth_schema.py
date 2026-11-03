@@ -272,7 +272,7 @@ def test_build_client_uses_explicit_init_timeout_without_widening_tool_timeout()
     client = _build_client(cfg)
 
     assert client._init_timeout == 300
-    assert client._session_kwargs["read_timeout_seconds"].total_seconds() == 7
+    assert client._session_kwargs["read_timeout_seconds"] == 7
 
 
 def test_build_client_keeps_default_init_timeout_floor() -> None:
@@ -287,7 +287,7 @@ def test_build_client_keeps_default_init_timeout_floor() -> None:
     client = _build_client(cfg)
 
     assert client._init_timeout == 30
-    assert client._session_kwargs["read_timeout_seconds"].total_seconds() == 7
+    assert client._session_kwargs["read_timeout_seconds"] == 7
 
 
 def test_static_header_http_path_unchanged() -> None:

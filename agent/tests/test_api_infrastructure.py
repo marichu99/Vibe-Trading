@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 import api_server
@@ -235,6 +237,10 @@ def test_settings_default_to_user_writable_config_path() -> None:
     assert helpers.LEGACY_ENV_PATH == helpers.AGENT_DIR / ".env"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="NTFS has no POSIX permission bits to assert against",
+)
 def test_write_env_values_creates_private_parent_directory(tmp_path) -> None:
     target = tmp_path / "nested" / ".env"
 

@@ -97,7 +97,8 @@ def _atomic_write_secret(path: Path, content: str) -> None:
         return
     try:
         os.write(fd, data)
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
     finally:
         os.close(fd)
     try:

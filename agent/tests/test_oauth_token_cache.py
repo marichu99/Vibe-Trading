@@ -264,7 +264,7 @@ def test_cache_expiry_surfaces_reauth_no_silent_stale_call() -> None:
     from src.tools.mcp import MCPServerAdapter
 
     # 401 Unauthorized → an auth failure the provider could not silently refresh.
-    auth_error = McpError(
+    auth_error = McpError.from_error_data(
         mcp_types.ErrorData(code=-32001, message="401 Unauthorized: token expired, re-auth required")
     )
 

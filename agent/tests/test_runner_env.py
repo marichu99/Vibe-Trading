@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,32 @@ from src.core.runner import (
     _prepare_sandbox_home,
     _resolve_sandbox_credentials,
 )
+
+
+def _symlinks_supported() -> bool:
+    """Probe whether this process can create symlinks right now.
+
+    Unprivileged Windows processes (no admin, no Developer Mode) raise
+    ``OSError: [WinError 1314]`` on ``symlink_to`` — ``_prepare_sandbox_home``
+    treats that as best-effort and silently skips the re-exposed path, so the
+    behavior this test pins doesn't hold there.
+    """
+    probe_dir = Path(tempfile.mkdtemp(prefix="vibe-symlink-probe-"))
+    try:
+        target = probe_dir / "target"
+        target.mkdir()
+        link = probe_dir / "link"
+        link.symlink_to(target, target_is_directory=True)
+        return True
+    except OSError:
+        return False
+    finally:
+        import shutil
+
+        shutil.rmtree(probe_dir, ignore_errors=True)
+
+
+_SYMLINKS_SUPPORTED = _symlinks_supported()
 
 
 def test_backtest_runtime_env_keeps_market_data_configuration(
@@ -110,6 +137,10 @@ def test_sandbox_credentials_absent_in_this_environment() -> None:
     assert _resolve_sandbox_credentials() is None
 
 
+@pytest.mark.skipif(
+    not _SYMLINKS_SUPPORTED,
+    reason="requires symlink privilege (admin or Developer Mode on Windows)",
+)
 def test_prepare_sandbox_home_reexposes_only_loader_paths(tmp_path: Path) -> None:
     real_home = tmp_path / "home"
     vt = real_home / ".vibe-trading"
