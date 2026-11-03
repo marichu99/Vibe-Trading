@@ -2051,6 +2051,25 @@ class TestHandleFilledOrder:
         # D13 (2026-10-08) -- see fundednext_reporter.py's identical test
         # for the full rationale.
         assert order["regime"] == "NORMAL"
+        # D-repair (2026-10-29) -- see fundednext_reporter.py's identical test.
+        assert order["edge"] == "unknown"
+
+    def test_journals_the_edge_label_from_report_text(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(cr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: None)
+        order = {"symbol": "EURUSDm", "side": "buy", "quantity": 0.01, "order_id": "6",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+        report = "DECISION: LONG\nEDGE: HTF_LEVEL_REJECTION, rejected prior day low\nREASON FOR PASS: n/a -- trade taken"
+
+        cr._handle_filled_order(self.TRADE, order, {"buy"}, report_text=report)
+
+        assert order["edge"] == "HTF_LEVEL_REJECTION"
 
     def test_journals_the_trade_s_regime_label_when_present(self, monkeypatch) -> None:
         monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
@@ -2453,6 +2472,45 @@ class TestRunCommitteeDataPackGate:
         assert "data_pack_unavailable" in result.report_text
 
 
+class TestRunCommitteeNewsBlackoutCurrencies:
+    """2026-11-03: run_committee used to derive is_news_blackout's currency
+    set with a raw ``{symbol[:3], symbol[3:6]}`` slice instead of
+    strategy_tracking.symbol_currencies — no isalpha filter, no .upper().
+    Every currently-configured TARGETS symbol happens to already be
+    uppercase with its broker suffix landing after index 6, so the bug never
+    fired live, but a lowercase symbol would silently derive {"eur", "usd"}
+    (never matching fn_news's uppercase currency codes) and the blackout
+    check would just never trigger — fail-open in exactly the one place a
+    news check must not be. Pins that the real, hardened helper is used."""
+
+    def _patch_pre_checks_inert(self, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "_live_circuit_breaker_check", lambda trade: None)
+        monkeypatch.setattr(cr, "_exclusive_group_conflict", lambda trade: None)
+        monkeypatch.setattr(cr, "TREND_FILTER_ENABLED", False)
+        monkeypatch.setattr(cr, "_build_prompt", lambda *a, **k: None)
+        # Avoid a real live MT5 call from the regime gate (see
+        # TestRunCommitteeDataPackGate's identical stub for the full
+        # rationale) — this test only cares about the news-blackout call's
+        # currency argument, not regime behavior.
+        monkeypatch.setattr(cr.strategy_tracking, "regime_for_symbol",
+                             lambda s, c, **k: cr.strategy_tracking.RegimeResult("NORMAL", 50.0, 1.0, "INVOKE_LLM", "normal_regime"))
+
+    def test_uses_hardened_symbol_currencies_helper(self, monkeypatch) -> None:
+        self._patch_pre_checks_inert(monkeypatch)
+        calls = []
+
+        def _capture(currencies, **kwargs):
+            calls.append(currencies)
+            return False, None
+
+        monkeypatch.setattr(cr.fn_news, "is_news_blackout", _capture)
+
+        trade = {"symbol": "eurusdm", "connection": "mt5-live-trade", "lots": 0.01, "max_stack": 1}
+        cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=trade)
+
+        assert calls == [{"EUR", "USD"}]
+
+
 class TestRunCommitteeRegimeGate:
     """D12 (2026-10-08) -- see fundednext_reporter.py's identical test class
     for the full rationale."""
@@ -2798,6 +2856,51 @@ class TestRunCommitteeMalformedOutputGate:
         assert "MALFORMED_OUTPUT" in result.error
         assert "MODE" in result.error
 
+    def test_malformed_output_retries_once_and_recovers(self, monkeypatch) -> None:
+        # D-repair (2026-10-27): see fundednext_reporter.py's identical test
+        # for the full rationale -- a real MALFORMED_OUTPUT pass places no
+        # order, so retrying the identical prompt once is safe.
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")
+        answers = iter([broken, self.VALID_REPORT])
+        popen_calls = []
+
+        self._patch_run(monkeypatch, report_text=broken)
+        monkeypatch.setattr(cr, "_read_final_answer", lambda run_id: next(answers))
+
+        import json as _json
+        payload = _json.dumps({"status": "success", "run_id": "fake-run-1"})
+
+        def _counting_popen(*a, **k):
+            popen_calls.append(1)
+            return _FakePopen(payload)
+
+        monkeypatch.setattr(cr.subprocess, "Popen", _counting_popen)
+
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert len(popen_calls) == 2
+        assert result.status == "success"
+
+    def test_malformed_output_twice_in_a_row_still_fails(self, monkeypatch) -> None:
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")
+        popen_calls = []
+        self._patch_run(monkeypatch, report_text=broken)
+
+        import json as _json
+        payload = _json.dumps({"status": "success", "run_id": "fake-run-1"})
+
+        def _counting_popen(*a, **k):
+            popen_calls.append(1)
+            return _FakePopen(payload)
+
+        monkeypatch.setattr(cr.subprocess, "Popen", _counting_popen)
+
+        result = cr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert len(popen_calls) == 2
+        assert result.status == "error"
+        assert "MALFORMED_OUTPUT" in result.error
+
     def test_rejection_with_no_order_placed_journals_nothing(self, monkeypatch, tmp_path) -> None:
         monkeypatch.setattr(cr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
         broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")
@@ -2834,6 +2937,11 @@ class TestRunCommitteeMalformedOutputGate:
         assert "MALFORMED_OUTPUT" in result.error
         assert result.traded is True  # but the real fill is not lost
         assert len(cr._read_journal()) == 1
+        # D-repair (2026-10-27): see fundednext_reporter.py's identical
+        # assertion for the full rationale.
+        assert "ORDER CONFIRMATION" in result.error
+        assert "BUY 0.01 lots EURUSDm" in result.error
+        assert "stop_loss=1.1" in result.error
 
 
 class TestLogEmailedRegimeParsing:
@@ -2884,3 +2992,43 @@ class TestRunOnceRecordsRegime:
         cr.run_once("new_york")
 
         assert seen.get("regime") == "EXTREME"
+
+
+class TestScorecardHtml:
+    """D-repair (2026-10-29) -- see fundednext_reporter.py's identical test."""
+
+    def test_empty_card(self) -> None:
+        html = cr._scorecard_html(cr.strategy_tracking.scorecard([]))
+        assert "No closed trades yet" in html
+        assert "<pre" not in html
+
+    def test_renders_table_rows(self) -> None:
+        journal = [
+            {"symbol": "EURUSDm", "status": "closed", "outcome": "win", "profit": 40.0,
+             "edge": "HTF_TREND_CONTINUATION", "side": "sell", "entry_price": 1.10, "stop_loss": 1.102,
+             "take_profit": 1.096, "exit_price": 1.096},
+        ]
+        html = cr._scorecard_html(cr.strategy_tracking.scorecard(journal))
+        assert "<table" in html
+        assert "<pre" not in html
+        assert "EURUSDm" in html and "HTF_TREND_CONTINUATION" in html
+
+
+class TestModelOverrideFor:
+    def test_research_only_stays_on_haiku_even_if_volatile(self) -> None:
+        assert cr._model_override_for(True, "VOLATILE") == cr._LLM_MODEL_HAIKU
+
+    def test_live_volatile_routes_to_sonnet(self) -> None:
+        assert cr._model_override_for(False, "VOLATILE") == cr._LLM_MODEL_SONNET
+
+    def test_live_extreme_routes_to_sonnet(self) -> None:
+        assert cr._model_override_for(False, "EXTREME") == cr._LLM_MODEL_SONNET
+
+    def test_live_normal_stays_on_haiku(self) -> None:
+        assert cr._model_override_for(False, "NORMAL") == cr._LLM_MODEL_HAIKU
+
+    def test_live_calm_stays_on_haiku(self) -> None:
+        assert cr._model_override_for(False, "CALM") == cr._LLM_MODEL_HAIKU
+
+    def test_no_regime_label_stays_on_haiku(self) -> None:
+        assert cr._model_override_for(False, None) == cr._LLM_MODEL_HAIKU

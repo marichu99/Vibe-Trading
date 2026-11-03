@@ -780,6 +780,26 @@ class TestHandleFilledOrder:
         # D13 (2026-10-08): no regime_label on trade -> defaults to NORMAL,
         # same fallback classify_regime itself uses for missing data.
         assert order["regime"] == "NORMAL"
+        # D-repair (2026-10-29): no report_text passed -> parse_edge's own
+        # "no EDGE line" fallback, same as classify_regime's None-input one.
+        assert order["edge"] == "unknown"
+
+    def test_journals_the_edge_label_from_report_text(self, monkeypatch) -> None:
+        monkeypatch.setattr(fr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(fr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_journal_record_open", lambda symbol, connection, order: None)
+        order = {"symbol": "EURUSD", "side": "buy", "quantity": 0.24, "order_id": "5",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+        report = "DECISION: LONG\nEDGE: HTF_TREND_CONTINUATION, pullback in Gartley zone\nREASON FOR PASS: n/a -- trade taken"
+
+        fr._handle_filled_order(self.TRADE, order, {"buy"}, report_text=report)
+
+        assert order["edge"] == "HTF_TREND_CONTINUATION"
 
     def test_journals_the_trade_s_regime_label_when_present(self, monkeypatch) -> None:
         monkeypatch.setattr(fr, "_enforce_trend_rule", lambda *a, **k: "")
@@ -1649,6 +1669,53 @@ class TestRunCommitteeMalformedOutputGate:
         assert "MALFORMED_OUTPUT" in result.error
         assert "MODE" in result.error
 
+    def test_malformed_output_retries_once_and_recovers(self, monkeypatch) -> None:
+        # D-repair (2026-10-27): a real MALFORMED_OUTPUT pass places no order
+        # (confirmed across all 5 recorded incidents -- see fundednext_reporter
+        # history.log Oct 7/8/16/23/26), so re-running the identical prompt
+        # once is safe and recovers most of these instead of burning the pass
+        # as an email-only error.
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")
+        answers = iter([broken, self.VALID_REPORT])
+        popen_calls = []
+
+        self._patch_run(monkeypatch, report_text=broken)
+        monkeypatch.setattr(fr, "_read_final_answer", lambda run_id: next(answers))
+
+        import json as _json
+        payload = _json.dumps({"status": "success", "run_id": "fake-run-1"})
+
+        def _counting_popen(*a, **k):
+            popen_calls.append(1)
+            return _FakePopen(payload)
+
+        monkeypatch.setattr(fr.subprocess, "Popen", _counting_popen)
+
+        result = fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert len(popen_calls) == 2
+        assert result.status == "success"
+
+    def test_malformed_output_twice_in_a_row_still_fails(self, monkeypatch) -> None:
+        broken = self.VALID_REPORT.replace("MODE: LIVE\n", "")
+        popen_calls = []
+        self._patch_run(monkeypatch, report_text=broken)
+
+        import json as _json
+        payload = _json.dumps({"status": "success", "run_id": "fake-run-1"})
+
+        def _counting_popen(*a, **k):
+            popen_calls.append(1)
+            return _FakePopen(payload)
+
+        monkeypatch.setattr(fr.subprocess, "Popen", _counting_popen)
+
+        result = fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert len(popen_calls) == 2
+        assert result.status == "error"
+        assert "MALFORMED_OUTPUT" in result.error
+
     def test_rejection_with_a_real_fill_still_journals_it(self, monkeypatch, tmp_path) -> None:
         monkeypatch.setattr(fr, "TRADE_JOURNAL_PATH", tmp_path / "journal.json")
         monkeypatch.setattr(fn_state, "STATE_PATH", tmp_path / "state.json")
@@ -1670,6 +1737,13 @@ class TestRunCommitteeMalformedOutputGate:
         assert result.status == "error"
         assert result.traded is True
         assert len(fr._read_journal()) == 1
+        # D-repair (2026-10-27): real incident -- _format_body/_format_body_html
+        # only render result.error for a non-success result, so the actual fill
+        # must be summarized there too, not just journaled, or the email reads
+        # as if nothing happened despite a live order going out.
+        assert "ORDER CONFIRMATION" in result.error
+        assert "BUY 0.24 lots EURUSD" in result.error
+        assert "stop_loss=1.1" in result.error
 
 
 class TestLogEmailedRegimeParsing:
@@ -1776,3 +1850,44 @@ class TestStatusReportHtmlStyling:
         assert "FundedNext Status" in html
         assert "<pre" not in html
         assert "white-space:pre-wrap" not in html
+
+
+class TestScorecardHtml:
+    def test_empty_card(self) -> None:
+        html = fr._scorecard_html(fr.strategy_tracking.scorecard([]))
+        assert "No closed trades yet" in html
+        assert "<pre" not in html
+
+    def test_renders_table_rows(self) -> None:
+        journal = [
+            {"symbol": "EURUSD", "status": "closed", "outcome": "win", "profit": 40.0,
+             "edge": "HTF_TREND_CONTINUATION", "side": "sell", "entry_price": 1.10, "stop_loss": 1.102,
+             "take_profit": 1.096, "exit_price": 1.096},
+        ]
+        html = fr._scorecard_html(fr.strategy_tracking.scorecard(journal))
+        assert "<table" in html
+        assert "<pre" not in html
+        assert "EURUSD" in html and "HTF_TREND_CONTINUATION" in html
+
+
+class TestModelOverrideFor:
+    def test_research_only_stays_on_haiku_even_if_volatile(self) -> None:
+        assert fr._model_override_for(True, "VOLATILE") == fr._LLM_MODEL_HAIKU
+
+    def test_live_volatile_routes_to_sonnet(self) -> None:
+        assert fr._model_override_for(False, "VOLATILE") == fr._LLM_MODEL_SONNET
+
+    def test_live_normal_stays_on_haiku(self) -> None:
+        assert fr._model_override_for(False, "NORMAL") == fr._LLM_MODEL_HAIKU
+
+    def test_live_calm_stays_on_haiku(self) -> None:
+        assert fr._model_override_for(False, "CALM") == fr._LLM_MODEL_HAIKU
+
+    def test_live_extreme_routes_to_sonnet(self) -> None:
+        # EXTREME only ever reaches the LLM via a deliberate
+        # REGIME_SKIP_EXTREME=False override -- route it with VOLATILE,
+        # not left to the Haiku default.
+        assert fr._model_override_for(False, "EXTREME") == fr._LLM_MODEL_SONNET
+
+    def test_no_regime_label_stays_on_haiku(self) -> None:
+        assert fr._model_override_for(False, None) == fr._LLM_MODEL_HAIKU

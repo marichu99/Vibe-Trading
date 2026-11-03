@@ -37,6 +37,114 @@ class TestParseDecision:
         assert st.parse_decision(f"blah\n{line}\nReasoning: x") == expected
 
 
+class TestParseEdge:
+    """D-repair (2026-10-29, user's request): the per-trade scorecard needs
+    to know which named edge took each trade -- this is what extracts that
+    label from the report text at journal-write time."""
+
+    @pytest.mark.parametrize("report, expected", [
+        ("DECISION: SHORT\nEDGE: HTF_TREND_CONTINUATION, pullback in Gartley zone\nREST: x", "HTF_TREND_CONTINUATION"),
+        ("EDGE: HTF_LEVEL_REJECTION, rejected prior day high\n", "HTF_LEVEL_REJECTION"),
+        ("EDGE: SESSION_RANGE_BREAKOUT, broke NY open range\n", "SESSION_RANGE_BREAKOUT"),
+        ("EDGE: NEWS_MOMENTUM, confirmed break of post-release range\n", "NEWS_MOMENTUM"),
+        ("**EDGE:** HTF_TREND_CONTINUATION, bold-wrapped label\n", "HTF_TREND_CONTINUATION"),
+        ("EDGE: none, no setup qualified\n", "unknown"),
+        ("EDGE: SOME_FUTURE_LABEL, not in EDGE_LABELS yet\n", "unknown"),
+        ("no edge line at all", "unknown"),
+        ("", "unknown"),
+    ])
+    def test_extracts_label(self, report, expected) -> None:
+        assert st.parse_edge(report) == expected
+
+
+class TestSymbolCurrencies:
+    """Centralized 2026-11-03 after committee_reporter.py's news-blackout call
+    site was found using a raw ``{symbol[:3], symbol[3:6]}`` slice instead of
+    this hardened version (no isalpha filter, no .upper()) -- see the
+    function's own docstring. These pin exactly the cases a raw slice gets
+    wrong: lowercase symbols and a suffix landing inside the first 6 chars."""
+
+    def test_strips_broker_suffix(self) -> None:
+        assert st.symbol_currencies("EURUSDm") == {"EUR", "USD"}
+
+    def test_handles_plain_pair(self) -> None:
+        assert st.symbol_currencies("GBPJPY") == {"GBP", "JPY"}
+
+    def test_lowercase_symbol_still_matches(self) -> None:
+        # A raw symbol[:3]/symbol[3:6] slice would yield {"eur", "usd"},
+        # which never matches the uppercase currency codes fn_news emits --
+        # a silent fail-open on the news blackout check for this symbol.
+        assert st.symbol_currencies("eurusd") == {"EUR", "USD"}
+
+    def test_suffix_before_sixth_letter_still_resolves_correctly(self) -> None:
+        # A raw slice assumes the pair occupies exactly the first 6
+        # characters; stripping non-letters first keeps this correct even
+        # when a prefix/separator pushes the pair's letters later.
+        assert st.symbol_currencies("#EURUSD") == {"EUR", "USD"}
+        assert st.symbol_currencies("EUR/USD") == {"EUR", "USD"}
+
+    def test_too_short_fails_open_to_empty_set(self) -> None:
+        assert st.symbol_currencies("XAU") == set()
+
+
+class TestScorecard:
+    """D-repair (2026-10-29, user's request): a per-symbol/per-edge win-loss
+    breakdown surfaced in the status email, computed fresh from the journal
+    every call (see scorecard's docstring for the full rationale)."""
+
+    def _entry(self, symbol, outcome, profit, edge="HTF_TREND_CONTINUATION", side="sell",
+               entry_price=1.1000, stop_loss=1.1020, take_profit=1.0960, exit_price=None) -> dict:
+        return {
+            "symbol": symbol, "status": "closed", "outcome": outcome, "profit": profit, "edge": edge,
+            "side": side, "entry_price": entry_price, "stop_loss": stop_loss, "take_profit": take_profit,
+            "exit_price": exit_price if exit_price is not None else (stop_loss if outcome == "loss" else take_profit),
+        }
+
+    def test_empty_journal(self) -> None:
+        card = st.scorecard([])
+        assert card["n_total"] == 0
+        assert card["by_symbol"] == {} and card["by_edge"] == {}
+        assert st.scorecard_text([]) == "No closed trades yet."
+
+    def test_open_and_unknown_outcome_trades_excluded(self) -> None:
+        journal = [
+            {"symbol": "EURUSD", "status": "open", "outcome": None},
+            {"symbol": "EURUSD", "status": "closed", "outcome": "unknown"},
+            self._entry("EURUSD", "win", 40.0),
+        ]
+        card = st.scorecard(journal)
+        assert card["n_total"] == 1
+
+    def test_buckets_by_symbol_and_edge(self) -> None:
+        journal = [
+            self._entry("EURUSD", "win", 40.0, edge="HTF_TREND_CONTINUATION"),
+            self._entry("EURUSD", "loss", -20.0, edge="HTF_TREND_CONTINUATION"),
+            self._entry("GBPUSD", "loss", -20.0, edge="HTF_LEVEL_REJECTION"),
+        ]
+        card = st.scorecard(journal)
+        assert card["n_total"] == 3
+        assert card["by_symbol"]["EURUSD"]["n"] == 2
+        assert card["by_symbol"]["EURUSD"]["wins"] == 1
+        assert card["by_symbol"]["EURUSD"]["losses"] == 1
+        assert card["by_symbol"]["EURUSD"]["win_rate"] == pytest.approx(0.5)
+        assert card["by_symbol"]["EURUSD"]["net_usd"] == pytest.approx(20.0)
+        assert card["by_symbol"]["GBPUSD"]["n"] == 1
+        assert card["by_edge"]["HTF_TREND_CONTINUATION"]["n"] == 2
+        assert card["by_edge"]["HTF_LEVEL_REJECTION"]["n"] == 1
+
+    def test_missing_edge_buckets_as_unknown(self) -> None:
+        entry = self._entry("EURUSD", "win", 40.0)
+        del entry["edge"]
+        card = st.scorecard([entry])
+        assert card["by_edge"]["unknown"]["n"] == 1
+
+    def test_scorecard_text_includes_symbol_and_edge_sections(self) -> None:
+        journal = [self._entry("EURUSD", "win", 40.0)]
+        text = st.scorecard_text(journal)
+        assert "By symbol:" in text and "By edge:" in text
+        assert "EURUSD" in text and "HTF_TREND_CONTINUATION" in text
+
+
 class TestValidateCommitteeFields:
     """D4 (2026-10-06, extended for v5.1 in D6): catch the LLM dropping a
     required field entirely -- something the email/journal pipeline had no

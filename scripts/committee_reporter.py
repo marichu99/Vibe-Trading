@@ -276,6 +276,25 @@ EXCLUSIVE_SYMBOL_GROUP = frozenset({"EURUSDm", "GBPUSDm"})
 MAX_ITER = 15
 RUN_TIMEOUT_SECONDS = 3600
 
+# 2026-10-24 (user's request) -- see fundednext_reporter.py's identical
+# routing for the full rationale: Sonnet only for a live VOLATILE/EXTREME
+# regime pass (real money, harder judgment call), Haiku for everything
+# else, including research-only, plain NORMAL, and CALM. Unlike
+# fundednext_reporter.py this bot has no LLM_MODEL_OVERRIDE of its own
+# today -- it just inherits agent/.env's Haiku default unconditionally --
+# so this is a NEW behavior here, not a change to an existing override.
+_LLM_MODEL_HAIKU = {"LANGCHAIN_PROVIDER": "openrouter", "LANGCHAIN_MODEL_NAME": "anthropic/claude-haiku-4-5"}
+_LLM_MODEL_SONNET = {"LANGCHAIN_PROVIDER": "openrouter", "LANGCHAIN_MODEL_NAME": "anthropic/claude-sonnet-5"}
+_SONNET_ROUTED_REGIMES = frozenset({"VOLATILE", "EXTREME"})
+
+
+def _model_override_for(research_only: bool, regime_label: str | None) -> dict[str, str]:
+    """Pick this pass's subprocess model override -- see fundednext_reporter.py's
+    identical function for the full rationale."""
+    if not research_only and regime_label in _SONNET_ROUTED_REGIMES:
+        return _LLM_MODEL_SONNET
+    return _LLM_MODEL_HAIKU
+
 # Cap on concurrent SAME-direction positions per symbol. Opposite-direction
 # stacking is never allowed regardless of this cap (avoids a same-symbol
 # long+short conflict on the hedging-mode MT5 account). A target's own trade
@@ -1061,6 +1080,25 @@ def _extract_placed_order(run_id: str) -> dict | None:
     return orders[0] if orders else None
 
 
+def _malformed_output_order_note(orders: list[dict]) -> str:
+    """Deterministic order-confirmation summary for a MALFORMED_OUTPUT pass
+    that nonetheless placed a real order -- see fundednext_reporter.py's
+    identical function for the full rationale (real incident 2026-10-27,
+    FundedNext XAUUSD)."""
+    lines = [
+        "[ORDER CONFIRMATION] the model's final report was malformed, but it DID "
+        "place a live order this pass (already journaled and run through the usual "
+        "post-fill guardrails):",
+    ]
+    for o in orders:
+        lines.append(
+            f"  {str(o.get('side', '?')).upper()} {o.get('quantity', '?')} lots {o.get('symbol', '?')} "
+            f"({o.get('order_type', 'market')}) -- stop_loss={o.get('stop_loss', '?')}, "
+            f"take_profit={o.get('take_profit', '?')}, ticket={o.get('order_id') or o.get('ticket') or '?'}"
+        )
+    return "\n".join(lines)
+
+
 def _blocked_order_note(run_id: str) -> str | None:
     """Surface the REAL reason a trading_place_order attempt didn't go through.
 
@@ -1129,6 +1167,7 @@ def _journal_record_open(symbol: str, connection: str, order: dict) -> None:
         "stop_adjusted": bool(order.get("stop_adjusted")),
         "trend_alignment": order.get("trend_alignment"),
         "regime": order.get("regime"),
+        "edge": order.get("edge", "unknown"),
     })
     _write_journal(entries)
 
@@ -2418,7 +2457,7 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
 
     if trade and not research_only:
         in_blackout, why = fn_news.is_news_blackout(
-            {trade["symbol"][:3], trade["symbol"][3:6]}, window_minutes=NEWS_BLACKOUT_WINDOW_MINUTES)
+            strategy_tracking.symbol_currencies(trade["symbol"]), window_minutes=NEWS_BLACKOUT_WINDOW_MINUTES)
         if in_blackout:
             breaker_note = f"[NEWS BLACKOUT] {trade['symbol']} pass run research-only: {why}."
             logger.warning("news blackout for %s: %s", target, why)
@@ -2441,6 +2480,7 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
 
     # D12 (2026-10-08) -- see fundednext_reporter.py's identical gate for
     # the full rationale.
+    regime_label = None
     if trade and not research_only:
         regime = strategy_tracking.regime_for_symbol(trade["symbol"], trade["connection"])
         logger.info(
@@ -2496,6 +2536,7 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             "regime_rule": strategy_tracking.regime_rule_prompt(regime),
             "regime_label": regime.label,
         }
+        regime_label = regime.label
 
     prompt = _build_prompt(
         committee, target, market, trade,
@@ -2523,120 +2564,164 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         )
     logger.info("running %s on %s (%s)%s", committee, target, market,
                 " [research-only]" if research_only else (" [trade-enabled]" if trade else ""))
-    cmd = [
-        sys.executable, "-m", "cli", "run",
-        "--prompt", prompt,
-        "--json",
-        "--max-iter", str(MAX_ITER),
-    ]
-    popen = subprocess.Popen(
-        cmd,
-        cwd=str(AGENT_DIR),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        # Committee reports routinely contain em-dashes/CJK text; without an
-        # explicit encoding, the pipe falls back to the Windows locale
-        # (cp1252 here), which can't decode that output and crashes the
-        # reader thread mid-read, leaving stdout as None.
-        encoding="utf-8",
-        errors="replace",
+    model_override = _model_override_for(research_only, regime_label)
+    # 2026-10-24 (user's request) -- see fundednext_reporter.py's identical
+    # MODEL_ROUTE log line for the full rationale (greppable per-day
+    # Sonnet/Haiku pass counts to check the routing decision against real
+    # spend instead of theorizing about it).
+    logger.info(
+        "MODEL_ROUTE day=%s target=%s regime=%s research_only=%s model=%s",
+        datetime.now(timezone.utc).strftime("%Y-%m-%d"), target, regime_label, research_only,
+        model_override["LANGCHAIN_MODEL_NAME"],
     )
-    try:
-        stdout, stderr = popen.communicate(timeout=RUN_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        _kill_process_tree(popen.pid)
-        # Now that every descendant is actually dead, drain whatever's left
-        # -- this can't hang, since nothing remains alive to hold the pipe's
-        # write end open (see _kill_process_tree's docstring for why a plain
-        # popen.kill() here would not be enough).
+    report_text = ""
+    missing_fields: list[str] = []
+    run_id = None
+    traded = False
+    notes = ""
+    any_placed = False
+    for attempt in range(2):
+        cmd = [
+            sys.executable, "-m", "cli", "run",
+            "--prompt", prompt,
+            "--json",
+            "--max-iter", str(MAX_ITER),
+        ]
+        popen = subprocess.Popen(
+            cmd,
+            cwd=str(AGENT_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            # Committee reports routinely contain em-dashes/CJK text; without an
+            # explicit encoding, the pipe falls back to the Windows locale
+            # (cp1252 here), which can't decode that output and crashes the
+            # reader thread mid-read, leaving stdout as None.
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, **model_override},
+        )
         try:
-            popen.communicate(timeout=15)
-        except Exception:
-            pass
-        logger.warning("%s on %s timed out after %ss", committee, target, RUN_TIMEOUT_SECONDS)
-        return CommitteeResult(committee, target, market, "timeout", None, "", error="run exceeded timeout")
-    proc = subprocess.CompletedProcess(cmd, popen.returncode, stdout, stderr)
+            stdout, stderr = popen.communicate(timeout=RUN_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(popen.pid)
+            # Now that every descendant is actually dead, drain whatever's left
+            # -- this can't hang, since nothing remains alive to hold the pipe's
+            # write end open (see _kill_process_tree's docstring for why a plain
+            # popen.kill() here would not be enough).
+            try:
+                popen.communicate(timeout=15)
+            except Exception:
+                pass
+            logger.warning("%s on %s timed out after %ss", committee, target, RUN_TIMEOUT_SECONDS)
+            return CommitteeResult(committee, target, market, "timeout", None, "", error="run exceeded timeout")
+        proc = subprocess.CompletedProcess(cmd, popen.returncode, stdout, stderr)
 
-    payload = _last_json_line(proc.stdout)
-    if payload is None:
-        return CommitteeResult(
-            committee, target, market, "error", None, "",
-            error=f"could not parse CLI output (exit {proc.returncode}): {proc.stderr[-2000:]}",
-        )
+        payload = _last_json_line(proc.stdout)
+        if payload is None:
+            return CommitteeResult(
+                committee, target, market, "error", None, "",
+                error=f"could not parse CLI output (exit {proc.returncode}): {proc.stderr[-2000:]}",
+            )
 
-    status = payload.get("status", "unknown")
-    run_id = payload.get("run_id")
-    if status != "success":
-        # A run that places an order and THEN fails on a later step (an
-        # empty model response, max-iterations, an unparseable final
-        # answer) must not let that fill skip every guardrail and the
-        # journal just because the run itself didn't end cleanly -- real
-        # incident 2026-10-05 (FundedNext GBPUSD empty_model_response)
-        # happened not to have placed anything, but confirmed the gap was
-        # live; found and fixed per the daily-repair agent's 2026-10-06
-        # review of that incident.
+        status = payload.get("status", "unknown")
+        run_id = payload.get("run_id")
+        if status != "success":
+            # A run that places an order and THEN fails on a later step (an
+            # empty model response, max-iterations, an unparseable final
+            # answer) must not let that fill skip every guardrail and the
+            # journal just because the run itself didn't end cleanly -- real
+            # incident 2026-10-05 (FundedNext GBPUSD empty_model_response)
+            # happened not to have placed anything, but confirmed the gap was
+            # live; found and fixed per the daily-repair agent's 2026-10-06
+            # review of that incident.
+            notes, traded, any_placed = _journal_any_placed_orders(
+                trade, run_id, trend_allowed, research_only=research_only, research_only_reason=breaker_note or "",
+            )
+            error_text = payload.get("reason") or f"run status was '{status}'"
+            if any_placed:
+                error_text += (
+                    f"\n\n[POST-FAILURE GUARDRAIL CHECK] this run ended '{status}' but had already placed a "
+                    f"live order -- it was still run through the full guardrail chain and journaled:{notes}"
+                )
+            return CommitteeResult(committee, target, market, "error", run_id, "", error=error_text, traded=traded)
+
+        report_text = _read_final_answer(run_id) if run_id else ""
+        if not report_text:
+            notes, traded, any_placed = _journal_any_placed_orders(
+                trade, run_id, trend_allowed, research_only=research_only, research_only_reason=breaker_note or "",
+            )
+            error_text = "run succeeded but produced no final answer"
+            if any_placed:
+                error_text += (
+                    f"\n\n[POST-FAILURE GUARDRAIL CHECK] this run had already placed a live order -- it was "
+                    f"still run through the full guardrail chain and journaled:{notes}"
+                )
+            return CommitteeResult(committee, target, market, "error", run_id, "", error=error_text, traded=traded)
+
+        # D4 (2026-10-06): checked against the LLM's RAW answer, before any
+        # guardrail/violation notes get appended below -- those use their own
+        # bracketed [CRITICAL]/[AUTOMATED CHECK] markers, not the required-field
+        # labels, and would never legitimately satisfy this check anyway.
+        missing_fields = strategy_tracking.validate_committee_fields(report_text)
+
+        # A trading_place_order CALL happening is not the same as an order being
+        # PLACED — a call the mandate gate blocks (wrong size, breach, halted,
+        # etc.) still shows up as a tool_call. Regression: a hallucinated 1.0-lot
+        # order (100x the intended 0.01) was correctly denied by the gate
+        # ($465,893 notional vs. the $6,000 cap) but still got tagged "TRADED" in
+        # the email under the old tool_call-only check. `_extract_placed_orders`
+        # already verifies status=="ok" against the connector's own response, so
+        # basing `traded` on it directly is both the fix and the single source of
+        # truth for what actually reached the broker. Journaled unconditionally,
+        # even if the schema check above will reject this report below -- a real
+        # fill must never be dropped because the narrative around it is
+        # malformed (same principle as the empty_model_response fix).
         notes, traded, any_placed = _journal_any_placed_orders(
             trade, run_id, trend_allowed, research_only=research_only, research_only_reason=breaker_note or "",
+            report_text=report_text,
         )
-        error_text = payload.get("reason") or f"run status was '{status}'"
-        if any_placed:
-            error_text += (
-                f"\n\n[POST-FAILURE GUARDRAIL CHECK] this run ended '{status}' but had already placed a "
-                f"live order -- it was still run through the full guardrail chain and journaled:{notes}"
-            )
-        return CommitteeResult(committee, target, market, "error", run_id, "", error=error_text, traded=traded)
+        report_text = report_text + notes
 
-    report_text = _read_final_answer(run_id) if run_id else ""
-    if not report_text:
-        notes, traded, any_placed = _journal_any_placed_orders(
-            trade, run_id, trend_allowed, research_only=research_only, research_only_reason=breaker_note or "",
+        if not missing_fields:
+            break
+
+        if any_placed or attempt == 1:
+            # D4: do not treat this as a trustworthy decision record -- status
+            # "error" (not "success") means record_decision logs result.status
+            # instead of parse_decision(report_text), and no AI-cost attribution
+            # exists anywhere in this codebase to skip (confirmed in the
+            # 2026-10-01 due-diligence review) so there is nothing further to
+            # withhold there. The real fill above (if any) is still journaled
+            # and still counts toward `traded` -- only the REPORT's trustworthi-
+            # ness as a decision record is being rejected, not the fill itself.
+            # Once a live order has been placed this pass, or the one retry
+            # below has already been spent, re-running would either risk a
+            # duplicate fill or just burn a second malformed response -- stop
+            # here instead.
+            logger.error("MALFORMED_OUTPUT: %s missing required fields: %s", target, ", ".join(missing_fields))
+            error_text = f"MALFORMED_OUTPUT: missing required field(s): {', '.join(missing_fields)}"
+            if any_placed:
+                placed_orders = _extract_placed_orders(run_id) if run_id else []
+                if placed_orders:
+                    error_text += f"\n\n{_malformed_output_order_note(placed_orders)}"
+            if breaker_note:
+                error_text += f"\n\n{breaker_note}"
+            return CommitteeResult(committee, target, market, "error", run_id, report_text, error=error_text, traded=traded)
+
+        # D-repair (2026-10-27): weekly MALFORMED_OUTPUT pattern (Oct 7, 8,
+        # 16, 23, 26 -- always the same shape: the model drops one or more
+        # required fields, most often REASON FOR PASS, from an otherwise
+        # coherent response). No order went out this attempt (any_placed is
+        # False, checked above), so re-running the identical prompt once is
+        # safe -- it cannot double-fill. One retry only (attempt == 1 above
+        # ends the loop) rather than looping until success, so a model that's
+        # genuinely stuck still fails fast and alerts rather than burning
+        # the pass window.
+        logger.warning(
+            "MALFORMED_OUTPUT: %s missing required fields: %s -- retrying once (no order placed this attempt)",
+            target, ", ".join(missing_fields),
         )
-        error_text = "run succeeded but produced no final answer"
-        if any_placed:
-            error_text += (
-                f"\n\n[POST-FAILURE GUARDRAIL CHECK] this run had already placed a live order -- it was "
-                f"still run through the full guardrail chain and journaled:{notes}"
-            )
-        return CommitteeResult(committee, target, market, "error", run_id, "", error=error_text, traded=traded)
-
-    # D4 (2026-10-06): checked against the LLM's RAW answer, before any
-    # guardrail/violation notes get appended below -- those use their own
-    # bracketed [CRITICAL]/[AUTOMATED CHECK] markers, not the required-field
-    # labels, and would never legitimately satisfy this check anyway.
-    missing_fields = strategy_tracking.validate_committee_fields(report_text)
-
-    # A trading_place_order CALL happening is not the same as an order being
-    # PLACED — a call the mandate gate blocks (wrong size, breach, halted,
-    # etc.) still shows up as a tool_call. Regression: a hallucinated 1.0-lot
-    # order (100x the intended 0.01) was correctly denied by the gate
-    # ($465,893 notional vs. the $6,000 cap) but still got tagged "TRADED" in
-    # the email under the old tool_call-only check. `_extract_placed_orders`
-    # already verifies status=="ok" against the connector's own response, so
-    # basing `traded` on it directly is both the fix and the single source of
-    # truth for what actually reached the broker. Journaled unconditionally,
-    # even if the schema check above will reject this report below -- a real
-    # fill must never be dropped because the narrative around it is
-    # malformed (same principle as the empty_model_response fix).
-    notes, traded, any_placed = _journal_any_placed_orders(
-        trade, run_id, trend_allowed, research_only=research_only, research_only_reason=breaker_note or "",
-    )
-    report_text = report_text + notes
-
-    if missing_fields:
-        # D4: do not treat this as a trustworthy decision record -- status
-        # "error" (not "success") means record_decision logs result.status
-        # instead of parse_decision(report_text), and no AI-cost attribution
-        # exists anywhere in this codebase to skip (confirmed in the
-        # 2026-10-01 due-diligence review) so there is nothing further to
-        # withhold there. The real fill above (if any) is still journaled
-        # and still counts toward `traded` -- only the REPORT's trustworthi-
-        # ness as a decision record is being rejected, not the fill itself.
-        logger.error("MALFORMED_OUTPUT: %s missing required fields: %s", target, ", ".join(missing_fields))
-        error_text = f"MALFORMED_OUTPUT: missing required field(s): {', '.join(missing_fields)}"
-        if breaker_note:
-            error_text += f"\n\n{breaker_note}"
-        return CommitteeResult(committee, target, market, "error", run_id, report_text, error=error_text, traded=traded)
 
     if not any_placed and trade:
         blocked_note = _blocked_order_note(run_id)
@@ -3226,7 +3311,7 @@ def _post_trade_reward_risk_check(trade: dict, placed_order: dict) -> str:
 
 def _handle_filled_order(
     trade: dict, placed_order: dict, trend_allowed: set[str] | None,
-    *, research_only: bool = False, research_only_reason: str = "",
+    *, research_only: bool = False, research_only_reason: str = "", report_text: str = "",
 ) -> tuple[str, bool]:
     """Run every post-fill guardrail against a just-filled order, then journal it.
 
@@ -3281,6 +3366,9 @@ def _handle_filled_order(
         # D13 (2026-10-08) -- see fundednext_reporter.py's identical line
         # for the full rationale.
         placed_order["regime"] = trade.get("regime_label", "NORMAL")
+        # D-repair (2026-10-29) -- see fundednext_reporter.py's identical line
+        # / strategy_tracking.scorecard's docstring for the full rationale.
+        placed_order["edge"] = strategy_tracking.parse_edge(report_text)
         traded = True
     _journal_record_open(placed_order.get("symbol") or trade["symbol"], trade["connection"], placed_order)
     return note, traded
@@ -3288,7 +3376,7 @@ def _handle_filled_order(
 
 def _journal_any_placed_orders(
     trade: dict | None, run_id: str | None, trend_allowed: set[str] | None,
-    *, research_only: bool = False, research_only_reason: str = "",
+    *, research_only: bool = False, research_only_reason: str = "", report_text: str = "",
 ) -> tuple[str, bool, bool]:
     """Run every verified placed order in this run's trace (if any) through
     the full post-fill guardrail chain and journal it. Returns (report notes,
@@ -3331,7 +3419,7 @@ def _journal_any_placed_orders(
             placed_order["fill_price"] = resolved_price
         note, order_traded = _handle_filled_order(
             trade, placed_order, trend_allowed,
-            research_only=research_only, research_only_reason=research_only_reason,
+            research_only=research_only, research_only_reason=research_only_reason, report_text=report_text,
         )
         notes += note
         traded = traded or order_traded
@@ -3679,8 +3767,52 @@ def _status_report_html() -> str:
         parts.append(f'<h3 style="margin:16px 0 4px;font-size:14px;">Track record: {_esc(trade["symbol"])}</h3>')
         parts.append(f'<p style="margin:2px 0;">{_esc(summary or "no closed trades yet")}</p>')
 
+    # D-repair (2026-10-29, user's request) -- see fundednext_reporter.py's
+    # identical addition / strategy_tracking.scorecard's docstring. Styled
+    # table, not a <pre> dump, matching this report's existing structure.
+    try:
+        parts.append(_scorecard_html(strategy_tracking.scorecard(_read_journal())))
+    except Exception as exc:
+        parts.append(f'<p style="color:#c62828;margin:2px 0;">Scorecard: could not compute ({_esc(exc)})</p>')
+
     parts.append("</div>")
     return "\n".join(parts)
+
+
+def _scorecard_html(card: dict) -> str:
+    """See fundednext_reporter.py's identical function for the full rationale."""
+    parts = ['<h3 style="margin:16px 0 4px;font-size:14px;">Scorecard</h3>']
+    if card["n_total"] == 0:
+        parts.append('<p style="margin:2px 0;color:#555;">No closed trades yet.</p>')
+        return "".join(parts)
+    parts.append(
+        f'<p style="margin:2px 0;color:#555;font-size:12px;">{card["n_total"]} closed trades -- treat with '
+        f'caution under ~50 trades.</p>'
+    )
+    for title, buckets in (("By symbol", card["by_symbol"]), ("By edge", card["by_edge"])):
+        parts.append(f'<p style="margin:8px 0 2px;color:#555;">{_esc(title)}:</p>')
+        rows = []
+        for key in sorted(buckets, key=lambda k: -buckets[k]["n"]):
+            s = buckets[key]
+            net_color = "#2e7d32" if s["net_usd"] >= 0 else "#c62828"
+            avg_r = f'{s["avg_r"]:+.2f}R' if s["avg_r"] is not None else "n/a"
+            rows.append(
+                "<tr>"
+                f'<td style="padding:2px 8px;">{_esc(key)}</td>'
+                f'<td style="padding:2px 8px;">{s["wins"]}W/{s["losses"]}L</td>'
+                f'<td style="padding:2px 8px;">{s["win_rate"]*100:.0f}%</td>'
+                f'<td style="padding:2px 8px;color:{net_color};font-weight:bold;">{s["net_usd"]:+.2f}</td>'
+                f'<td style="padding:2px 8px;">{_esc(avg_r)}</td>'
+                "</tr>"
+            )
+        parts.append(
+            '<table style="border-collapse:collapse;width:100%;font-size:13px;">'
+            '<tr style="color:#555;"><th style="text-align:left;padding:2px 8px;">Key</th>'
+            '<th style="text-align:left;padding:2px 8px;">W/L</th><th style="text-align:left;padding:2px 8px;">Win%</th>'
+            '<th style="text-align:left;padding:2px 8px;">Net $</th><th style="text-align:left;padding:2px 8px;">Avg R</th></tr>'
+            + "".join(rows) + "</table>"
+        )
+    return "".join(parts)
 
 
 def _format_body_html(result: CommitteeResult, tag: str) -> str:
@@ -4387,6 +4519,13 @@ def _build_status_report() -> str:
         except Exception as exc:
             summary = f"could not read journal: {exc}"
         lines.append(f"\nTrack record ({trade['symbol']}): {summary or 'no closed trades yet'}")
+
+    # D-repair (2026-10-29, user's request) -- see fundednext_reporter.py's
+    # identical addition / strategy_tracking.scorecard's docstring.
+    try:
+        lines.append(f"\n{strategy_tracking.scorecard_text(_read_journal())}")
+    except Exception as exc:
+        lines.append(f"\nScorecard: could not compute ({exc})")
 
     return "\n".join(lines)
 

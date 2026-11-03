@@ -265,6 +265,97 @@ def parse_decision(report_text: str) -> str:
     return "wait"
 
 
+# D-repair (2026-10-29): the four edge labels both reporters' prompts define
+# in the "Edge must be exactly one of these" rulebook section -- see
+# fundednext_reporter.py/committee_reporter.py's prompt text. Trades were
+# never journaled with which edge took them, so a per-symbol/per-trade-count
+# picture existed (see _journal_summary_text) but no per-edge one did --
+# findable only by re-reading every report_text by hand. scorecard() below
+# needs this to break results down by edge type as well as symbol.
+EDGE_LABELS = ("HTF_TREND_CONTINUATION", "HTF_LEVEL_REJECTION", "SESSION_RANGE_BREAKOUT", "NEWS_MOMENTUM")
+
+_EDGE_RE = re.compile(r"^\W*EDGE:\W*([A-Z_]+)", re.MULTILINE)
+
+
+def parse_edge(report_text: str) -> str:
+    """Pull the EDGE label a just-filled order's report declared, or "unknown"
+    if the report doesn't have one, is empty, or names something outside
+    EDGE_LABELS (defensive against a future label typo/rename silently
+    polluting the scorecard with a new bucket nobody reads)."""
+    match = _EDGE_RE.search(report_text or "")
+    if not match:
+        return "unknown"
+    label = match.group(1)
+    return label if label in EDGE_LABELS else "unknown"
+
+
+def scorecard(journal: list[dict]) -> dict:
+    """Deterministic win/loss scorecard broken down by symbol and by edge
+    type, computed fresh from the trade journal every call (no separate
+    state to drift out of sync -- same principle as _journal_summary_text).
+
+    Returns {"by_symbol": {symbol: stats}, "by_edge": {edge: stats}} where
+    each stats dict is {"n", "wins", "losses", "win_rate", "net_usd",
+    "avg_r"}. Only closed trades with a known win/loss outcome count --
+    exactly the fields outcome/review/_trade_r-style logic elsewhere in this
+    module already assume populated outcome before scoring one.
+    """
+    closed = [e for e in journal if e.get("status") == "closed" and e.get("outcome") in ("win", "loss")]
+
+    def _bucket(entries: list[dict]) -> dict:
+        n = len(entries)
+        wins = sum(1 for e in entries if e["outcome"] == "win")
+        losses = n - wins
+        net_usd = sum(float(e.get("profit") or 0) for e in entries)
+        r_values = [r for r in (_trade_r(e) for e in entries) if r is not None]
+        return {
+            "n": n,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": wins / n if n else 0.0,
+            "net_usd": net_usd,
+            "avg_r": sum(r_values) / len(r_values) if r_values else None,
+        }
+
+    by_symbol: dict[str, list[dict]] = {}
+    by_edge: dict[str, list[dict]] = {}
+    for e in closed:
+        by_symbol.setdefault(e.get("symbol", "?"), []).append(e)
+        by_edge.setdefault(e.get("edge", "unknown"), []).append(e)
+
+    return {
+        "by_symbol": {k: _bucket(v) for k, v in by_symbol.items()},
+        "by_edge": {k: _bucket(v) for k, v in by_edge.items()},
+        "n_total": len(closed),
+    }
+
+
+def scorecard_text(journal: list[dict]) -> str:
+    """Human-readable rendering of scorecard() for the status report email --
+    see that function's docstring for what's being computed."""
+    card = scorecard(journal)
+    if card["n_total"] == 0:
+        return "No closed trades yet."
+
+    def _rows(buckets: dict) -> list[str]:
+        lines = []
+        for key in sorted(buckets, key=lambda k: -buckets[k]["n"]):
+            s = buckets[key]
+            avg_r = f"{s['avg_r']:+.2f}R" if s["avg_r"] is not None else "n/a"
+            lines.append(
+                f"  {key:28s} {s['wins']}W/{s['losses']}L ({s['win_rate']*100:.0f}%)  "
+                f"net {s['net_usd']:+.2f}  avg {avg_r}"
+            )
+        return lines
+
+    out = [f"Scorecard ({card['n_total']} closed trades -- treat with caution under ~50 trades, see n above):"]
+    out.append("By symbol:")
+    out += _rows(card["by_symbol"])
+    out.append("By edge:")
+    out += _rows(card["by_edge"])
+    return "\n".join(out)
+
+
 def _append(entry: dict) -> None:
     DECISION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with DECISION_LOG_PATH.open("a", encoding="utf-8") as fh:
@@ -983,6 +1074,28 @@ ATR_STOP_MULTIPLE = 1.5
 
 _DECISION_LINE_RE = re.compile(r"^Decision:\s*(.+)$", re.MULTILINE)
 _REASONING_LINE_RE = re.compile(r"^Reasoning:\s*(.+)$", re.MULTILINE)
+
+
+def symbol_currencies(symbol: str) -> set[str]:
+    """Best-effort base/quote currency codes for a forex symbol, e.g.
+    'EURUSDm' -> {'EUR', 'USD'}. Empty set if the symbol doesn't look like a
+    plain 6-letter forex pair (fails open — the news check just skips).
+
+    Moved here 2026-11-03: committee_reporter.py's news-blackout call site
+    used a raw ``{symbol[:3], symbol[3:6]}`` slice instead of this
+    (fundednext_reporter.py-only) hardened version — no ``isalpha`` filter
+    and no ``.upper()``. Every symbol currently configured in either
+    reporter's TARGETS happens to already be uppercase with any broker
+    suffix (e.g. the 'm' in 'EURUSDm') landing after index 6, so neither gap
+    has fired yet, but a differently-cased or differently-suffixed symbol
+    would silently derive the wrong currency codes and the blackout check
+    would just never match — fail-open in exactly the place a news check
+    must not be. Centralizing avoids the two copies drifting further.
+    """
+    letters = "".join(ch for ch in symbol if ch.isalpha()).upper()
+    if len(letters) < 6:
+        return set()
+    return {letters[:3], letters[3:6]}
 
 
 def _mt5_config_for(connection: str):
