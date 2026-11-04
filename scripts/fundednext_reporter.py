@@ -138,26 +138,30 @@ TARGETS: list[dict[str, object]] = [
             "early_profit_trigger_usd": 12.00,
         },
     },
-    # PAUSED 2026-09-24 at the user's request, purely to halve LLM spend --
-    # mirrored from committee_reporter.py's identical pause (see its comment).
-    # Note this account's OWN history does not favor EURUSD the way the
-    # Exness account's does (EURUSD -$33.36 over 3 trades, AUDUSD -$2.23
-    # over 1 as of the pause) -- far too few trades to pick a pair on, so
-    # the pair choice here follows the Exness evidence, not this account's.
-    # Just uncomment this block to re-enable.
-    # {
-    #     "committee": "investment_committee", "target": "AUDUSD", "market": "forex",
-    #     "trade": {
-    #         "symbol": "AUDUSD", "connection": "mt5fn-live-trade", "lots": 0.33, "max_stack": 1,
-    #         "early_profit_trigger_usd": 24.75,
-    #     },
-    # },
-    # PAUSED 2026-09-18 at the user's request, purely to cut LLM spend while
-    # EURUSD/AUDUSD alone prove out today's fixes (terminal-routing,
-    # reward:risk enforcement, spec-check, fill-price fallback) -- NOT
-    # because anything about gold itself was a problem. No mandate change
-    # needed to re-enable (asset_classes already includes "commodity") --
-    # just uncomment this block.
+    # RE-ENABLED 2026-11-04 at the user's request, replacing gold (below) to
+    # focus this account on three currency pairs only. Moved to
+    # fx_commodity_day_desk (the old investment_committee predates the data
+    # pack/rulebook) to match EURUSD/GBPUSD's current committee. Lots halved
+    # from the pre-pause 0.33 to 0.16, mirroring the same 2026-09-28 halving
+    # EURUSD (0.24->0.12) and GBPUSD (0.30->0.15) already went through --
+    # this pair was paused before that halving happened, so it never got it.
+    # At the live-verified floor (AUDUSD 0.000610, contract_size 100,000):
+    # 0.16 lots * 100,000 * 0.000610 ~= $9.76 risk, in the same ~$10-16 band
+    # as the other two. early_profit_trigger_usd halved to match (24.75/2).
+    {
+        "committee": "fx_commodity_day_desk", "target": "AUDUSD", "market": "forex",
+        "trade": {
+            "symbol": "AUDUSD", "connection": "mt5fn-live-trade", "lots": 0.16, "max_stack": 1,
+            "early_profit_trigger_usd": 12.50,
+        },
+    },
+    # PAUSED 2026-11-04 at the user's request, to focus this account on three
+    # currency pairs only (EURUSD/GBPUSD/AUDUSD above) after the EURUSD-loss
+    # review this session -- NOT because gold itself underperformed (it was
+    # only ever at 0/0 scored trades on this account; see the 2026-10-21
+    # re-enable comment below for the sizing math if re-enabling later). No
+    # mandate change needed to re-enable (asset_classes already includes
+    # "commodity") -- just uncomment this block.
     #
     # Added 2026-09-17 at the user's request, after live-verifying (via
     # a full symbols_get() scan of FundedNext-Server 2's 96-symbol
@@ -190,13 +194,13 @@ TARGETS: list[dict[str, object]] = [
     # EXCLUSIVE_SYMBOL_GROUP: gold isn't a doubled USD-pair bet, and one forex
     # + one gold loss (~$29) stays far inside the 2% daily-loss halt.
     # early_profit_trigger_usd halved with lots from the earlier $30 @ 0.02.
-    {
-        "committee": "fx_commodity_day_desk", "target": "XAUUSD", "market": "commodity",
-        "trade": {
-            "symbol": "XAUUSD", "connection": "mt5fn-live-trade", "lots": 0.01, "max_stack": 1,
-            "early_profit_trigger_usd": 15.00,
-        },
-    },
+    # {
+    #     "committee": "fx_commodity_day_desk", "target": "XAUUSD", "market": "commodity",
+    #     "trade": {
+    #         "symbol": "XAUUSD", "connection": "mt5fn-live-trade", "lots": 0.01, "max_stack": 1,
+    #         "early_profit_trigger_usd": 15.00,
+    #     },
+    # },
     {
         # Added 2026-09-24 at the user's request, replacing gold. Chosen over
         # US oil (USOUSD, -0.06 corr to EURUSD) for cost and predictability:
@@ -232,6 +236,13 @@ TARGETS: list[dict[str, object]] = [
 # open, the other's pass runs research-only (same fallback as the guardrail
 # and news-blackout checks in run_committee). Each symbol's own
 # pyramiding limit is still max_stack.
+#
+# AUDUSD re-enabled 2026-11-04 (see TARGETS above) -- checked against this
+# group rather than silently assumed either way: live 120-day D1 return
+# correlation is EURUSD/AUDUSD 0.58, GBPUSD/AUDUSD 0.55, well below the 0.84
+# that justified excluding EURUSD/GBPUSD from each other. Left OUT of this
+# group on that basis; re-check if AUDUSD trades start clustering with
+# EURUSD/GBPUSD losses in a way that looks like one doubled USD bet anyway.
 EXCLUSIVE_SYMBOL_GROUP = frozenset({"EURUSD", "GBPUSD"})
 
 MAX_ITER = 15
@@ -3110,6 +3121,18 @@ def _challenge_progress_lines(account: dict) -> list[str]:
                 f"  Today's drawdown: {drawdown:.1%} (self-imposed halt at {fn_guard.DAILY_LOSS_HALT_PCT:.0%}, "
                 f"room remaining {room:.1%})"
             )
+            today_profit = equity - baseline_equity
+            target_usd = initial * fn_state.CHALLENGE_TARGET_PCT / 100
+            if today_profit > 0 and target_usd > 0:
+                consistency_frac = today_profit / target_usd
+                flag = " -- WATCH: consider this a human double-check day" if (
+                    consistency_frac >= fn_state.CONSISTENCY_WATCH_FRACTION
+                ) else ""
+                lines.append(
+                    f"  Today's profit: ${today_profit:.2f} = {consistency_frac:.0%} of the "
+                    f"${target_usd:.2f} profit target (informational only -- this bot does not "
+                    f"enforce or self-certify any consistency rule){flag}"
+                )
         else:
             lines.append("  Today's drawdown: no baseline recorded yet this server-day")
     except Exception as exc:
@@ -3181,6 +3204,19 @@ def _challenge_progress_html(account: dict) -> str:
                 f'<p style="margin:2px 0;color:{dd_color};">Today\'s drawdown: <strong>{drawdown:.1%}</strong> '
                 f'(self-imposed halt at {fn_guard.DAILY_LOSS_HALT_PCT:.0%}, room remaining {room:.1%})</p>'
             )
+            today_profit = equity - baseline_equity
+            target_usd = initial * fn_state.CHALLENGE_TARGET_PCT / 100
+            if today_profit > 0 and target_usd > 0:
+                consistency_frac = today_profit / target_usd
+                watch = consistency_frac >= fn_state.CONSISTENCY_WATCH_FRACTION
+                consistency_color = "#c62828" if watch else "#555"
+                flag_html = " <strong>-- WATCH: consider this a human double-check day</strong>" if watch else ""
+                parts.append(
+                    f'<p style="margin:2px 0;color:{consistency_color};">Today\'s profit: '
+                    f'<strong>${today_profit:.2f}</strong> = <strong>{consistency_frac:.0%}</strong> of the '
+                    f'${target_usd:.2f} profit target (informational only -- this bot does not enforce or '
+                    f'self-certify any consistency rule){flag_html}</p>'
+                )
         else:
             parts.append('<p style="margin:2px 0;color:#555;">Today\'s drawdown: no baseline recorded yet this server-day</p>')
     except Exception as exc:

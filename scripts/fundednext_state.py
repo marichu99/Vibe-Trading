@@ -82,6 +82,18 @@ CHALLENGE_TARGET_PCT = 10.0
 # >=1 trade each, non-consecutive OK.
 MIN_TRADING_DAYS = 2
 
+# Informational only -- NOT an enforced halt (see this bot's deliberate
+# refusal to self-declare pass/fail above). Many prop firms, FundedNext
+# included on some account types, cap how much of the total profit target
+# a single day may contribute (a "consistency rule"); third-party guides
+# researched 2026-11-04 put the typical cap at 30-40% of target, varying by
+# account/program and not independently confirmed against FundedNext's own
+# current terms. 30% (the conservative end) is used here purely to flag a
+# day worth a human double-check in the status report -- same margin-of-
+# safety spirit as the daily/static drawdown halts being set tighter than
+# the real limits, but this one never blocks a trade or a pass/fail call.
+CONSISTENCY_WATCH_FRACTION = 0.30
+
 # Reverted 2026-09-18 back to FundedNext's documented GMT+3 DST / GMT+2
 # standard (Europe/Bucharest) -- see module docstring for the full story of
 # why the brief 2026-09-17 "UTC" correction was itself wrong.

@@ -1052,12 +1052,12 @@ class TestExclusiveGroupConflict:
         assert seen["research_only"] is True
         assert "CORRELATION LIMIT" in seen["research_only_reason"]
 
-    def test_targets_are_eurusd_gold_and_gbpusd(self) -> None:
-        assert [t["trade"]["symbol"] for t in fr.TARGETS] == ["EURUSD", "XAUUSD", "GBPUSD"]
+    def test_targets_are_eurusd_audusd_and_gbpusd(self) -> None:
+        assert [t["trade"]["symbol"] for t in fr.TARGETS] == ["EURUSD", "AUDUSD", "GBPUSD"]
         gbp = next(t["trade"] for t in fr.TARGETS if t["trade"]["symbol"] == "GBPUSD")
         assert gbp["lots"] == 0.15 and gbp["max_stack"] == 1
-        gold = next(t for t in fr.TARGETS if t["trade"]["symbol"] == "XAUUSD")
-        assert gold["committee"] == "fx_commodity_day_desk" and gold["trade"]["lots"] == 0.01
+        aud = next(t for t in fr.TARGETS if t["trade"]["symbol"] == "AUDUSD")
+        assert aud["committee"] == "fx_commodity_day_desk" and aud["trade"]["lots"] == 0.16
 
     def test_gold_is_outside_the_correlation_group(self) -> None:
         assert "XAUUSD" not in fr.EXCLUSIVE_SYMBOL_GROUP
@@ -1195,7 +1195,7 @@ class TestBrokerTimeToUtc:
 
     def test_halved_lots(self) -> None:
         lots = {t["trade"]["symbol"]: t["trade"]["lots"] for t in fr.TARGETS}
-        assert lots == {"EURUSD": 0.12, "XAUUSD": 0.01, "GBPUSD": 0.15}
+        assert lots == {"EURUSD": 0.12, "AUDUSD": 0.16, "GBPUSD": 0.15}
 
 
 # ---------------------------------------------------------------------------
@@ -1835,6 +1835,77 @@ class TestChallengeProgressHtml:
         html = fr._challenge_progress_html({"balance": 5924.50, "equity": 5924.50})
         assert "<table" in html
         assert "FundedNext challenge progress" in html  # section's own header, self-contained
+
+    def _patch_consistency_state(self, monkeypatch, *, initial=6000.0, baseline_equity=6000.0) -> None:
+        """Decoupled from the class's own _patch_state (whose daily_dd/
+        static_dd knobs both derive from `initial`, making an exact $/%
+        profit figure hard to pin) -- fixes the baseline directly so the
+        test's account dict can set today's equity (and therefore profit)
+        to an exact, assertable number."""
+        monkeypatch.setattr(fr.fn_state, "get_state", lambda: {
+            "initial_balance_usd": initial, "challenge_start_date": "2026-09-17", "passed_date": None,
+        })
+        monkeypatch.setattr(fr.fn_state, "progress_pct", lambda balance: 0.0)
+        monkeypatch.setattr(fr.fn_state, "trading_days_count", lambda: 8)
+        monkeypatch.setattr(fr.fn_state, "server_today", lambda: "2026-11-04")
+        monkeypatch.setattr(fr.fn_guard, "_read_daily_baseline", lambda: {"date": "2026-11-04", "equity": baseline_equity})
+
+    def test_loss_day_omits_consistency_line(self, monkeypatch) -> None:
+        self._patch_consistency_state(monkeypatch, baseline_equity=6000.0)
+        html = fr._challenge_progress_html({"balance": 5990.0, "equity": 5990.0})
+        assert "profit target" not in html
+
+    def test_small_profit_day_shown_without_watch_flag(self, monkeypatch) -> None:
+        # $60 profit on a $6,000 initial balance / 10% target ($600) = 10%,
+        # under CONSISTENCY_WATCH_FRACTION (30%).
+        self._patch_consistency_state(monkeypatch, initial=6000.0, baseline_equity=6000.0)
+        html = fr._challenge_progress_html({"balance": 6060.0, "equity": 6060.0})
+        assert "$60.00" in html
+        assert "10%" in html
+        assert "of the $600.00 profit target" in html
+        assert "WATCH" not in html
+
+    def test_large_profit_day_triggers_watch_flag(self, monkeypatch) -> None:
+        # $240 profit on the same $600 target = 40%, over the 30% watch
+        # threshold -- should surface the human-double-check flag.
+        self._patch_consistency_state(monkeypatch, initial=6000.0, baseline_equity=6000.0)
+        html = fr._challenge_progress_html({"balance": 6240.0, "equity": 6240.0})
+        assert "$240.00" in html
+        assert "40%" in html
+        assert "WATCH" in html
+
+    def test_does_not_claim_to_enforce_or_certify(self, monkeypatch) -> None:
+        self._patch_consistency_state(monkeypatch, initial=6000.0, baseline_equity=6000.0)
+        html = fr._challenge_progress_html({"balance": 6240.0, "equity": 6240.0})
+        assert "does not enforce or self-certify" in html
+
+
+class TestChallengeProgressLinesConsistencyWatch:
+    """Plain-text counterpart to TestChallengeProgressHtml's consistency-rule
+    coverage -- _challenge_progress_lines feeds the plain-text status email
+    the same way _challenge_progress_html feeds the styled one."""
+
+    def _patch_state(self, monkeypatch, *, initial=6000.0, baseline_equity=6000.0) -> None:
+        monkeypatch.setattr(fr.fn_state, "get_state", lambda: {
+            "initial_balance_usd": initial, "challenge_start_date": "2026-09-17", "passed_date": None,
+        })
+        monkeypatch.setattr(fr.fn_state, "progress_pct", lambda balance: 0.0)
+        monkeypatch.setattr(fr.fn_state, "trading_days_count", lambda: 8)
+        monkeypatch.setattr(fr.fn_state, "server_today", lambda: "2026-11-04")
+        monkeypatch.setattr(fr.fn_guard, "_read_daily_baseline", lambda: {"date": "2026-11-04", "equity": baseline_equity})
+
+    def test_loss_day_omits_consistency_line(self, monkeypatch) -> None:
+        self._patch_state(monkeypatch, baseline_equity=6000.0)
+        lines = fr._challenge_progress_lines({"balance": 5990.0, "equity": 5990.0})
+        assert not any("profit target" in line for line in lines)
+
+    def test_large_profit_day_triggers_watch_flag(self, monkeypatch) -> None:
+        self._patch_state(monkeypatch, initial=6000.0, baseline_equity=6000.0)
+        lines = fr._challenge_progress_lines({"balance": 6240.0, "equity": 6240.0})
+        joined = "\n".join(lines)
+        assert "$240.00" in joined and "40%" in joined
+        assert "WATCH" in joined
+        assert "does not enforce or self-certify" in joined
 
 
 class TestStatusReportHtmlStyling:
