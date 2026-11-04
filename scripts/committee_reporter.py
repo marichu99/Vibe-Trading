@@ -3369,6 +3369,7 @@ def _handle_filled_order(
         # D-repair (2026-10-29) -- see fundednext_reporter.py's identical line
         # / strategy_tracking.scorecard's docstring for the full rationale.
         placed_order["edge"] = strategy_tracking.parse_edge(report_text)
+        placed_order["confidence"] = strategy_tracking.parse_confidence(report_text)
         traded = True
     _journal_record_open(placed_order.get("symbol") or trade["symbol"], trade["connection"], placed_order)
     return note, traded
@@ -3789,10 +3790,16 @@ def _scorecard_html(card: dict) -> str:
         f'<p style="margin:2px 0;color:#555;font-size:12px;">{card["n_total"]} closed trades -- treat with '
         f'caution under ~50 trades.</p>'
     )
-    for title, buckets in (("By symbol", card["by_symbol"]), ("By edge", card["by_edge"])):
+    sections = (
+        ("By symbol", card["by_symbol"], None),
+        ("By edge", card["by_edge"], None),
+        ("By confidence (is the committee's own stated confidence calibrated?)",
+         card["by_confidence"], strategy_tracking.confidence_sort_key),
+    )
+    for title, buckets, sort_key in sections:
         parts.append(f'<p style="margin:8px 0 2px;color:#555;">{_esc(title)}:</p>')
         rows = []
-        for key in sorted(buckets, key=lambda k: -buckets[k]["n"]):
+        for key in sorted(buckets, key=sort_key or (lambda k: -buckets[k]["n"])):
             s = buckets[key]
             net_color = "#2e7d32" if s["net_usd"] >= 0 else "#c62828"
             avg_r = f'{s["avg_r"]:+.2f}R' if s["avg_r"] is not None else "n/a"

@@ -801,6 +801,25 @@ class TestHandleFilledOrder:
 
         assert order["edge"] == "HTF_TREND_CONTINUATION"
 
+    def test_journals_the_confidence_score_from_report_text(self, monkeypatch) -> None:
+        # 2026-11-04: mirrors test_journals_the_edge_label_from_report_text
+        # above -- same wiring, now for the scorecard's by_confidence check.
+        monkeypatch.setattr(fr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(fr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(fr, "_journal_record_open", lambda symbol, connection, order: None)
+        order = {"symbol": "EURUSD", "side": "buy", "quantity": 0.24, "order_id": "6",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+        report = "DECISION: LONG\nCONFIDENCE: 83\nEDGE: HTF_TREND_CONTINUATION, pullback\nREASON FOR PASS: n/a -- trade taken"
+
+        fr._handle_filled_order(self.TRADE, order, {"buy"}, report_text=report)
+
+        assert order["confidence"] == 83
+
     def test_journals_the_trade_s_regime_label_when_present(self, monkeypatch) -> None:
         monkeypatch.setattr(fr, "_enforce_trend_rule", lambda *a, **k: "")
         monkeypatch.setattr(fr, "_post_trade_spec_check", lambda *a, **k: "")
@@ -1939,6 +1958,19 @@ class TestScorecardHtml:
         assert "<table" in html
         assert "<pre" not in html
         assert "EURUSD" in html and "HTF_TREND_CONTINUATION" in html
+
+    def test_renders_confidence_section_in_ascending_order(self) -> None:
+        journal = [
+            {"symbol": "EURUSD", "status": "closed", "outcome": "win", "profit": 10.0,
+             "edge": "HTF_TREND_CONTINUATION", "side": "sell", "entry_price": 1.10, "stop_loss": 1.102,
+             "take_profit": 1.096, "exit_price": 1.096, "confidence": 61},
+            {"symbol": "EURUSD", "status": "closed", "outcome": "win", "profit": 10.0,
+             "edge": "HTF_TREND_CONTINUATION", "side": "sell", "entry_price": 1.10, "stop_loss": 1.102,
+             "take_profit": 1.096, "exit_price": 1.096, "confidence": 95},
+        ]
+        html = fr._scorecard_html(fr.strategy_tracking.scorecard(journal))
+        assert "By confidence" in html
+        assert html.index("60-69") < html.index("90-100")
 
 
 class TestModelOverrideFor:

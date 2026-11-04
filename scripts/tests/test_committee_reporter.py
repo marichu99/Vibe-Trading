@@ -2071,6 +2071,24 @@ class TestHandleFilledOrder:
 
         assert order["edge"] == "HTF_LEVEL_REJECTION"
 
+    def test_journals_the_confidence_score_from_report_text(self, monkeypatch) -> None:
+        # 2026-11-04 -- see fundednext_reporter.py's identical test.
+        monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_stop_floor_check", lambda *a, **k: ("", False))
+        monkeypatch.setattr(cr, "_post_trade_max_stop_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_cap_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_spread_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_post_trade_reward_risk_check", lambda *a, **k: "")
+        monkeypatch.setattr(cr, "_journal_record_open", lambda symbol, connection, order: None)
+        order = {"symbol": "EURUSDm", "side": "buy", "quantity": 0.01, "order_id": "7",
+                 "stop_loss": 1.0, "take_profit": 1.1}
+        report = "DECISION: LONG\nCONFIDENCE: 77\nEDGE: HTF_LEVEL_REJECTION, rejected prior day low\nREASON FOR PASS: n/a -- trade taken"
+
+        cr._handle_filled_order(self.TRADE, order, {"buy"}, report_text=report)
+
+        assert order["confidence"] == 77
+
     def test_journals_the_trade_s_regime_label_when_present(self, monkeypatch) -> None:
         monkeypatch.setattr(cr, "_enforce_trend_rule", lambda *a, **k: "")
         monkeypatch.setattr(cr, "_post_trade_spec_check", lambda *a, **k: "")

@@ -81,6 +81,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import math
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -289,16 +290,64 @@ def parse_edge(report_text: str) -> str:
     return label if label in EDGE_LABELS else "unknown"
 
 
-def scorecard(journal: list[dict]) -> dict:
-    """Deterministic win/loss scorecard broken down by symbol and by edge
-    type, computed fresh from the trade journal every call (no separate
-    state to drift out of sync -- same principle as _journal_summary_text).
+# 2026-11-04: both committees' prompts (fx_commodity_day_desk.yaml) already
+# require a mandatory "CONFIDENCE: <0-100>" line on every pass, and already
+# gate on it in-prompt (below 60 -> PASS) -- but nothing ever parsed it back
+# out of a FILLED order's report, so there was no way to check whether that
+# self-rated confidence is actually calibrated (do 90-confidence trades win
+# more than 65-confidence ones, or is the number noise?). Mirrors
+# _EDGE_RE/parse_edge's exact pattern and defensiveness.
+_CONFIDENCE_RE = re.compile(r"^\W*CONFIDENCE:\W*(\d{1,3})", re.MULTILINE)
 
-    Returns {"by_symbol": {symbol: stats}, "by_edge": {edge: stats}} where
-    each stats dict is {"n", "wins", "losses", "win_rate", "net_usd",
+# Buckets for scorecard()'s by_confidence breakdown. Anything below 60 would
+# have been gated to PASS in-prompt and never reach a filled order, so the
+# lowest bucket starts there; "unknown" covers trades journaled before this
+# field existed (parse_confidence returns None for those).
+CONFIDENCE_BUCKETS = ((60, 70), (70, 80), (80, 90), (90, 101))
+
+
+def parse_confidence(report_text: str) -> int | None:
+    """Pull the CONFIDENCE score a just-filled order's report declared, or
+    None if missing, malformed, or out of the valid 0-100 range (same
+    fail-to-"unknown" defensiveness as parse_edge, just with None standing
+    in for "unknown" since there's no sentinel int that couldn't also be a
+    real score)."""
+    match = _CONFIDENCE_RE.search(report_text or "")
+    if not match:
+        return None
+    value = int(match.group(1))
+    return value if 0 <= value <= 100 else None
+
+
+def confidence_bucket(confidence: int | None) -> str:
+    """Human-readable bucket label for scorecard() grouping -- kept as its
+    own function (not inlined) so the HTML/text renderers and the bucketing
+    here can never drift on label spelling."""
+    if confidence is None:
+        return "unknown"
+    for low, high in CONFIDENCE_BUCKETS:
+        if low <= confidence < high:
+            return f"{low}-{high - 1}"
+    return "unknown"
+
+
+def scorecard(journal: list[dict]) -> dict:
+    """Deterministic win/loss scorecard broken down by symbol, by edge type,
+    and by the committee's own stated confidence bucket, computed fresh from
+    the trade journal every call (no separate state to drift out of sync --
+    same principle as _journal_summary_text).
+
+    Returns {"by_symbol": {...}, "by_edge": {...}, "by_confidence": {...}}
+    where each stats dict is {"n", "wins", "losses", "win_rate", "net_usd",
     "avg_r"}. Only closed trades with a known win/loss outcome count --
     exactly the fields outcome/review/_trade_r-style logic elsewhere in this
     module already assume populated outcome before scoring one.
+
+    by_confidence exists to answer a question neither by_symbol nor by_edge
+    can: is the committee's own self-rated CONFIDENCE calibrated at all, or
+    noise? (If the 90-100 bucket doesn't win more than the 60-69 bucket,
+    the number isn't worth weighting anything on.) See parse_confidence's
+    own docstring for why this field was never captured before 2026-11-04.
     """
     closed = [e for e in journal if e.get("status") == "closed" and e.get("outcome") in ("win", "loss")]
 
@@ -319,15 +368,28 @@ def scorecard(journal: list[dict]) -> dict:
 
     by_symbol: dict[str, list[dict]] = {}
     by_edge: dict[str, list[dict]] = {}
+    by_confidence: dict[str, list[dict]] = {}
     for e in closed:
         by_symbol.setdefault(e.get("symbol", "?"), []).append(e)
         by_edge.setdefault(e.get("edge", "unknown"), []).append(e)
+        by_confidence.setdefault(confidence_bucket(e.get("confidence")), []).append(e)
 
     return {
         "by_symbol": {k: _bucket(v) for k, v in by_symbol.items()},
         "by_edge": {k: _bucket(v) for k, v in by_edge.items()},
+        "by_confidence": {k: _bucket(v) for k, v in by_confidence.items()},
         "n_total": len(closed),
     }
+
+
+def confidence_sort_key(bucket_key: str) -> tuple:
+    """Sort by_confidence buckets in ascending confidence order (so a
+    calibration trend -- or its absence -- reads left-to-right/top-to-bottom
+    instead of being scrambled by trade count like the other two
+    breakdowns), with "unknown" always last."""
+    if bucket_key == "unknown":
+        return (1, 0)
+    return (0, int(bucket_key.split("-")[0]))
 
 
 def scorecard_text(journal: list[dict]) -> str:
@@ -337,9 +399,9 @@ def scorecard_text(journal: list[dict]) -> str:
     if card["n_total"] == 0:
         return "No closed trades yet."
 
-    def _rows(buckets: dict) -> list[str]:
+    def _rows(buckets: dict, sort_key) -> list[str]:
         lines = []
-        for key in sorted(buckets, key=lambda k: -buckets[k]["n"]):
+        for key in sorted(buckets, key=sort_key):
             s = buckets[key]
             avg_r = f"{s['avg_r']:+.2f}R" if s["avg_r"] is not None else "n/a"
             lines.append(
@@ -350,9 +412,11 @@ def scorecard_text(journal: list[dict]) -> str:
 
     out = [f"Scorecard ({card['n_total']} closed trades -- treat with caution under ~50 trades, see n above):"]
     out.append("By symbol:")
-    out += _rows(card["by_symbol"])
+    out += _rows(card["by_symbol"], lambda k: -card["by_symbol"][k]["n"])
     out.append("By edge:")
-    out += _rows(card["by_edge"])
+    out += _rows(card["by_edge"], lambda k: -card["by_edge"][k]["n"])
+    out.append("By confidence (is the committee's own stated confidence calibrated?):")
+    out += _rows(card["by_confidence"], confidence_sort_key)
     return "\n".join(out)
 
 
@@ -641,6 +705,67 @@ def compute_atr_percentile(
     return None if pd.isna(value) else float(value)
 
 
+# DRAFT -- not wired into any live gate yet. Added 2026-11-03 to let
+# `scripts/adx_gate_backtest.py` test, against real replayed trades, whether
+# gating HTF_TREND_CONTINUATION entries on trend STRENGTH (this) on top of
+# the existing regime gate's trend VOLATILITY (compute_atr_percentile) would
+# have improved historical outcomes, before anyone wires it into either
+# reporter's prompt.
+def compute_adx(
+    high: Sequence[float], low: Sequence[float], close: Sequence[float],
+    period: int = REGIME_ATR_PERIOD,
+) -> float | None:
+    """Current Average Directional Index (0-100) from equal-length OHLC
+    sequences (oldest first, same convention as compute_atr_percentile).
+
+    Wilder's standard construction, but smoothed with a simple rolling mean
+    rather than Wilder's recursive smoothing -- deliberately matching
+    compute_atr_percentile's own simplification (plain `.rolling().mean()`,
+    not a textbook Wilder ATR) rather than mixing two different smoothing
+    conventions in sibling indicators:
+
+    +DM = up-move where up-move > down-move and up-move > 0, else 0
+    -DM = down-move where down-move > up-move and down-move > 0, else 0
+    TR  = max(high-low, |high-prev_close|, |low-prev_close|)
+    +DI = 100 * rolling_mean(+DM, period) / rolling_mean(TR, period)
+    -DI = 100 * rolling_mean(-DM, period) / rolling_mean(TR, period)
+    DX  = 100 * |+DI - -DI| / (+DI + -DI)
+    ADX = rolling_mean(DX, period)
+
+    High ADX means a strong trend in EITHER direction, not which direction --
+    callers that need direction too should read it alongside the regime
+    gate's own existing trend-continuation/fallback machinery, not in place
+    of it.
+
+    Returns None when there are fewer than ``2 * period`` valid bars (one
+    period to form DX, another to average it into ADX) -- same
+    insufficient-history contract as compute_atr_percentile.
+    """
+    frame = pd.DataFrame({"high": high, "low": low, "close": close}, dtype=float)
+    up_move = frame["high"].diff()
+    down_move = -frame["low"].diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    prev_close = frame["close"].shift(1)
+    true_range = pd.concat([
+        frame["high"] - frame["low"],
+        (frame["high"] - prev_close).abs(),
+        (frame["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    tr_avg = true_range.rolling(period).mean()
+    plus_di = 100 * plus_dm.rolling(period).mean() / tr_avg
+    minus_di = 100 * minus_dm.rolling(period).mean() / tr_avg
+    di_sum = plus_di + minus_di
+    dx = (100 * (plus_di - minus_di).abs() / di_sum).where(di_sum != 0, 0.0)
+    adx_series = dx.rolling(period).mean().dropna()
+
+    if len(adx_series) == 0:
+        return None
+    value = adx_series.iloc[-1]
+    return None if pd.isna(value) else float(value)
+
+
 @dataclass
 class RegimeResult:
     label: str               # CALM | NORMAL | VOLATILE | EXTREME
@@ -750,6 +875,60 @@ def regime_adjusted_lots(lots: float, regime: RegimeResult) -> float:
     adjusted = lots * regime.size_multiplier
     stepped = round(adjusted / REGIME_LOT_STEP) * REGIME_LOT_STEP
     return max(round(stepped, 8), REGIME_LOT_STEP)
+
+
+# DRAFT -- not wired into either reporter's live sizing path yet. Added
+# 2026-11-03 after a code-review flagged that `lots` in TARGETS is a fixed
+# number per symbol (only ever scaled by the regime volatility multiplier),
+# so two trades with different stop distances at the same lot size carry
+# different dollar risk -- risk-per-trade isn't held constant the way every
+# fixed-fractional sizing source recommends (size the trade so stop-out loss
+# equals a fixed $ amount, derived from the stop distance). `scripts/
+# risk_sizing_whatif.py` replays the closed journal through this to show
+# what it would have produced historically before anyone wires it live.
+def risk_based_lots(
+    symbol: str, connection: str, risk_usd: float, stop_distance_price: float,
+) -> float | None:
+    """Lot size whose stop-out loss is exactly `risk_usd`, given the planned
+    stop distance in price units.
+
+    lots = risk_usd / (stop_distance_price * contract_size), rounded DOWN to
+    REGIME_LOT_STEP (never up -- rounding up would silently risk more than
+    `risk_usd`). Unlike regime_adjusted_lots's floor-at-minimum (there, a
+    *shrink* that undershoots the broker's minimum has nowhere smaller to
+    go), undershooting the minimum lot step HERE means the broker's smallest
+    tradeable size already risks more than the caller asked for -- returning
+    None lets the caller decide (skip the trade, or knowingly accept the
+    floor) rather than silently taking on more risk than `risk_usd`.
+
+    Returns None when stop_distance_price/risk_usd aren't positive, or the
+    contract size / computed lots can't be resolved (fail-closed, same
+    philosophy as _atr_stop_floor/_max_stop_distance's None-on-error -- a
+    caller that can't verify the real risk must not guess).
+    """
+    if risk_usd <= 0 or stop_distance_price <= 0:
+        return None
+    sys.path.insert(0, str(AGENT_DIR))
+    from src.trading.connectors.mt5 import sdk as mt5_sdk
+
+    try:
+        config = _mt5_config_for(connection)
+        size = mt5_sdk.contract_size(symbol, config=config)
+    except Exception:
+        return None
+    if not size or size <= 0:
+        return None
+    raw_lots = risk_usd / (stop_distance_price * size)
+    # A plain `raw_lots // REGIME_LOT_STEP` is the wrong tool here: floating
+    # point 0.01 is actually ~0.010000000000000002, so an exact 1.0 lots
+    # worth of raw_lots divides to ~99.999999999999986 steps and floors to
+    # 0.99, not 1.0 -- silently under-risking by a full step on an input
+    # that was supposed to land exactly on one. `+ 1e-9` absorbs noise at
+    # that scale while still flooring any genuinely fractional raw_lots
+    # down (never up -- see this function's own docstring for why).
+    steps = math.floor(raw_lots / REGIME_LOT_STEP + 1e-9)
+    stepped = round(steps * REGIME_LOT_STEP, 8)
+    return stepped if stepped >= REGIME_LOT_STEP else None
 
 
 # --------------------------------------------------------------------------- #

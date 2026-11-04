@@ -57,6 +57,41 @@ class TestParseEdge:
         assert st.parse_edge(report) == expected
 
 
+class TestParseConfidence:
+    """2026-11-04: the committee's mandatory CONFIDENCE line was already a
+    hard in-prompt gate (below 60 -> PASS) but was never parsed back out of
+    a filled order's report, so the scorecard's by_confidence calibration
+    check (below) had nothing to bucket on. Mirrors TestParseEdge's pattern."""
+
+    @pytest.mark.parametrize("report, expected", [
+        ("DECISION: LONG\nCONFIDENCE: 85\nMODE: LIVE\n", 85),
+        ("CONFIDENCE: 60\n", 60),
+        ("CONFIDENCE: 100\n", 100),
+        ("**CONFIDENCE:** 72\n", 72),
+        ("CONFIDENCE: 0\n", 0),
+        ("CONFIDENCE: 101\n", None),  # out of valid range
+        ("CONFIDENCE: 999\n", None),
+        ("no confidence line at all", None),
+        ("", None),
+    ])
+    def test_extracts_score(self, report, expected) -> None:
+        assert st.parse_confidence(report) == expected
+
+
+class TestConfidenceBucket:
+    @pytest.mark.parametrize("confidence, expected", [
+        (None, "unknown"),
+        (60, "60-69"),
+        (69, "60-69"),
+        (70, "70-79"),
+        (85, "80-89"),
+        (90, "90-100"),
+        (100, "90-100"),
+    ])
+    def test_buckets(self, confidence, expected) -> None:
+        assert st.confidence_bucket(confidence) == expected
+
+
 class TestSymbolCurrencies:
     """Centralized 2026-11-03 after committee_reporter.py's news-blackout call
     site was found using a raw ``{symbol[:3], symbol[3:6]}`` slice instead of
@@ -103,7 +138,7 @@ class TestScorecard:
     def test_empty_journal(self) -> None:
         card = st.scorecard([])
         assert card["n_total"] == 0
-        assert card["by_symbol"] == {} and card["by_edge"] == {}
+        assert card["by_symbol"] == {} and card["by_edge"] == {} and card["by_confidence"] == {}
         assert st.scorecard_text([]) == "No closed trades yet."
 
     def test_open_and_unknown_outcome_trades_excluded(self) -> None:
@@ -138,11 +173,38 @@ class TestScorecard:
         card = st.scorecard([entry])
         assert card["by_edge"]["unknown"]["n"] == 1
 
+    def test_buckets_by_confidence(self) -> None:
+        journal = [
+            {**self._entry("EURUSD", "win", 40.0), "confidence": 92},
+            {**self._entry("EURUSD", "loss", -20.0), "confidence": 88},
+            {**self._entry("GBPUSD", "loss", -20.0), "confidence": 61},
+            self._entry("AUDUSD", "win", 10.0),  # no confidence field at all
+        ]
+        card = st.scorecard(journal)
+        assert card["by_confidence"]["90-100"]["n"] == 1
+        assert card["by_confidence"]["80-89"]["n"] == 1
+        assert card["by_confidence"]["60-69"]["n"] == 1
+        assert card["by_confidence"]["unknown"]["n"] == 1
+
     def test_scorecard_text_includes_symbol_and_edge_sections(self) -> None:
         journal = [self._entry("EURUSD", "win", 40.0)]
         text = st.scorecard_text(journal)
-        assert "By symbol:" in text and "By edge:" in text
+        assert "By symbol:" in text and "By edge:" in text and "By confidence" in text
         assert "EURUSD" in text and "HTF_TREND_CONTINUATION" in text
+
+    def test_confidence_rows_sort_ascending_not_by_count(self) -> None:
+        # Deliberately give the smaller bucket more trades than the larger
+        # one -- a count-based sort (like by_symbol/by_edge use) would put
+        # 60-69 above 90-100, scrambling the calibration trend this section
+        # exists to show.
+        journal = [
+            {**self._entry("EURUSD", "win", 10.0), "confidence": 61},
+            {**self._entry("EURUSD", "loss", -10.0), "confidence": 65},
+            {**self._entry("EURUSD", "win", 10.0), "confidence": 95},
+        ]
+        text = st.scorecard_text(journal)
+        section = text.split("By confidence")[1]
+        assert section.index("60-69") < section.index("90-100")
 
 
 class TestValidateCommitteeFields:
@@ -321,6 +383,95 @@ class TestComputeAtrPercentile:
     def test_one_short_of_lookback_returns_none(self) -> None:
         high, low, close = self._bars(100.0, [1, 2, 3, 4, 5, 6])  # 6 bars -> 4 ATR values
         result = st.compute_atr_percentile(high, low, close, atr_period=3, lookback=5)
+        assert result is None
+
+
+class TestComputeAdx:
+    """DRAFT (2026-11-03), backing scripts/adx_gate_backtest.py. Synthetic
+    OHLC series constructed so +DM/-DM/TR are known exactly, same approach
+    as TestComputeAtrPercentile."""
+
+    def _trend_bars(self, n: int, step: float = 10.0, width: float = 10.0) -> tuple[list[float], list[float], list[float]]:
+        # Each bar's high AND low move up by `step` -- a pure, undisturbed
+        # uptrend: up_move is always `step` (>0, > down_move which is
+        # negative), down_move is always -step (fails down_move>0), so
+        # +DM=step constant and -DM=0 constant every bar -> -DI=0 -> DX=100
+        # every bar (100*(x-0)/x == 100 exactly for any nonzero x) -> ADX=100.
+        high = [100.0 + step * i + width for i in range(n)]
+        low = [100.0 + step * i for i in range(n)]
+        close = [(h + l) / 2 for h, l in zip(high, low)]
+        return high, low, close
+
+    def _flat_bars(self, n: int, width: float = 10.0) -> tuple[list[float], list[float], list[float]]:
+        # Identical bar repeated every time: up_move == down_move == 0 ->
+        # +DM == -DM == 0 -> +DI == -DI == 0 -> di_sum == 0 -> DX == 0 (the
+        # explicit `.where(di_sum != 0, 0.0)` guard, not a 0/0 NaN) -> ADX=0.
+        high = [110.0] * n
+        low = [100.0] * n
+        close = [105.0] * n
+        return high, low, close
+
+    def test_pure_uptrend_is_max_strength(self) -> None:
+        high, low, close = self._trend_bars(10)
+        result = st.compute_adx(high, low, close, period=3)
+        assert result == 100.0
+
+    def test_flat_market_is_zero_strength(self) -> None:
+        high, low, close = self._flat_bars(10)
+        result = st.compute_adx(high, low, close, period=3)
+        assert result == 0.0
+
+    def test_insufficient_history_returns_none(self) -> None:
+        # period=3 needs ~2*period bars to form both a DI value and a full
+        # DX rolling window; 4 bars is nowhere close.
+        high, low, close = self._trend_bars(4, step=10.0)
+        result = st.compute_adx(high, low, close, period=3)
+        assert result is None
+
+
+class TestRiskBasedLots:
+    """DRAFT (2026-11-03), backing scripts/risk_sizing_whatif.py -- see
+    risk_based_lots's own docstring for why this exists and what it's not
+    wired into yet."""
+
+    def _mock_contract_size(self, monkeypatch, size: float) -> None:
+        monkeypatch.setattr(st, "_mt5_config_for", lambda connection: object())
+        import sys as _sys
+        fake_mt5_sdk = type("_FakeSdk", (), {"contract_size": staticmethod(lambda symbol, config=None: size)})
+        fake_connectors_mt5 = type("_FakeMod", (), {"sdk": fake_mt5_sdk})
+        monkeypatch.setitem(_sys.modules, "src.trading.connectors.mt5", fake_connectors_mt5)
+
+    def test_computes_lots_for_exact_risk_target(self, monkeypatch) -> None:
+        # contract_size=100000 (standard FX lot), risk_usd=100, stop=0.0010
+        # (10 pips on a 5-decimal pair) -> raw lots = 100/(0.0010*100000) = 1.0
+        self._mock_contract_size(monkeypatch, 100_000.0)
+        result = st.risk_based_lots("EURUSDm", "mt5-live-trade", risk_usd=100.0, stop_distance_price=0.0010)
+        assert result == 1.0
+
+    def test_rounds_down_never_up_past_the_risk_target(self, monkeypatch) -> None:
+        # raw lots = 100/(0.0010*100000) = 1.0 exactly as above; widen the
+        # stop slightly so raw lots = 0.95 -- must floor to 0.95 (already a
+        # clean step) not round up to 1.0, which would risk more than asked.
+        self._mock_contract_size(monkeypatch, 100_000.0)
+        result = st.risk_based_lots("EURUSDm", "mt5-live-trade", risk_usd=95.0, stop_distance_price=0.0010)
+        assert result == 0.95
+
+    def test_below_broker_minimum_returns_none_not_a_silent_floor(self, monkeypatch) -> None:
+        # raw lots = 0.5/(0.0010*100000) = 0.005 -- below REGIME_LOT_STEP
+        # (0.01), so even the broker's smallest tradeable size (0.01) would
+        # risk 2x the caller's requested risk_usd. Returning that floor
+        # instead of None would silently double the intended risk.
+        self._mock_contract_size(monkeypatch, 100_000.0)
+        result = st.risk_based_lots("EURUSDm", "mt5-live-trade", risk_usd=0.5, stop_distance_price=0.0010)
+        assert result is None
+
+    def test_non_positive_inputs_fail_closed(self) -> None:
+        assert st.risk_based_lots("EURUSDm", "mt5-live-trade", risk_usd=0.0, stop_distance_price=0.0010) is None
+        assert st.risk_based_lots("EURUSDm", "mt5-live-trade", risk_usd=100.0, stop_distance_price=0.0) is None
+
+    def test_unresolvable_contract_size_fails_closed(self, monkeypatch) -> None:
+        self._mock_contract_size(monkeypatch, None)
+        result = st.risk_based_lots("EURUSDm", "mt5-live-trade", risk_usd=100.0, stop_distance_price=0.0010)
         assert result is None
 
 
