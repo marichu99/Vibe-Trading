@@ -1039,37 +1039,31 @@ class TestExclusiveGroupConflict:
         assert note is not None and "could not read" in note
 
     def test_run_committee_marks_research_only_on_conflict(self, monkeypatch) -> None:
-        # D3 (2026-10-06): a conflict no longer nulls `trade` out -- it stays
-        # populated (symbol/connection/lots preserved) so the research-only
-        # pass still gets the full data-pack-backed v4 prompt; research_only
-        # is what actually prevents a trade now, not a missing trade dict.
+        # D-cost (2026-11-05): a conflict now short-circuits run_committee
+        # straight to a canned PASS -- _build_prompt (and the LLM behind it)
+        # is never reached, since DECISION: PASS was always the only
+        # possible outcome here anyway (see
+        # _post_trade_research_only_violation). D3 (2026-10-06) background:
+        # `trade` itself is still preserved rather than nulled out, but that
+        # no longer matters for reaching _build_prompt since this path
+        # returns before it.
         monkeypatch.setattr(fr.fn_guard, "guardrail_check", lambda *a: None)
         monkeypatch.setattr(fr.fn_news, "is_news_blackout", lambda *a, **k: (False, ""))
+        monkeypatch.setattr(fr.fn_news, "news_api_status", lambda: "OK")
         self._patch_positions(monkeypatch, {"EURUSD": {"count": 1, "side": "sell"}})
-        seen = {}
 
-        class _Stop(Exception):
-            pass
+        def _fail_build_prompt(*a, **k):
+            raise AssertionError("_build_prompt must not be called for a research_only short-circuit")
+        monkeypatch.setattr(fr, "_build_prompt", _fail_build_prompt)
 
-        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
-            seen["trade"] = trade
-            seen["research_only"] = research_only
-            seen["research_only_reason"] = research_only_reason
-            raise _Stop
+        result = fr.run_committee(
+            "investment_committee", "GBPUSD", "forex",
+            trade={"symbol": "GBPUSD", "connection": "mt5fn-live-trade", "lots": 0.30, "max_stack": 1},
+        )
 
-        monkeypatch.setattr(fr, "_build_prompt", _fake_build_prompt)
-
-        try:
-            fr.run_committee(
-                "investment_committee", "GBPUSD", "forex",
-                trade={"symbol": "GBPUSD", "connection": "mt5fn-live-trade", "lots": 0.30, "max_stack": 1},
-            )
-        except _Stop:
-            pass
-
-        assert seen["trade"] is not None and seen["trade"]["symbol"] == "GBPUSD"
-        assert seen["research_only"] is True
-        assert "CORRELATION LIMIT" in seen["research_only_reason"]
+        assert "MODE: RESEARCH_ONLY" in result.report_text
+        assert "CORRELATION LIMIT" in result.report_text
+        assert result.traded is False
 
     def test_targets_are_eurusd_audusd_and_gbpusd(self) -> None:
         assert [t["trade"]["symbol"] for t in fr.TARGETS] == ["EURUSD", "AUDUSD", "GBPUSD"]
@@ -1486,20 +1480,21 @@ class TestRunCommitteeRegimeGate:
         assert reached.get("called") is True
 
     def test_regime_gate_skipped_when_already_research_only(self, monkeypatch) -> None:
+        # D-cost (2026-11-05): research_only now short-circuits before even
+        # reaching the regime gate (see TestRunCommitteePreChecksPreserveTrade
+        # below for the full rationale) -- this test now confirms
+        # regime_for_symbol is still never called, just one step earlier.
         monkeypatch.setattr(fr.fn_guard, "guardrail_check", lambda *a, **k: "[FUNDEDNEXT DAILY LOSS STOP] ...")
         called = []
         monkeypatch.setattr(fr.strategy_tracking, "regime_for_symbol",
                              lambda s, c, **k: called.append(1) or self._regime("CALM", "PASS_NO_LLM"))
+        monkeypatch.setattr(fr.fn_news, "news_api_status", lambda: "OK")
 
-        class _Stop(Exception):
-            pass
-
-        monkeypatch.setattr(fr, "_build_prompt", lambda *a, **k: (_ for _ in ()).throw(_Stop))
-
-        with pytest.raises(_Stop):
-            fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+        result = fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
 
         assert called == []
+        assert "MODE: RESEARCH_ONLY" in result.report_text
+        assert result.traded is False
 
     @pytest.mark.parametrize("label,reason", [("CALM", "calm_regime"), ("EXTREME", "extreme_volatility")])
     def test_regime_short_circuit_satisfies_d4_schema(self, monkeypatch, label, reason) -> None:
@@ -1607,29 +1602,46 @@ class TestBuildPromptResearchOnly:
 class TestRunCommitteePreChecksPreserveTrade:
     TRADE = {"symbol": "EURUSD", "connection": "mt5fn-live-trade", "lots": 0.24, "max_stack": 1}
 
-    def test_guardrail_trip_keeps_trade_and_sets_research_only(self, monkeypatch) -> None:
+    def test_guardrail_trip_short_circuits_without_llm(self, monkeypatch) -> None:
+        # D-cost (2026-11-05): a guardrail trip now short-circuits
+        # run_committee straight to a canned PASS -- _build_prompt (and the
+        # LLM behind it) is never reached, since DECISION: PASS was always
+        # the only possible outcome here anyway (see
+        # _post_trade_research_only_violation).
         monkeypatch.setattr(fr.fn_guard, "guardrail_check", lambda *a, **k: "[FUNDEDNEXT DAILY LOSS STOP] ...")
-        seen = {}
+        monkeypatch.setattr(fr.fn_news, "news_api_status", lambda: "OK")
 
-        class _Stop(Exception):
-            pass
+        def _fail_build_prompt(*a, **k):
+            raise AssertionError("_build_prompt must not be called for a research_only short-circuit")
+        monkeypatch.setattr(fr, "_build_prompt", _fail_build_prompt)
 
-        def _fake_build_prompt(committee, target, market, trade, *, research_only=False, research_only_reason=""):
-            seen["trade"] = trade
-            seen["research_only"] = research_only
-            seen["research_only_reason"] = research_only_reason
-            raise _Stop
+        result = fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
 
-        monkeypatch.setattr(fr, "_build_prompt", _fake_build_prompt)
+        assert "MODE: RESEARCH_ONLY" in result.report_text
+        assert "FUNDEDNEXT DAILY LOSS STOP" in result.report_text
+        assert result.traded is False
 
-        try:
-            fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
-        except _Stop:
-            pass
+    def test_news_blackout_short_circuits_without_llm(self, monkeypatch) -> None:
+        # D-cost (2026-11-05, user's request): the actual case that motivated
+        # this short-circuit -- a news-blackout research_only pass could
+        # never place an order either way, so skip the 4-agent LLM debate
+        # entirely rather than running it just to discard the result.
+        monkeypatch.setattr(fr.fn_guard, "guardrail_check", lambda *a, **k: None)
+        monkeypatch.setattr(fr, "_exclusive_group_conflict", lambda trade: None)
+        monkeypatch.setattr(fr.fn_news, "is_news_blackout", lambda *a, **k: (True, "high-impact EUR release"))
+        monkeypatch.setattr(fr.fn_news, "news_momentum_window", lambda *a, **k: (False, None))
+        monkeypatch.setattr(fr.fn_news, "news_api_status", lambda: "OK")
 
-        assert seen["trade"] is not None and seen["trade"]["symbol"] == "EURUSD"
-        assert seen["research_only"] is True
-        assert "FUNDEDNEXT DAILY LOSS STOP" in seen["research_only_reason"]
+        def _fail_build_prompt(*a, **k):
+            raise AssertionError("_build_prompt must not be called for a research_only short-circuit")
+        monkeypatch.setattr(fr, "_build_prompt", _fail_build_prompt)
+
+        result = fr.run_committee("fx_commodity_day_desk", "EURUSD", "forex", trade=self.TRADE)
+
+        assert "MODE: RESEARCH_ONLY" in result.report_text
+        assert "DECISION: PASS" in result.report_text
+        assert "NEWS BLACKOUT" in result.report_text
+        assert result.traded is False
 
 
 # ---------------------------------------------------------------------------

@@ -1752,6 +1752,31 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             logger.warning("correlation limit for %s: %s", target, conflict)
             research_only = True
 
+    if research_only:
+        # D-cost (2026-11-05, user's request) -- see committee_reporter.py's
+        # identical short-circuit for the full rationale: all three
+        # research_only triggers above (guardrail, news blackout,
+        # exclusive-group conflict) force DECISION: PASS at the code level
+        # regardless of what the LLM concludes, so no order was ever
+        # reachable from this pass either way. Short-circuit before the
+        # ~$0.60-0.80 4-agent debate runs -- changes zero trading behavior.
+        return CommitteeResult(
+            committee, target, market, "success", None,
+            "DECISION: PASS\n"
+            "CONFIDENCE: 0\n"
+            "MODE: RESEARCH_ONLY\n"
+            "DATA_MISSING: none\n"
+            f"NEWS_API_STATUS: {fn_news.news_api_status()}\n"
+            "EDGE: none\n"
+            "CHECKLIST: n/a -- research-only short-circuit (code-level gate), LLM not invoked\n"
+            "ORDER: none\n"
+            "INVALIDATION: n/a\n"
+            "INPUT_PROVENANCE: n/a -- no data pack built, LLM not invoked\n"
+            "PROPOSAL: none\n"
+            f"REASON FOR PASS: {breaker_note}",
+            traded=False,
+        )
+
     trend_allowed = None
     trend_fallback = None
     if trade and not research_only and TREND_FILTER_ENABLED:

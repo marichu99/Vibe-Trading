@@ -2463,6 +2463,33 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             logger.warning("news blackout for %s: %s", target, why)
             research_only = True
 
+    if research_only:
+        # D-cost (2026-11-05, user's request): all three research_only
+        # triggers above (live circuit breaker, exclusive-group conflict,
+        # news blackout) force DECISION: PASS at the code level regardless
+        # of what the LLM concludes (see _build_prompt's research_only
+        # branch and _post_trade_research_only_violation) -- no order was
+        # ever reachable from this pass either way. Short-circuit before
+        # the ~$0.60-0.80 4-agent debate runs, same shape as the regime
+        # gate's own short-circuit below; this changes zero trading
+        # behavior since the LLM's output here was always discarded.
+        return CommitteeResult(
+            committee, target, market, "success", None,
+            "DECISION: PASS\n"
+            "CONFIDENCE: 0\n"
+            "MODE: RESEARCH_ONLY\n"
+            "DATA_MISSING: none\n"
+            f"NEWS_API_STATUS: {fn_news.news_api_status()}\n"
+            "EDGE: none\n"
+            "CHECKLIST: n/a -- research-only short-circuit (code-level gate), LLM not invoked\n"
+            "ORDER: none\n"
+            "INVALIDATION: n/a\n"
+            "INPUT_PROVENANCE: n/a -- no data pack built, LLM not invoked\n"
+            "PROPOSAL: none\n"
+            f"REASON FOR PASS: {breaker_note}",
+            traded=False,
+        )
+
     trend_allowed = None
     trend_fallback = None
     if trade and not research_only and TREND_FILTER_ENABLED:
