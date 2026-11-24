@@ -95,3 +95,10 @@ AGENTS.md
 # Alpha Zoo wiki artifacts (generated, not source)
 wiki/alpha-library/manifest.json
 wiki/alpha-library/content/
+data/mt5_history/
+
+# Backtest result outputs (generated, not source)
+*_backtest_mt5-live-trade.json
+*_backtest_mt5fn-live-trade.json
+risk_sizing_whatif_mt5-live-trade.json
+risk_sizing_whatif_mt5fn-live-trade.json
