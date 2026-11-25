@@ -119,6 +119,61 @@ def test_gate_denies_on_halt(monkeypatch) -> None:
     assert conn.placed == []
 
 
+def test_gate_denies_fixed_order_size_mismatch(monkeypatch) -> None:
+    """Real incident 2026-11-12: a malformed-output pass placed 0.06 lots
+    when the reporter's trade spec fixed 0.12 for that broker/symbol — only
+    caught post-fill. These env vars are the pre-fill counterpart."""
+    monkeypatch.setenv("VIBE_TRADING_FIXED_ORDER_BROKER", "mt5fn")
+    monkeypatch.setenv("VIBE_TRADING_FIXED_ORDER_SYMBOL", "EURUSD")
+    monkeypatch.setenv("VIBE_TRADING_FIXED_ORDER_QTY", "0.12")
+    _patch_gate(monkeypatch, mandate=_mandate())
+    conn = _FakeConnector()
+    intent = OrderIntent(
+        symbol="EURUSD", side="sell", notional_usd=None, quantity=0.06,
+        instrument_type=InstrumentType.EQUITY, asset_class=AssetClass.US_EQUITY,
+    )
+    out = gate.execute_live_order(
+        broker="mt5fn", connector_module=conn, config=object(),
+        intent=intent, place_kwargs={"symbol": "EURUSD", "side": "sell", "quantity": 0.06},
+    )
+    assert out["status"] == "blocked" and out["decision"] == "deny"
+    assert "0.12" in out["reason"] and "0.06" in out["reason"]
+    assert conn.placed == []  # never reached the broker
+
+
+def test_gate_allows_fixed_order_size_match(monkeypatch) -> None:
+    monkeypatch.setenv("VIBE_TRADING_FIXED_ORDER_BROKER", "mt5fn")
+    monkeypatch.setenv("VIBE_TRADING_FIXED_ORDER_SYMBOL", "EURUSD")
+    monkeypatch.setenv("VIBE_TRADING_FIXED_ORDER_QTY", "0.12")
+    _patch_gate(monkeypatch, mandate=_mandate())
+    conn = _FakeConnector()
+    intent = OrderIntent(
+        symbol="EURUSD", side="sell", notional_usd=None, quantity=0.12,
+        instrument_type=InstrumentType.EQUITY, asset_class=AssetClass.US_EQUITY,
+    )
+    out = gate.execute_live_order(
+        broker="mt5fn", connector_module=conn, config=object(),
+        intent=intent, place_kwargs={"symbol": "EURUSD", "side": "sell", "quantity": 0.12},
+    )
+    assert out["status"] == "ok"
+    assert len(conn.placed) == 1
+
+
+def test_gate_fixed_order_size_ignores_other_broker_or_symbol(monkeypatch) -> None:
+    """The env vars name one broker/symbol per subprocess pass -- an order
+    for a different broker or symbol must be unaffected (fails open)."""
+    monkeypatch.setenv("VIBE_TRADING_FIXED_ORDER_BROKER", "mt5fn")
+    monkeypatch.setenv("VIBE_TRADING_FIXED_ORDER_SYMBOL", "EURUSD")
+    monkeypatch.setenv("VIBE_TRADING_FIXED_ORDER_QTY", "0.12")
+    _patch_gate(monkeypatch, mandate=_mandate())
+    conn = _FakeConnector()
+    out = gate.execute_live_order(
+        broker="alpaca", connector_module=conn, config=object(),
+        intent=_intent(notional=500.0), place_kwargs={"symbol": "AAPL", "side": "buy", "notional": 500.0},
+    )
+    assert out["status"] == "ok"
+
+
 def test_gate_allows_in_bounds_and_places(monkeypatch) -> None:
     _patch_gate(monkeypatch, mandate=_mandate())
     conn = _FakeConnector()

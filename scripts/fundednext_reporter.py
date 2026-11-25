@@ -1958,6 +1958,36 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
         fn_state.server_today(), target, regime_label, research_only,
         model_override["LANGCHAIN_MODEL_NAME"],
     )
+    # D-fixedlot (2026-11-25) -- mirrored from committee_reporter.py's
+    # identical fix. Real incident 2026-11-12: a malformed-output pass on
+    # THIS bot still placed a live order at 0.06 lots when TARGETS specifies
+    # 0.12; "lot size is fixed, not LLM-chosen" was prompt-only, so the
+    # wrong-size order reached the broker and was only caught (closed +
+    # kill-switch tripped) by the POST-fill spec check, ~13 days before
+    # anyone noticed and cleared the halt. These three env vars let
+    # sdk_order_gate's PRE-fill check (_fixed_quantity_violation) deny any
+    # quantity that doesn't match this pass's own trade spec, before the
+    # order ever reaches the broker. Best-effort: a failure to resolve the
+    # connector must not block the pass itself (the post-fill check still
+    # exists as a backstop), so this only logs and leaves fixed_order_env
+    # empty on error.
+    fixed_order_env: dict[str, str] = {}
+    if trade:
+        try:
+            sys.path.insert(0, str(AGENT_DIR))
+            from src.trading.service import profile_by_id
+
+            fixed_order_env = {
+                "VIBE_TRADING_FIXED_ORDER_BROKER": profile_by_id(trade["connection"]).connector,
+                "VIBE_TRADING_FIXED_ORDER_SYMBOL": trade["symbol"],
+                "VIBE_TRADING_FIXED_ORDER_QTY": str(trade["lots"]),
+            }
+        except Exception:
+            logger.exception(
+                "could not resolve fixed-order env for %s -- pre-fill quantity "
+                "enforcement skipped this pass (post-fill spec check still applies)",
+                target,
+            )
     report_text = ""
     missing_fields: list[str] = []
     run_id = None
@@ -1979,7 +2009,7 @@ def run_committee(committee: str, target: str, market: str, trade: dict | None =
             text=True,
             encoding="utf-8",
             errors="replace",
-            env={**os.environ, **model_override},
+            env={**os.environ, **model_override, **fixed_order_env},
         )
         try:
             stdout, stderr = popen.communicate(timeout=RUN_TIMEOUT_SECONDS)

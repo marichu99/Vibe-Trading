@@ -24,6 +24,7 @@ returned payload carries the redacted record under ``live_action``.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -90,6 +91,13 @@ def execute_live_order(
     if halt_flag_set(broker):
         return _deny(broker, session_id, "live trading halted", ["mandate", "expiry", "halt_flag"], mandate, intent=None)
 
+    fixed_size_violation = _fixed_quantity_violation(broker, intent)
+    if fixed_size_violation:
+        return _deny(
+            broker, session_id, fixed_size_violation,
+            ["mandate", "expiry", "halt_flag", "fixed_order_size"], mandate, intent=intent,
+        )
+
     normalized = _normalize_notional(intent, connector_module, config)
     if normalized is None:
         return _deny(
@@ -117,6 +125,50 @@ def execute_live_order(
 # --------------------------------------------------------------------------- #
 # Decision helpers
 # --------------------------------------------------------------------------- #
+
+
+_FIXED_QTY_TOLERANCE = 1e-6
+
+
+def _fixed_quantity_violation(broker: str, intent: OrderIntent) -> str | None:
+    """Deny an order whose quantity doesn't match this pass's fixed lot size.
+
+    Real incident 2026-11-12: a malformed-output FundedNext pass still called
+    trading_place_order with quantity=0.06 when the reporter's TARGETS config
+    for that symbol/connection specifies 0.12 -- "lot size is fixed, not
+    LLM-chosen" was prompt-only, never enforced in code, so the wrong-size
+    order reached the broker and was only caught (closed + kill-switch
+    tripped) by the POST-fill spec check, ~13 days before anyone noticed and
+    cleared the halt. This is the PRE-fill counterpart: the reporter scripts
+    set these three env vars per subprocess invocation on a trade-enabled
+    pass; when all three are set and match this order's broker/symbol, any
+    quantity that doesn't match the fixed value is denied here, before ever
+    reaching the broker. Opt-in and fails open (returns None, no denial) when
+    the env vars are absent or don't name this broker/symbol -- callers that
+    don't set them (e.g. non-fixed-lot connectors, notional-sized orders) are
+    unaffected.
+    """
+    expected_broker = os.environ.get("VIBE_TRADING_FIXED_ORDER_BROKER", "").strip().lower()
+    expected_symbol = os.environ.get("VIBE_TRADING_FIXED_ORDER_SYMBOL", "").strip().lower()
+    expected_qty_raw = os.environ.get("VIBE_TRADING_FIXED_ORDER_QTY", "").strip()
+    if not (expected_broker and expected_symbol and expected_qty_raw):
+        return None
+    if broker.strip().lower() != expected_broker:
+        return None
+    if (intent.symbol or "").strip().lower() != expected_symbol:
+        return None
+    if intent.quantity is None:
+        return None
+    try:
+        expected_qty = float(expected_qty_raw)
+    except ValueError:
+        return None
+    if abs(intent.quantity - expected_qty) > _FIXED_QTY_TOLERANCE:
+        return (
+            f"order quantity {intent.quantity} for {intent.symbol} does not match this pass's "
+            f"fixed lot size {expected_qty} -- denied before reaching the broker"
+        )
+    return None
 
 
 def _allow(broker, session_id, connector_module, config, intent, place_kwargs, mandate) -> dict[str, Any]:
