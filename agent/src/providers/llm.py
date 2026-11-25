@@ -689,6 +689,21 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
     # Optional reasoning activation for relays requiring opt-in (e.g. OpenRouter).
     # Moonshot/DeepSeek official APIs emit reasoning by default and ignore this field.
     effort = get_env_config().llm.langchain_reasoning_effort.strip().lower()
+    # OpenRouter pre-authorizes a request against max_tokens * worst-case
+    # price, not actual usage -- with no explicit max_tokens, ChatOpenAI
+    # leaves it unset and the model's own ceiling applies (e.g. 64000 for
+    # claude-haiku-4-5), so a request can be rejected with 402 "requires
+    # more credits" even when the account can easily cover the *real*
+    # response size. Real incident 2026-11-24: both live bots failed
+    # outright all day ("requested up to 64000 tokens, but can only afford
+    # 59567") despite having well above the $2 LLM_BALANCE_ALERT_THRESHOLD_USD
+    # balance -- that alert checks total balance, not per-request headroom,
+    # so it never fires for this failure mode. Capped only for OpenRouter,
+    # and only when the operator hasn't set an explicit override, since other
+    # providers don't pre-authorize against max_tokens this way.
+    max_tokens = get_env_config().llm.langchain_max_tokens
+    if max_tokens <= 0 and caps.name == "openrouter":
+        max_tokens = 8192
     kwargs: dict[str, Any] = {
         "model": name,
         "temperature": temperature,
@@ -698,6 +713,8 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         "extra_body": {"reasoning": {"effort": effort}} if effort and caps.openrouter_reasoning_body else None,
         "vibe_provider": provider,
     }
+    if max_tokens > 0:
+        kwargs["max_tokens"] = max_tokens
     if caps.default_headers:
         headers = dict(caps.default_headers)
         if caps.name in {"moonshot", "kimi-coding"}:
